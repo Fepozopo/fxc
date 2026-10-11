@@ -1802,6 +1802,8 @@ pub fn Handlers(comptime App: type) type {
             try collectSkillsRefreshFacts(app);
         }
 
+        /// Consumes one completed catalog action and renders its result for `app`.
+        /// Startup inventory is emitted only for actions queued by a fresh launch.
         pub fn collectSkillsRefreshFacts(app: *App) !void {
             var ready = app.skills.takeReadyRefreshAction() orelse return;
             defer ready.deinit(app.alloc);
@@ -1809,7 +1811,7 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "skills",
                     .tone = .@"error",
-                    .body = if (ready.action == .startup_notice)
+                    .body = if (ready.action == .startup_notice or ready.action == .startup_inventory)
                         "Skills could not be loaded. Run /skills to try again."
                     else
                         "Skills could not be refreshed. The previous catalog was not shown as current.",
@@ -1818,6 +1820,10 @@ pub fn Handlers(comptime App: type) type {
             }
             switch (ready.action) {
                 .startup_notice => try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app),
+                .startup_inventory => {
+                    try app_bootstrap_runtime.Runtime(App).writeStartupInventory(app);
+                    try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app);
+                },
                 .list => try executeSkillsCommand(
                     app,
                     app.skillsCommandProvider(),

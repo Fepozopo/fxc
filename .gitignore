@@ -1,4 +1,6 @@
 .DS_Store
+.tools/
+.codebase-memory/
 
 # Dependencies
 node_modules/

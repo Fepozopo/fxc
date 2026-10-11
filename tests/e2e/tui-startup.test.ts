@@ -15,6 +15,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   hasEmptyComposer,
+  isEmptyComposerLine,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -70,6 +71,202 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 });
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
+  test(
+    "startup lists loaded global and workspace context sources and skill directories once before the prompt",
+    async () => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-e2e-startup-inventory-")),
+      );
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const globalInstructions = join(home, ".fx", "AGENTS.md");
+      const workspaceInstructions = join(workspace, "AGENTS.md");
+      const globalSkill = join(home, ".fx", "skills", "global-startup");
+      const workspaceSkill = join(
+        workspace,
+        ".agents",
+        "skills",
+        "workspace-startup",
+      );
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(globalSkill, { recursive: true });
+      mkdirSync(workspaceSkill, { recursive: true });
+      writeFileSync(globalInstructions, "Global startup instructions.\n");
+      writeFileSync(workspaceInstructions, "Workspace startup instructions.\n");
+      writeFileSync(join(workspace, ".fx.json"), '{"context":true}\n');
+      writeFileSync(
+        join(globalSkill, "SKILL.md"),
+        "---\nname: global-startup\ndescription: Global startup fixture\n---\nGLOBAL_STARTUP_SKILL_BODY\n",
+      );
+      writeFileSync(
+        join(workspaceSkill, "SKILL.md"),
+        "---\nname: workspace-startup\ndescription: Workspace startup fixture\n---\nWORKSPACE_STARTUP_SKILL_BODY\n",
+      );
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+          },
+          stderrPath,
+          // Keep absolute fixture paths on single lines for content assertions.
+          width: 200,
+          height: 40,
+        });
+
+        // The composer can appear before the background skill catalog lands.
+        const pane = await session.waitForPane(
+          (value) =>
+            value.includes("[Context]") &&
+            value.includes("[Skills]") &&
+            value.includes(globalInstructions) &&
+            value.includes(workspaceInstructions) &&
+            value.includes(globalSkill) &&
+            value.includes(workspaceSkill) &&
+            hasEmptyComposer(value),
+          10_000,
+        );
+        const lines = pane.split("\n");
+        const contextIndex = lines.indexOf("[Context]");
+        const skillsIndex = lines.indexOf("[Skills]");
+        const promptIndex = lines.findIndex(isEmptyComposerLine);
+        expect(pane).toContain("𝒇x v");
+        expect(pane).toContain("Run /help for commands");
+        expect(contextIndex).toBeGreaterThanOrEqual(0);
+        expect(skillsIndex).toBeGreaterThan(contextIndex);
+        expect(promptIndex).toBeGreaterThan(skillsIndex);
+        for (const path of [globalInstructions, workspaceInstructions]) {
+          expect(lines.slice(contextIndex + 1, skillsIndex)).toContain(
+            `  ${path}`,
+          );
+        }
+        for (const path of [globalSkill, workspaceSkill]) {
+          expect(lines.slice(skillsIndex + 1, promptIndex)).toContain(
+            `  ${path}`,
+          );
+          expect(pane).not.toContain(join(path, "SKILL.md"));
+        }
+        expect(pane).not.toContain("GLOBAL_STARTUP_SKILL_BODY");
+        expect(pane).not.toContain("WORKSPACE_STARTUP_SKILL_BODY");
+        expect(pane.split("[Context]")).toHaveLength(2);
+        expect(pane.split("[Skills]")).toHaveLength(2);
+
+        await session.sendText("/status");
+        await session.waitForText("model=", 5_000);
+        const history = await session.captureFullScrollback();
+        expect(history.split("[Context]")).toHaveLength(2);
+        expect(history.split("[Skills]")).toHaveLength(2);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const { name, contextEnabled, contextEntry } of [
+    { name: "empty", contextEnabled: true, contextEntry: "  (none)" },
+    { name: "disabled", contextEnabled: false, contextEntry: "  (disabled)" },
+  ]) {
+    test(
+      `startup reports ${name} context and an empty skill catalog`,
+      async () => {
+        const root = realpathSync(
+          mkdtempSync(join(tmpdir(), "fx-e2e-startup-empty-")),
+        );
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const stderrPath = join(root, "stderr.log");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(workspace, { recursive: true });
+        writeFileSync(
+          join(workspace, ".fx.json"),
+          `${JSON.stringify({ context: contextEnabled })}\n`,
+        );
+        // Disabled context must omit sources even when instruction files exist.
+        if (!contextEnabled) {
+          writeFileSync(
+            join(home, ".fx", "AGENTS.md"),
+            "Disabled global instructions.\n",
+          );
+          writeFileSync(
+            join(workspace, "AGENTS.md"),
+            "Disabled workspace instructions.\n",
+          );
+        }
+        writeFileSync(stderrPath, "");
+
+        try {
+          session = await TmuxSession.create({
+            cwd: workspace,
+            env: {
+              HOME: home,
+              AI_GATEWAY_API_KEY: undefined,
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_AUTO_UPGRADE: "0",
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_SKIP_ONBOARDING: "1",
+            },
+            stderrPath,
+            width: 200,
+            height: 40,
+          });
+
+          const pane = await session.waitForPane(
+            (value) =>
+              value.includes(`[Context]\n${contextEntry}`) &&
+              value.includes("[Skills]\n  (none)") &&
+              hasEmptyComposer(value),
+            10_000,
+          );
+          const lines = pane.split("\n");
+          const contextIndex = lines.indexOf("[Context]");
+          const skillsIndex = lines.indexOf("[Skills]");
+          const promptIndex = lines.findIndex(isEmptyComposerLine);
+          expect(pane).toContain("𝒇x v");
+          expect(pane).toContain("Run /help for commands");
+          expect(contextIndex).toBeGreaterThanOrEqual(0);
+          expect(skillsIndex).toBeGreaterThan(contextIndex);
+          expect(promptIndex).toBeGreaterThan(skillsIndex);
+          expect(
+            lines
+              .slice(contextIndex + 1, skillsIndex)
+              .filter((line) => line.trim()),
+          ).toEqual([contextEntry]);
+          expect(lines[skillsIndex + 1]).toBe("  (none)");
+          expect(pane).not.toContain("AGENTS.md");
+          expect(pane.split("[Context]")).toHaveLength(2);
+          expect(pane.split("[Skills]")).toHaveLength(2);
+          await session.sendText("/quit");
+          expect(await session.waitForSessionEnd(5_000)).toBe(true);
+          expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+        } finally {
+          if (session) {
+            await session.kill();
+            session = null;
+          }
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
   test(
     "statusline hides the workspace identity by default",
     async () => {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const app_lifecycle = @import("app_lifecycle.zig");
+const app_agent_runtime = @import("app_agent_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const app_input_runtime = @import("app_input_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -31,6 +32,7 @@ const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const startup_inventory = @import("../../ui/startup_inventory.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
@@ -276,8 +278,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Starts skill discovery on the catalog refresh worker so the first
-        /// frame does not wait for it, and queues the discovery notice for
-        /// when it lands. Prompts already wait for a current catalog. Returns
+        /// frame does not wait for it, and queues the inventory and discovery
+        /// diagnostics for when it lands. Resume queues only diagnostics so
+        /// asynchronous completion cannot insert a fresh-start inventory into
+        /// restored history. Prompts already wait for a current catalog. Returns
         /// false when the host loads skills inline.
         fn beginStartupSkillsLoad(app: *App) !bool {
             if (comptime host_target.is_wasm or !@hasDecl(App, "requestSkillsRefresh")) return false;
@@ -288,8 +292,30 @@ pub fn Runtime(comptime App: type) type {
                 return err;
             };
             const generation = try app.requestSkillsRefresh();
-            try app.skills.queueRefreshAction(std.heap.c_allocator, generation, .startup_notice);
+            try app.skills.queueRefreshAction(std.heap.c_allocator, generation, if (app.requested_resume == null) .startup_inventory else .startup_notice);
             return true;
+        }
+
+        /// Gathers startup instructions through the normal context provider and
+        /// writes their selected source paths and available skill directories
+        /// with the welcome hint's muted style on every row.
+        /// Called once for a fresh launch after its skill catalog is current;
+        /// the snapshot remains app-owned and prompts refresh it as usual.
+        pub fn writeStartupInventory(app: *App) !void {
+            if (comptime !@hasField(App, "context_snapshot")) return;
+            try app_agent_runtime.Runtime(App).refreshProjectContext(app, &.{});
+            var output: std.Io.Writer.Allocating = .init(app.alloc);
+            defer output.deinit();
+            try startup_inventory.write(&output.writer, .{
+                .context_sources = app.context_snapshot.delivered_sources,
+                .skills = app.skills.items,
+                .context_enabled = app.context_enabled,
+                .line_style = ui_render.dim_style,
+            });
+            try output.writer.writeAll(ui_render.reset_style);
+            // Ordinary transcript content can scroll; only the compact welcome
+            // header should remain pinned when the inventory is taller than the TTY.
+            try app.writeTranscript(output.written(), true);
         }
 
         /// Reports skill discovery issues inline and to the model's context.
@@ -403,6 +429,9 @@ pub fn Runtime(comptime App: type) type {
             });
         }
 
+        /// Initializes `app` with the supplied launch configuration and service dependencies.
+        /// Fresh launches present startup facts; resumes leave history to session recovery.
+        /// On failure, tears down partially initialized app state before returning the error.
         fn bootstrapWithDeps(
             app: *App,
             footer_rows: u16,
@@ -648,8 +677,11 @@ pub fn Runtime(comptime App: type) type {
                 // empty until the deferred session load replays history.
                 try writeSessionAssemblyNotice(app, startup.provider.label());
             }
-            // A deferred catalog reports its discovery issues when it lands.
-            if (!skills_deferred) try writeSkillDiagnosticsNotice(app);
+            // A deferred catalog prints the inventory and diagnostics when it lands.
+            if (!skills_deferred) {
+                if (app.requested_resume == null) try writeStartupInventory(app);
+                try writeSkillDiagnosticsNotice(app);
+            }
             if (comptime @hasField(App, "auth")) {
                 if (!credential_deferred) {
                     try app_auth_runtime.Runtime(App).writeStartupCredentialFailure(app, startup.provider, startup.credential_load_failure);

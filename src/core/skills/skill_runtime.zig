@@ -1892,16 +1892,20 @@ pub const RefreshCompletion = enum {
     failed,
 };
 
+/// Deferred catalog actions released after their requested discovery generation.
 pub const RefreshAction = union(enum) {
     list,
     show: []u8,
     notice: []u8,
-    /// Reports discovery issues once the launch catalog lands.
+    /// Reports discovery issues once the launch catalog lands on resume.
     startup_notice,
+    /// Prints the fresh-launch context and skill inventory, then discovery issues.
+    startup_inventory,
 
+    /// Releases action text using its owning allocator; tag-only actions own no memory.
     pub fn deinit(self: *RefreshAction, alloc: Allocator) void {
         switch (self.*) {
-            .list, .startup_notice => {},
+            .list, .startup_notice, .startup_inventory => {},
             .show => |value| alloc.free(value),
             .notice => |value| alloc.free(value),
         }
@@ -2350,6 +2354,8 @@ pub const Runtime = struct {
         return self.refresh_task != null or self.pending_catalog != null;
     }
 
+    /// Queues `action` for `generation`, replacing any earlier queued action.
+    /// Copies action text into `alloc`; the runtime owns it until completion or teardown.
     pub fn queueRefreshAction(
         self: *Runtime,
         alloc: Allocator,
@@ -2359,11 +2365,13 @@ pub const Runtime = struct {
             show: []const u8,
             notice: []const u8,
             startup_notice,
+            startup_inventory,
         },
     ) !void {
         const owned: RefreshAction = switch (action) {
             .list => .list,
             .startup_notice => .startup_notice,
+            .startup_inventory => .startup_inventory,
             .show => |value| .{ .show = try alloc.dupe(u8, value) },
             .notice => |value| .{ .notice = try alloc.dupe(u8, value) },
         };
@@ -3764,7 +3772,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
 }
 
-test "an empty launch catalog fills from a refresh before its startup notice is due" {
+test "an empty launch catalog fills from a refresh before its startup inventory is due" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3782,7 +3790,7 @@ test "an empty launch catalog fills from a refresh before its startup notice is 
     // The launch records only the managed directory, then refreshes into it.
     try runtime.replaceLoaded(alloc, try std.fs.path.join(alloc, &.{ home, ".fx", "skills" }), &.{}, &.{});
     const generation = try runtime.requestRefresh(alloc, home, home, policy);
-    try runtime.queueRefreshAction(alloc, generation, .startup_notice);
+    try runtime.queueRefreshAction(alloc, generation, .startup_inventory);
     try std.testing.expectEqual(@as(usize, 0), runtime.items.len);
     try std.testing.expect(runtime.takeReadyRefreshAction() == null);
 
@@ -3796,10 +3804,10 @@ test "an empty launch catalog fills from a refresh before its startup notice is 
     try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
     try std.testing.expectEqualStrings("launch", runtime.items[0].name);
 
-    var ready = runtime.takeReadyRefreshAction() orelse return error.MissingStartupNotice;
+    var ready = runtime.takeReadyRefreshAction() orelse return error.MissingStartupInventory;
     defer ready.deinit(alloc);
     try std.testing.expect(ready.succeeded);
-    try std.testing.expect(ready.action == .startup_notice);
+    try std.testing.expect(ready.action == .startup_inventory);
 }
 
 test "overlapping skill refresh actions retain only the latest bounded action" {
