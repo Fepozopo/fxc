@@ -50,6 +50,15 @@ afterEach(async () => {
   fixtureImagePath = null;
 });
 
+/**
+ * Starts an isolated composer fixture with a managed review skill and optional workspace winner.
+ * The fake gateway returns deterministic completions without contacting a model provider.
+ * @param withGateway Whether to serve fake model metadata and responses.
+ * @param responseCount Number of completion responses to serve.
+ * @param duplicateReview Whether to add a workspace skill that shadows the managed review skill.
+ * @param traceScopes Optional runtime trace scopes written to the fixture's trace log.
+ * @returns The running TTY session; afterEach owns session, gateway, and fixture cleanup.
+ */
 async function startFx(
   withGateway: boolean,
   responseCount = 1,
@@ -263,14 +272,37 @@ async function pasteExact(active: TmuxSession, text: string): Promise<void> {
   ]);
 }
 
-async function selectReviewSkill(
-  active: TmuxSession,
-  selectWorkspace = false,
-): Promise<void> {
+/**
+ * Inserts the visible review skill, which is the workspace winner when a duplicate is present.
+ * @param active Running fixture session whose composer receives the skill mention.
+ * @returns A promise that resolves after accepting the first completion row.
+ */
+async function selectReviewSkill(active: TmuxSession): Promise<void> {
   await active.sendLiteralText("$review");
   await active.waitForText("enter use", TIMEOUT);
-  if (selectWorkspace) await active.sendKeys("Down");
   await active.sendKeys("Enter");
+}
+
+/**
+ * Verifies that a model request advertises and loads only the workspace review winner.
+ * @param requestIndex Zero-based fake gateway request to inspect.
+ * @returns Nothing; failed catalog or content expectations fail the calling test.
+ */
+function expectWorkspaceReviewWinner(requestIndex = 0): void {
+  const prompt = gatewayPromptText(requestIndex);
+  const available =
+    prompt.split("<available_skills>")[1]?.split("</available_skills>")[0] ??
+    "";
+  const advertised = available
+    .split("\n")
+    .filter((line) => line.startsWith("- review: "));
+  expect(advertised).toHaveLength(1);
+  expect(advertised[0]).toContain("/review-workspace)");
+  expect(available).toContain(join(root!, "workspace", "skills"));
+  expect(available).toContain("Review from the workspace");
+  expect(available).not.toContain("Review the current change");
+  expect(prompt).toContain(WORKSPACE_REVIEW_BODY);
+  expect(prompt).not.toContain(MANAGED_REVIEW_BODY);
 }
 
 tmuxTest(
@@ -799,20 +831,18 @@ tmuxTest(
 );
 
 tmuxTest(
-  "Ctrl+U and Ctrl+Y preserve the selected duplicate skill source",
+  "Ctrl+U and Ctrl+Y preserve the workspace duplicate skill winner",
   async () => {
     const active = await startFx(true, 1, true);
 
-    await selectReviewSkill(active, true);
+    await selectReviewSkill(active);
     await active.sendLiteralText("inspect");
     await active.sendHexBytes(["15", "19"]);
     await active.sendKeys("Enter");
     await waitForGatewayRequest();
 
     expect(finalUserText()).toBe("$review inspect");
-    const prompt = gatewayPromptText();
-    expect(prompt).toContain(WORKSPACE_REVIEW_BODY);
-    expect(prompt).not.toContain(MANAGED_REVIEW_BODY);
+    expectWorkspaceReviewWinner();
     expectCleanRuntime(active);
   },
   TIMEOUT,
@@ -935,11 +965,11 @@ for (
 }
 
 tmuxTest(
-  "history recall preserves duplicate skill provenance without showing it",
+  "history recall preserves the workspace duplicate skill winner without showing provenance",
   async () => {
     const active = await startFx(true, 2, true);
 
-    await selectReviewSkill(active, true);
+    await selectReviewSkill(active);
     await active.waitForPane(
       (pane) =>
         composerContains(pane, "review") &&
@@ -968,10 +998,10 @@ tmuxTest(
     await active.sendKeys("Enter");
     await waitForGatewayRequest(2);
 
+    expect(finalUserText(0)).toBe("$review history skill");
     expect(finalUserText(1)).toBe("$review history skill");
-    const prompt = gatewayPromptText(1);
-    expect(prompt).toContain(WORKSPACE_REVIEW_BODY);
-    expect(prompt).not.toContain(MANAGED_REVIEW_BODY);
+    expectWorkspaceReviewWinner(0);
+    expectWorkspaceReviewWinner(1);
     expectCleanRuntime(active);
   },
   TIMEOUT,

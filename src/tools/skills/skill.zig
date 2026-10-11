@@ -378,6 +378,57 @@ test "skill preparation discovers canonical locations added after the catalog" {
     try std.testing.expectEqualStrings(path, selected.skill.path);
 }
 
+test "skill tool loads only the first discovered name and rejects shadowed locations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const name = "fixture-first-wins-workflow";
+    const files = [_]struct { path: []const u8, content: []const u8 }{
+        .{ .path = "workspace/.fx/skills/first/SKILL.md", .content = "---\nname: fixture-first-wins-workflow\n---\nFIRST_SKILL_BODY\n" },
+        .{ .path = "managed/second/SKILL.md", .content = "---\nname: fixture-first-wins-workflow\n---\nSHADOWED_SKILL_BODY\n" },
+    };
+    for (files) |fixture| {
+        try tmp.dir.createDirPath(io_mod.getIo(), std.fs.path.dirname(fixture.path).?);
+        var file = try tmp.dir.createFile(io_mod.getIo(), fixture.path, .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), fixture.content);
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const managed = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "managed");
+    defer alloc.free(managed);
+    const winner = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/.fx/skills/first");
+    defer alloc.free(winner);
+    const shadowed = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "managed/second");
+    defer alloc.free(shadowed);
+    const cases = [_]struct { label: []const u8, location: ?[]const u8, loads: bool }{
+        .{ .label = "name resolves to first", .location = null, .loads = true },
+        .{ .label = "exact winner loads", .location = winner, .loads = true },
+        .{ .label = "exact duplicate rejected", .location = shadowed, .loads = false },
+    };
+    for (cases) |case| {
+        const args = try std.json.Stringify.valueAlloc(alloc, .{ .name = name, .location = case.location }, .{ .emit_null_optional_fields = false });
+        defer alloc.free(args);
+        // The legacy execution API retains parsed arguments in its request arena.
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = try executeForSession(arena.allocator(), workspace, managed, args);
+        defer skill_invocation.freeExecuteResult(arena.allocator(), result);
+        if ((result == .loaded) != case.loads) {
+            std.debug.print("{s}: expected loads={any} for location {?s}, got {s}\n", .{ case.label, case.loads, case.location, result.modelOutput() });
+            return error.TestUnexpectedSkillLoad;
+        }
+        try std.testing.expect(std.mem.find(u8, result.modelOutput(), "SHADOWED_SKILL_BODY") == null);
+        if (case.loads) {
+            try std.testing.expect(std.mem.find(u8, result.modelOutput(), "FIRST_SKILL_BODY") != null);
+        } else {
+            try std.testing.expect(result == .failure);
+            try std.testing.expect(std.mem.find(u8, result.modelOutput(), "not found") != null);
+            try std.testing.expect(std.mem.find(u8, result.modelOutput(), "FIRST_SKILL_BODY") == null);
+        }
+    }
+}
+
 test "skill tool accepts an exact location without a guessed name" {
     const alloc = std.testing.allocator;
     const decoded = try decode(.{ .allocator = alloc }, "{\"location\":\"/installed/workflow\"}");

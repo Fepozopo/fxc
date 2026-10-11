@@ -52,6 +52,8 @@ fx
 
 Fresh interactive startup lists selected absolute `AGENTS.md` source paths under **[Context]** and discovered skill directory paths under **[Skills]** before the prompt; the skills are an available catalog, not full skill bodies already loaded into context.
 
+When skills share a name, fx keeps only the first valid match in discovery order: the nearest workspace's skill roots, ancestor workspace roots, `~/.fx/skills`, then global compatibility roots. Within each root, directories are scanned in name order. Later duplicates are excluded from the agent's catalog and cannot be loaded through the `skill` tool.
+
 Or make a one-shot request:
 
 ```bash

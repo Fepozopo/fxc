@@ -88,6 +88,17 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         "skills",
         "workspace-startup",
       );
+      const shadowedSkills = [
+        join(home, ".config", "opencode", "skills", "other-directory"),
+        join(home, ".agents", "skills", "global-startup"),
+      ];
+      for (const path of shadowedSkills) {
+        mkdirSync(path, { recursive: true });
+        writeFileSync(
+          join(path, "SKILL.md"),
+          "---\nname: global-startup\ndescription: Shadowed startup fixture\n---\nSHADOWED_STARTUP_BODY\n",
+        );
+      }
       const stderrPath = join(root, "stderr.log");
       mkdirSync(globalSkill, { recursive: true });
       mkdirSync(workspaceSkill, { recursive: true });
@@ -153,6 +164,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           );
           expect(pane).not.toContain(join(path, "SKILL.md"));
         }
+        for (const path of shadowedSkills) expect(pane).not.toContain(path);
+        expect(pane).not.toContain("SHADOWED_STARTUP_BODY");
         expect(pane).not.toContain("GLOBAL_STARTUP_SKILL_BODY");
         expect(pane).not.toContain("WORKSPACE_STARTUP_SKILL_BODY");
         expect(pane.split("[Context]")).toHaveLength(2);

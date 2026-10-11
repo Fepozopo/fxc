@@ -938,59 +938,97 @@ describe("gateway stream lifecycle", () => {
     for (const [directory, name, body] of [
       ["first", "status-first", "FIRST_REQUESTED_CONTENT"],
       ["second", "status-second", "SECOND_REQUESTED_CONTENT"],
-      ["duplicate-a", "status-duplicate", "AMBIGUOUS_CONTENT_A"],
-      ["duplicate-b", "status-duplicate", "AMBIGUOUS_CONTENT_B"],
+      ["duplicate-b", "status-duplicate", "SHADOWED_REQUESTED_CONTENT"],
+      ["duplicate-a", "status-duplicate", "WINNING_REQUESTED_CONTENT"],
     ]) {
       const path = join(root.workspace, ".agents", "skills", directory!);
       mkdirSync(path, { recursive: true });
-      writeFileSync(join(path, "SKILL.md"), `---\nname: ${name}\ndescription: Status fixture\n---\n${body}\n`);
+      writeFileSync(
+        join(path, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Status fixture\n---\n${body}\n`,
+      );
     }
     let requestCount = 0;
     const gateway = startDynamicFakeGateway((body) => {
       const text = promptText(body);
       expect(text).toContain("FIRST_REQUESTED_CONTENT");
       expect(text).not.toContain("requested skills loaded");
-      expect(text).not.toContain("AMBIGUOUS_CONTENT_A");
-      expect(text).not.toContain("AMBIGUOUS_CONTENT_B");
+      const locations = advertisedSkillLocations(body, "status-duplicate");
+      expect(locations).toHaveLength(1);
+      expect(advertisedSkillPath(body, locations[0]!)).toBe(
+        join(root.workspace, ".agents", "skills", "duplicate-a"),
+      );
+      expect(taggedBlock(body, "available_skills")).not.toContain(
+        "duplicate-b",
+      );
+      expect(text).not.toContain("SHADOWED_REQUESTED_CONTENT");
       if (requestCount++ === 0) {
         expect(text).toContain("SECOND_REQUESTED_CONTENT");
+        expect(text).not.toContain("WINNING_REQUESTED_CONTENT");
         return fakeGatewayFinalText("STATUS_FIRST_COMPLETE");
       }
-      expect(text).toContain('Skill "status-duplicate" is ambiguous');
+      expect(text).toContain("WINNING_REQUESTED_CONTENT");
+      expect(text).toContain('Skill "status-missing" not found.');
+      expect(text).not.toContain('Skill "status-duplicate" is ambiguous');
       return fakeGatewayFinalText("STATUS_MIXED_COMPLETE");
     });
     const stderrPath = join(root.root, "stderr.log");
     let tui: TmuxSession | null = null;
     try {
-      tui = await TmuxSession.create({ cwd: root.workspace, env: fixtureEnv(root, gateway, join(root.root, "trace.log")), stderrPath, width: 100, height: 36 });
+      tui = await TmuxSession.create({
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        stderrPath,
+        width: 100,
+        height: 36,
+      });
       await tui.waitForComposer(15_000);
       await tui.sendText("Use $status-first and $status-second.");
-      await tui.waitForPane((pane) => pane.includes("STATUS_FIRST_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.waitForPane(
+        (pane) =>
+          pane.includes("STATUS_FIRST_COMPLETE") && hasEmptyComposer(pane),
+        15_000,
+      );
       const first = await tui.captureFullScrollback();
       expect(first).toContain("2 requested skills loaded");
       expect(first).toContain("Loaded skill status-first");
       expect(first).toContain("Loaded skill status-second");
       expect(first).toMatch(/^├ Loaded skill status-first$/m);
       expect(first).toMatch(/^└ Loaded skill status-second$/m);
-      expect(first.indexOf("2 requested skills loaded")).toBeLessThan(first.indexOf("STATUS_FIRST_COMPLETE"));
+      expect(first.indexOf("2 requested skills loaded")).toBeLessThan(
+        first.indexOf("STATUS_FIRST_COMPLETE"),
+      );
       expect(first).not.toContain("tool call");
       await tui.resizeWindow(48, 36);
-      await tui.sendText("Use $status-first and $status-duplicate.");
-      await tui.waitForPane((pane) => pane.includes("STATUS_MIXED_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      await tui.sendText(
+        "Use $status-first, $status-duplicate, and $status-missing.",
+      );
+      await tui.waitForPane(
+        (pane) =>
+          pane.includes("STATUS_MIXED_COMPLETE") && hasEmptyComposer(pane),
+        15_000,
+      );
       const mixed = await tui.captureFullScrollback();
-      expect(mixed.replace(/\s+/g, " ")).toContain("Requested skills · 1 loaded · 1 failed");
-      expect(mixed).toContain("Could not load status-duplicate");
-      expect(mixed).toContain("ambiguous");
-      expect(mixed).toMatch(/^└ Could not load status-duplicate/m);
+      expect(mixed.replace(/\s+/g, " ")).toContain(
+        "Requested skills · 2 loaded · 1 failed",
+      );
+      expect(mixed).toContain("Loaded skill status-duplicate");
+      expect(mixed).toContain("Could not load status-missing");
+      expect(mixed).not.toContain("Could not load status-duplicate");
+      expect(mixed).not.toContain("ambiguous");
+      expect(mixed).toMatch(/^└ Could not load status-missing/m);
       expect(mixed.replace(/\s+/g, " ")).toContain("ctrl+o");
-      expect(mixed).not.toContain("duplicate-a");
       expect(mixed).not.toContain("duplicate-b");
-      expect(mixed).not.toContain("Loaded skill status-duplicate");
       expect(mixed).not.toContain("tool call");
       await tui.sendKeys("C-o");
-      await tui.waitForText("Could not load status-duplicate", 5_000);
-      const details = await tui.waitForText("duplicate-a", 5_000);
-      expect(details).toContain("duplicate-b");
+      const details = await tui.waitForPane(
+        (pane) => pane.replace(/\s+/g, " ").includes('Skill "status-missing" not found.'),
+        5_000,
+      );
+      expect(details).toContain("Could not load status-missing");
+      expect(details).toContain("Loaded skill status-duplicate");
+      expect(details).not.toContain("SHADOWED_REQUESTED_CONTENT");
+      expect(details).not.toContain("duplicate-b");
       await tui.sendKeys("C-o");
       await tui.waitForComposer(5_000);
       expect(gateway.requests).toHaveLength(2);
@@ -2352,7 +2390,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 45_000);
 
-  test("exact advertised skill location loads its matching root", async () => {
+  test("first valid skill name advertises the workspace winner and rejects shadowed locations", async () => {
     const root = createFixtureRoot("exact-skill-identity");
     const tracePath = join(root.root, "trace.log");
     const skillName = "exact-duplicate";
@@ -2377,9 +2415,14 @@ describe("gateway stream lifecycle", () => {
     const bodyA = "EXACT_A_BODY_SENTINEL";
     const bodyB = "EXACT_B_BODY_SENTINEL";
     const companionB = "EXACT_B_COMPANION_SENTINEL.txt";
+    const companionBodyB = "EXACT_B_RESOURCE_BODY_SENTINEL";
     const malformedBody = "MALFORMED_BODY_MUST_NOT_LEAK";
 
-    for (const directory of [skillDirectoryA, skillDirectoryB, malformedDirectory]) {
+    for (const directory of [
+      skillDirectoryA,
+      skillDirectoryB,
+      malformedDirectory,
+    ]) {
       mkdirSync(join(directory, "assets"), { recursive: true });
     }
     writeFileSync(
@@ -2390,33 +2433,35 @@ describe("gateway stream lifecycle", () => {
       join(skillDirectoryB, "SKILL.md"),
       `---\nname: ${skillName}\ndescription: |\n  managed exact\n  duplicate\n---\n\n${bodyB}\n`,
     );
-    writeFileSync(join(skillDirectoryB, "assets", companionB), "b\n");
+    writeFileSync(
+      join(skillDirectoryB, "assets", companionB),
+      `${companionBodyB}\n`,
+    );
     writeFileSync(
       join(malformedDirectory, "SKILL.md"),
       `---\nname: malformed-neighbor\nname: duplicate-key\n---\n\n${malformedBody}\n`,
     );
 
-    const ambiguousCallId = "exact_skill_ambiguous";
+    const nameCallId = "exact_skill_name";
     const searchCallId = "exact_skill_search";
+    const exactACallId = "exact_skill_a";
     const exactBCallId = "exact_skill_b";
+    const resourceBCallId = "exact_skill_b_resource";
     let advertisedA = "";
-    let advertisedB = "";
     let responseIndex = 0;
     let gateway: GatewayFixture;
     gateway = startGateway(() => {
       switch (responseIndex++) {
         case 0: {
-          const locations = advertisedSkillLocations(gateway.requests[0]!.body, skillName).map(
-            (location) => advertisedSkillPath(gateway.requests[0]!.body, location),
+          const locations = advertisedSkillLocations(
+            gateway.requests[0]!.body,
+            skillName,
           );
-          if (locations.length !== 2) {
-            throw new Error(`Expected two advertised ${skillName} locations, got ${JSON.stringify(locations)}`);
-          }
-          if (!locations.includes(skillDirectoryA) || !locations.includes(skillDirectoryB)) {
-            throw new Error(`Expected both exact skill locations, got ${JSON.stringify(locations)}`);
-          }
-          advertisedA = skillDirectoryA;
-          advertisedB = skillDirectoryB;
+          expect(locations).toHaveLength(1);
+          advertisedA = locations[0]!;
+          expect(
+            advertisedSkillPath(gateway.requests[0]!.body, advertisedA),
+          ).toBe(skillDirectoryA);
           return fakeGatewayToolCall(searchCallId, "capability_search", {
             query: "managed exact duplicate workflow",
           });
@@ -2425,20 +2470,34 @@ describe("gateway stream lifecycle", () => {
           const searchOutput = JSON.parse(
             toolResultOutput(gateway.requests[1]!.body, searchCallId),
           ) as {
-            skills: Array<{ name: string; description: string; location: string }>;
+            skills: Array<{
+              name: string;
+              description: string;
+              location: string;
+            }>;
             count: number;
           };
-          if (searchOutput.skills[0]?.location !== advertisedB) {
-            throw new Error(`Expected managed skill first, got ${JSON.stringify(searchOutput)}`);
-          }
-          return fakeGatewayToolCall(ambiguousCallId, "skill", { name: skillName });
+          expect(searchOutput.skills.map((skill) => skill.location)).toEqual([
+            advertisedA,
+          ]);
+          return fakeGatewayToolCall(nameCallId, "skill", { name: skillName });
         }
         case 2:
-          return fakeGatewayToolCall(exactBCallId, "skill", {
-            name: skillName,
-            location: advertisedB,
+          return fakeGatewayToolCall(exactACallId, "skill", {
+            location: advertisedA,
           });
         case 3:
+          // A supplied filesystem path must rediscover the catalog, not bypass shadowing.
+          return fakeGatewayToolCall(exactBCallId, "skill", {
+            name: skillName,
+            location: skillDirectoryB,
+          });
+        case 4:
+          return fakeGatewayToolCall(resourceBCallId, "skill", {
+            location: skillDirectoryB,
+            resource: `assets/${companionB}`,
+          });
+        case 5:
           return fakeGatewayFinalText("Exact duplicate selection complete.");
         default:
           return new Response("unexpected request", { status: 500 });
@@ -2447,7 +2506,13 @@ describe("gateway stream lifecycle", () => {
 
     try {
       const first = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Exercise the exact duplicate skill fixture."],
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          "Exercise the exact duplicate skill fixture.",
+        ],
         {
           cwd: root.workspace,
           env: {
@@ -2466,12 +2531,15 @@ describe("gateway stream lifecycle", () => {
       expect(firstJson.error).toBeUndefined();
       expect(firstJson.tool_calls).toEqual([
         { name: "capability_search", status: "success" },
-        { name: "skill", status: "error" },
         { name: "skill", status: "success" },
+        { name: "skill", status: "success" },
+        { name: "skill", status: "error" },
+        { name: "skill", status: "error" },
       ]);
-      expect(advertisedA).toBe(skillDirectoryA);
-      expect(advertisedB).toBe(skillDirectoryB);
-      expect(gateway.requestCount()).toBe(4);
+      expect(advertisedSkillPath(gateway.requests[0]!.body, advertisedA)).toBe(
+        skillDirectoryA,
+      );
+      expect(gateway.requestCount()).toBe(6);
 
       const initialRequest = gatewayRequest(gateway.requests[0]!.body);
       const skillSchema = initialRequest.tools.find((tool) => tool.name === "skill");
@@ -2493,48 +2561,95 @@ describe("gateway stream lifecycle", () => {
       expect(capabilitySearchSchema?.inputSchema.properties.limit).toBeUndefined();
       expect(capabilitySearchSchema?.inputSchema.properties.cursor).toBeUndefined();
 
-      const available = taggedBlock(gateway.requests[0]!.body, "available_skills");
+      const available = taggedBlock(
+        gateway.requests[0]!.body,
+        "available_skills",
+      );
       expect(promptText(gateway.requests[0]!.body)).toContain(
         '<skill_discovery_warning skipped_candidate_count="1" incomplete_root_count="0" missing_from_incomplete_roots="0" />',
       );
-      expect(advertisedSkillLocations(gateway.requests[0]!.body, skillName)).toHaveLength(2);
+      expect(
+        advertisedSkillLocations(gateway.requests[0]!.body, skillName),
+      ).toEqual([advertisedA]);
       expect(available).toContain("workspace exact duplicate&#x0a;");
-      expect(available).toContain("managed exact&#x0a;duplicate&#x0a;");
+      expect(available).not.toContain("managed exact");
+      expect(available).not.toContain("exact-duplicate-b");
       expect(available).not.toContain("malformed-neighbor");
       expect(available).not.toContain(malformedBody);
       expect(available).not.toContain(bodyA);
       expect(available).not.toContain(bodyB);
 
-      const searchOutputText = toolResultOutput(gateway.requests[1]!.body, searchCallId);
+      const searchOutputText = toolResultOutput(
+        gateway.requests[1]!.body,
+        searchCallId,
+      );
       const searchOutput = JSON.parse(searchOutputText) as {
         skills: Array<{ name: string; description: string; location: string }>;
         counts: { skills: number; mcp_tools: number };
       };
-      expect(searchOutput.counts.skills).toBe(2);
-      expect(searchOutput.skills.map((entry) => entry.location)).toEqual([
-        advertisedB,
-        advertisedA,
+      expect(searchOutput.counts.skills).toBe(1);
+      expect(searchOutput.skills.map(({ name, location }) => ({ name, location }))).toEqual([
+        { name: skillName, location: advertisedA },
       ]);
+      expect(searchOutput.skills[0]!.description).toContain("workspace exact duplicate");
+      expect(searchOutputText).not.toContain("managed exact");
+      expect(searchOutputText).not.toContain("exact-duplicate-b");
+      expect(searchOutputText).not.toContain(companionB);
       expect(searchOutputText).not.toContain(bodyA);
       expect(searchOutputText).not.toContain(bodyB);
       expect(searchOutputText).not.toContain(malformedBody);
 
-      const ambiguity = toolResultOutput(gateway.requests[2]!.body, ambiguousCallId);
-      expect(ambiguity).toContain(advertisedA);
-      expect(ambiguity).toContain(advertisedB);
-      expect(ambiguity).not.toContain(bodyA);
-      expect(ambiguity).not.toContain(bodyB);
+      for (const [requestIndex, callId] of [
+        [2, nameCallId],
+        [3, exactACallId],
+      ] as const) {
+        const loadedA = toolResultOutput(
+          gateway.requests[requestIndex]!.body,
+          callId,
+        );
+        expect(loadedA).toContain(`<skill_content name="${skillName}"`);
+        expect(loadedA).toContain(bodyA);
+        expect(loadedA).not.toContain(bodyB);
+        expect(loadedA).not.toContain(companionB);
+      }
 
-      const loadedB = toolResultOutput(gateway.requests[3]!.body, exactBCallId);
-      expect(loadedB).toContain(bodyB);
-      expect(loadedB).not.toContain(companionB);
-      expect(loadedB).not.toContain(bodyA);
+      for (const [requestIndex, callId] of [
+        [4, exactBCallId],
+        [5, resourceBCallId],
+      ] as const) {
+        const rejectedB = toolResultOutput(
+          gateway.requests[requestIndex]!.body,
+          callId,
+        );
+        expect(rejectedB).toContain("was not found at advertised location");
+        expect(rejectedB).toContain(skillDirectoryB);
+        expect(rejectedB).not.toContain("<skill_content");
+        expect(rejectedB).not.toContain(bodyA);
+        expect(rejectedB).not.toContain(bodyB);
+        expect(rejectedB).not.toContain(companionBodyB);
+      }
+      expect(
+        toolResultOutput(gateway.requests[4]!.body, exactBCallId),
+      ).not.toContain(companionB);
+      for (const request of gateway.requests) {
+        expect(advertisedSkillLocations(request.body, skillName)).toEqual([
+          advertisedA,
+        ]);
+        expect(taggedBlock(request.body, "available_skills")).not.toContain(
+          "exact-duplicate-b",
+        );
+        expect(promptText(request.body)).not.toContain(bodyB);
+        expect(promptText(request.body)).not.toContain(companionBodyB);
+        expect(promptText(request.body)).not.toContain(malformedBody);
+      }
 
       const diagnosticSummary = "skill discovery warning:";
       expect(occurrenceCount(first.stderr, diagnosticSummary)).toBe(1);
       expect(first.stderr).toContain(`see "${tracePath}" for details`);
       expect(first.stderr).toContain(malformedDirectory);
-      expect(first.stderr).toContain("metadata is invalid (duplicate_recognized_key)");
+      expect(first.stderr).toContain(
+        "metadata is invalid (duplicate_recognized_key)",
+      );
       expect(first.stderr).not.toContain(malformedBody);
       const firstTrace = readFileSync(tracePath, "utf8");
       expect(firstTrace).toContain(malformedDirectory);

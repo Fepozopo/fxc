@@ -493,6 +493,10 @@ function createMentionGuardFixture() {
   return { home, workspace };
 }
 
+/**
+ * Creates workspace and managed skills with the same metadata name plus an invalid neighbor.
+ * @returns Fixture paths, body markers, and the workspace winner's description; teardown owns cleanup.
+ */
 function createExactSkillsMenuFixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-exact-skills-menu-")));
   workDirs.push(root);
@@ -3658,7 +3662,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "selected duplicate skill binds one advertised location",
+    "duplicate skill picker exposes only the workspace winner",
     async () => {
       const fixture = createExactSkillsMenuFixture();
       const tracePath = join(fixture.root, "trace.log");
@@ -3708,18 +3712,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(startupDiagnosticCount).toBeGreaterThan(0);
 
       await session.sendLiteralText("$exact-picker");
-      await session.waitForPane(
-        (pane) => countOccurrences(pane, "exact-picker") >= 3,
+      const picker = await session.waitForPane(
+        (pane) => pane.includes(fixture.workspaceDescription) && pane.includes("enter use"),
         5_000,
       );
-      await session.sendKeys("Down");
-      const selectedRows = (await session.capturePaneEscapes())
-        .split("\n")
-        .filter((line) =>
-          line.includes(SELECTED_COMPLETION_SGR) && line.includes("exact-picker")
-        );
-      expect(selectedRows).toHaveLength(1);
-      expect(selectedRows[0]).toContain("Workspace");
+      expect(countOccurrences(picker, fixture.workspaceDescription)).toBe(1);
+      expect(picker).not.toContain("managed duplicate picker");
       await session.sendKeys("Enter");
       await session.waitForPane((pane) => composerContains(pane, "exact-picker"), 5_000);
       await session.sendLiteralText(" inspect the exact selection");
@@ -3742,6 +3740,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(firstPrompt).toContain(fixture.workspaceDescription);
       expect(firstPrompt).toContain(fixture.bodyB);
       expect(firstPrompt).not.toContain(fixture.bodyA);
+      const available = firstPrompt.split("<available_skills>")[1]?.split("</available_skills>")[0] ?? "";
+      const advertised = available.split("\n").filter((line) => line.startsWith("- exact-picker: "));
+      expect(advertised).toHaveLength(1);
+      expect(advertised[0]).toContain("/exact-picker-workspace)");
+      expect(available).toContain(join(fixture.workspace, "skills"));
+      expect(available).not.toContain("exact-picker-managed");
+      expect(available).not.toContain("managed duplicate picker");
 
       const loadScrollback = await session.captureFullScrollback();
       expect(countOccurrences(loadScrollback, "1 requested skill loaded")).toBe(1);

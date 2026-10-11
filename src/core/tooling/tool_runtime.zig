@@ -6797,7 +6797,7 @@ test "skill tool preserves resource and discovery notices separately" {
     }
 }
 
-test "skill tool loads the exact advertised duplicate and rejects ambiguous or untrusted locations" {
+test "skill tool loads the first advertised name and rejects shadowed or untrusted locations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6855,24 +6855,33 @@ test "skill tool loads the exact advertised duplicate and rejects ambiguous or u
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const exact_managed_args = try std.fmt.allocPrint(arena, "{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{managed_skill});
-    const exact = try executeToolCall(rt.context(), arena, .{ .id = "exact", .name = "skill", .arguments_json = exact_managed_args });
+    const exact_workspace_args = try std.fmt.allocPrint(arena, "{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{workspace_skill});
+    const exact = try executeToolCall(rt.context(), arena, .{ .id = "exact", .name = "skill", .arguments_json = exact_workspace_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, exact.status);
-    try expectContains(exact.model_output, "MANAGED BODY B");
-    try expectNotContains(exact.model_output, "b-only.txt");
-    try expectNotContains(exact.model_output, "WORKSPACE BODY A");
+    try expectContains(exact.model_output, "WORKSPACE BODY A");
+    try expectNotContains(exact.model_output, "MANAGED BODY B");
     try expectNotContains(exact.model_output, "a-only.txt");
 
-    const duplicate = try executeToolCall(rt.context(), arena, .{ .id = "duplicate", .name = "skill", .arguments_json = exact_managed_args });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, duplicate.status);
-    try expectContains(duplicate.model_output, "MANAGED BODY B");
-    try expectNotContains(duplicate.model_output, "already loaded");
+    const repeated = try executeToolCall(rt.context(), arena, .{ .id = "repeated", .name = "skill", .arguments_json = exact_workspace_args });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, repeated.status);
+    try expectContains(repeated.model_output, "WORKSPACE BODY A");
+    try expectNotContains(repeated.model_output, "already loaded");
 
-    const ambiguous = try executeToolCall(rt.context(), arena, .{ .id = "ambiguous", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, ambiguous.status);
-    try expectContains(ambiguous.model_output, "ambiguous");
-    try expectContains(ambiguous.model_output, workspace_skill);
-    try expectContains(ambiguous.model_output, managed_skill);
+    const by_name = try executeToolCall(rt.context(), arena, .{ .id = "by_name", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, by_name.status);
+    try expectContains(by_name.model_output, "WORKSPACE BODY A");
+    try expectNotContains(by_name.model_output, "MANAGED BODY B");
+
+    const exact_managed_args = try std.fmt.allocPrint(arena, "{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{managed_skill});
+    const shadowed = try executeToolCall(rt.context(), arena, .{ .id = "shadowed", .name = "skill", .arguments_json = exact_managed_args });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, shadowed.status);
+    try expectContains(shadowed.model_output, "not found");
+    try expectNotContains(shadowed.model_output, "MANAGED BODY B");
+    const resource_args = try std.fmt.allocPrint(arena, "{{\"location\":\"{s}\",\"resource\":\"assets/b-only.txt\"}}", .{managed_skill});
+    const resource = try executeToolCall(rt.context(), arena, .{ .id = "shadowed_resource", .name = "skill", .arguments_json = resource_args });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, resource.status);
+    try expectContains(resource.model_output, "not found");
+    try expectNotContains(resource.model_output, "MANAGED COMPANION B");
 
     const outside_args = try std.fmt.allocPrint(arena, "{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{outside_skill});
     const outside = try executeToolCall(rt.context(), arena, .{ .id = "outside", .name = "skill", .arguments_json = outside_args });
@@ -6880,14 +6889,14 @@ test "skill tool loads the exact advertised duplicate and rejects ambiguous or u
     try expectNotContains(outside.model_output, "OUTSIDE BODY SENTINEL");
     try expectNotContains(outside.model_output, "outside-only.txt");
 
-    const mismatch_args = try std.fmt.allocPrint(arena, "{{\"name\":\"other\",\"location\":\"{s}\"}}", .{managed_skill});
+    const mismatch_args = try std.fmt.allocPrint(arena, "{{\"name\":\"other\",\"location\":\"{s}\"}}", .{workspace_skill});
     const mismatch = try executeToolCall(rt.context(), arena, .{ .id = "mismatch", .name = "skill", .arguments_json = mismatch_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, mismatch.status);
     try expectContains(mismatch.model_output, "does not match");
-    try expectNotContains(mismatch.model_output, "MANAGED BODY B");
+    try expectNotContains(mismatch.model_output, "WORKSPACE BODY A");
 }
 
-test "name-only skill call rediscovers a duplicate added after the first read" {
+test "name-only skill call selects a higher-precedence duplicate added after the first read" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6925,8 +6934,9 @@ test "name-only skill call rediscovers a duplicate added after the first read" {
     }
 
     const rediscovered = try executeToolCall(rt.context(), arena, .{ .id = "rediscovered", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rediscovered.status);
-    try expectContains(rediscovered.model_output, "ambiguous");
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, rediscovered.status);
+    try expectContains(rediscovered.model_output, "WORKSPACE BODY B");
+    try expectNotContains(rediscovered.model_output, "MANAGED BODY A");
     try expectNotContains(rediscovered.model_output, "already loaded");
 }
 

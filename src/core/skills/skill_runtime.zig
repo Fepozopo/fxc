@@ -305,9 +305,8 @@ fn collectSkillEntries(
     return entries;
 }
 
-/// Deduplicates filesystem aliases without collapsing distinct skills that
-/// share metadata names. Ordered discovery makes the first logical root the
-/// stable source and display path for each canonical candidate directory.
+/// Deduplicates filesystem aliases before metadata inspection. Ordered discovery
+/// keeps the first logical root as the source and display path of each candidate.
 const CanonicalSkillPaths = struct {
     paths: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -333,6 +332,11 @@ const CanonicalSkillPaths = struct {
     }
 };
 
+/// Discovers valid skills from `root_policy` in root precedence and directory-name order.
+/// Keeps only the first valid candidate for each exact metadata name, including
+/// duplicates within one root. Optional workspace and home paths select the roots;
+/// `skills_dir` supplies the managed root. The caller owns the returned discovery
+/// and must release it with `SkillDiscovery.deinit(alloc)`.
 pub fn loadVisibleSkills(
     alloc: Allocator,
     workspace_root: ?[]const u8,
@@ -352,6 +356,9 @@ pub fn loadVisibleSkills(
     }
     var canonical_skill_paths: CanonicalSkillPaths = .{};
     defer canonical_skill_paths.deinit(alloc);
+    // Keys borrow admitted skill names, which outlive this discovery-local map.
+    var skill_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer skill_names.deinit(alloc);
 
     var roots: std.ArrayList(SkillRoot) = .empty;
     defer {
@@ -369,7 +376,7 @@ pub fn loadVisibleSkills(
     );
 
     for (roots.items) |root| {
-        try appendSkillsFromDir(alloc, &skills, &diagnostics, &canonical_skill_paths, root);
+        try appendSkillsFromDir(alloc, &skills, &diagnostics, &canonical_skill_paths, &skill_names, root);
     }
 
     const owned_skills = try skills.toOwnedSlice(alloc);
@@ -464,6 +471,8 @@ fn collectRootFingerprints(
     return fingerprints;
 }
 
+/// Fingerprints candidate directories and metadata stats in `root` without loading bodies.
+/// Includes shadowed candidates so metadata edits can make them eligible on refresh.
 fn candidateDirectoryDigest(
     alloc: Allocator,
     root: SkillRoot,
@@ -477,33 +486,48 @@ fn candidateDirectoryDigest(
     for (entries.items) |entry| {
         hash.update(entry.name);
         hash.update(if (entry.linked) "\x01" else "\x00");
-        const stat = if (entry.linked) linked: {
+        var candidate_dir = if (entry.linked) linked: {
             const candidate_path = try std.fs.path.join(alloc, &.{ root.path, entry.name });
             defer alloc.free(candidate_path);
-            var candidate_dir = openContainedDir(
-                alloc,
-                candidate_path,
-                root.read_authority.?,
-                .{},
-            ) catch {
+            break :linked openContainedDir(alloc, candidate_path, root.read_authority.?, .{}) catch {
                 hash.update("unavailable");
                 continue;
             };
-            defer candidate_dir.close(io_mod.getIo());
-            break :linked candidate_dir.stat(io_mod.getIo()) catch {
-                hash.update("unavailable");
-                continue;
-            };
-        } else dir.statFile(
-            io_mod.getIo(),
-            entry.name,
-            .{ .follow_symlinks = false },
-        ) catch {
+        } else dir.openDir(io_mod.getIo(), entry.name, .{ .follow_symlinks = false }) catch {
+            hash.update("unavailable");
+            continue;
+        };
+        defer candidate_dir.close(io_mod.getIo());
+        const stat = candidate_dir.stat(io_mod.getIo()) catch {
             hash.update("unavailable");
             continue;
         };
         hash.update(std.mem.asBytes(&stat.inode));
         hash.update(std.mem.asBytes(&stat.mtime.nanoseconds));
+        // Shadowed entries are absent from the active catalog's metadata checks.
+        // Include their file stats so changing a name cannot remain invisible.
+        const path_stat = candidate_dir.statFile(io_mod.getIo(), "SKILL.md", .{ .follow_symlinks = false }) catch {
+            hash.update("metadata-unavailable");
+            continue;
+        };
+        // Authorized metadata links must track their target, not just the link.
+        const metadata_stat = if (path_stat.kind == .sym_link) linked_metadata: {
+            var file = switch (try openPrimarySkillFile(alloc, &candidate_dir, root.read_authority)) {
+                .opened => |opened| opened,
+                .missing, .rejected => {
+                    hash.update("metadata-unavailable");
+                    continue;
+                },
+            };
+            defer file.close(io_mod.getIo());
+            break :linked_metadata file.stat(io_mod.getIo()) catch {
+                hash.update("metadata-unavailable");
+                continue;
+            };
+        } else path_stat;
+        hash.update(std.mem.asBytes(&metadata_stat.inode));
+        hash.update(std.mem.asBytes(&metadata_stat.size));
+        hash.update(std.mem.asBytes(&metadata_stat.mtime.nanoseconds));
     }
     return hash.finalResult();
 }
@@ -700,11 +724,14 @@ fn containsRootPath(roots: []const SkillRoot, path: []const u8) bool {
     return false;
 }
 
+/// Appends the first valid candidates from `root` in lexical directory order.
+/// Diagnostics own copied paths; `skill_names` borrows names from admitted skills.
 fn appendSkillsFromDir(
     alloc: Allocator,
     skills: *std.ArrayList(Skill),
     diagnostics: ?*std.ArrayList(SkillDiagnostic),
     canonical_skill_paths: *CanonicalSkillPaths,
+    skill_names: *std.StringHashMapUnmanaged(void),
     root: SkillRoot,
 ) !void {
     var dir = openSkillRoot(alloc, root, .{ .iterate = true }) catch |err| {
@@ -723,7 +750,7 @@ fn appendSkillsFromDir(
     defer freeSkillEntries(alloc, &entries);
 
     for (entries.items) |entry| {
-        try appendSkillCandidate(alloc, skills, diagnostics, canonical_skill_paths, root, &dir, entry.name, entry.linked);
+        try appendSkillCandidate(alloc, skills, diagnostics, canonical_skill_paths, skill_names, root, &dir, entry.name, entry.linked);
     }
 }
 
@@ -841,11 +868,15 @@ fn openPrimarySkillFileWithOptions(
     }
 }
 
+/// Inspects one candidate and admits its owned metadata only if its name is new.
+/// Reads through `root_dir` and the root's symlink authority, recording invalid
+/// candidates in `diagnostics`; invalid entries never reserve a name.
 fn appendSkillCandidate(
     alloc: Allocator,
     skills: *std.ArrayList(Skill),
     diagnostics: ?*std.ArrayList(SkillDiagnostic),
     canonical_skill_paths: *CanonicalSkillPaths,
+    skill_names: *std.StringHashMapUnmanaged(void),
     root: SkillRoot,
     root_dir: *std.Io.Dir,
     entry_name: []const u8,
@@ -915,6 +946,10 @@ fn appendSkillCandidate(
     };
     defer candidate.deinit(alloc);
 
+    // Metadata names can differ from directory names, so precedence is decided
+    // after validation but before allocating or advertising the later candidate.
+    if (skill_names.contains(candidate.metadata.name)) return;
+
     const skill_name = try alloc.dupe(u8, candidate.metadata.name);
     errdefer alloc.free(skill_name);
     const description = try alloc.alloc(u8, candidate.metadata.description_len());
@@ -928,6 +963,8 @@ fn appendSkillCandidate(
         null;
     errdefer if (read_authority) |authority| alloc.free(authority);
 
+    try skill_names.put(alloc, skill_name, {});
+    errdefer _ = skill_names.remove(skill_name);
     try skills.append(alloc, .{
         .name = skill_name,
         .description = description,
@@ -1751,6 +1788,9 @@ fn statKnownSkill(skill: Skill) !std.Io.File.Stat {
     );
 }
 
+/// Reloads owned metadata for `previous` while retaining its identity.
+/// Returns null when validation or a name change requires precedence-aware discovery.
+/// The caller releases returned allocations with `freeSkill(alloc, skill)`.
 fn loadKnownSkill(alloc: Allocator, previous: Skill) !?Skill {
     var candidate_dir = if (previous.read_authority) |authority|
         openContainedDir(alloc, previous.path, authority, .{}) catch return null
@@ -1774,6 +1814,7 @@ fn loadKnownSkill(alloc: Allocator, previous: Skill) !?Skill {
         .invalid, .unreadable, .oversized => return null,
     };
     defer candidate.deinit(alloc);
+    if (!std.mem.eql(u8, candidate.metadata.name, previous.name)) return null;
     const name = try alloc.dupe(u8, candidate.metadata.name);
     errdefer alloc.free(name);
     const description = try alloc.alloc(u8, candidate.metadata.description_len());
@@ -3772,6 +3813,73 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
 }
 
+test "skill refresh reconsiders duplicate names after metadata changes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/skills/alpha/SKILL.md", "---\nname: review\ndescription: first\n---\nfirst body\n");
+    try writeTempFile(&tmp, "home/.fx/skills/beta/SKILL.md", "---\nname: review\ndescription: later\n---\nlater body\n");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const managed = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed);
+    var runtime = Runtime{ .dir = try alloc.dupe(u8, managed) };
+    defer runtime.deinit(alloc);
+    const steps = [_]struct {
+        file: []const u8,
+        content: []const u8,
+        expected_names: []const []const u8,
+        winner_directory: []const u8,
+    }{
+        .{ .file = "beta", .content = "---\nname: review\ndescription: later\n---\nlater body\n", .expected_names = &.{"review"}, .winner_directory = "alpha" },
+        .{ .file = "beta", .content = "---\nname: newly-unique\ndescription: now eligible\n---\nlater body\n", .expected_names = &.{ "review", "newly-unique" }, .winner_directory = "alpha" },
+        .{ .file = "beta", .content = "---\nname: review\ndescription: duplicate again\n---\nlater body\n", .expected_names = &.{"review"}, .winner_directory = "alpha" },
+        .{ .file = "alpha", .content = "---\nname: \"\"\n---\ninvalid former winner\n", .expected_names = &.{"review"}, .winner_directory = "beta" },
+    };
+    for (steps) |step| {
+        const file_path = try std.fmt.allocPrint(alloc, "home/.fx/skills/{s}/SKILL.md", .{step.file});
+        defer alloc.free(file_path);
+        try writeTempFile(&tmp, file_path, step.content);
+        const generation = try runtime.requestRefresh(alloc, home, home, test_managed_root_policy);
+        while (runtime.generationStatus(generation) == .pending) {
+            if (try runtime.pollRefresh(alloc, home, test_managed_root_policy) == .failed) return error.TestSkillRefreshFailed;
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        try std.testing.expectEqual(step.expected_names.len, runtime.items.len);
+        for (runtime.items, step.expected_names) |skill, name| try std.testing.expectEqualStrings(name, skill.name);
+        try std.testing.expectEqualStrings(step.winner_directory, std.fs.path.basename(runtime.items[0].path));
+    }
+}
+
+test "skill refresh detects a renamed shadowed metadata link target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.agents/skills/alpha/SKILL.md", "---\nname: review\n---\nfirst body\n");
+    try writeTempFile(&tmp, "home/metadata/beta.md", "---\nname: review\n---\nlater body\n");
+    try createTempSymlinkOrSkip(&tmp, "../../../metadata/beta.md", "home/.agents/skills/beta/SKILL.md");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const managed = try std.fs.path.join(alloc, &.{ home, ".fx/skills" });
+    defer alloc.free(managed);
+    const roots = [_]skill_contract.RootSpec{.{ .source = .global_agents, .path = ".agents/skills" }};
+    const policy: skill_contract.RootPolicy = .{ .global_roots = &roots, .managed_root_source = null };
+    var runtime = Runtime{ .dir = try alloc.dupe(u8, managed) };
+    defer runtime.deinit(alloc);
+    const expected_catalogs = [_][]const []const u8{ &.{"review"}, &.{ "review", "linked-unique" } };
+    for (expected_catalogs, 0..) |expected_names, index| {
+        if (index == 1) try writeTempFile(&tmp, "home/metadata/beta.md", "---\nname: linked-unique\n---\nlater body\n");
+        const generation = try runtime.requestRefresh(alloc, home, home, policy);
+        while (runtime.generationStatus(generation) == .pending) {
+            if (try runtime.pollRefresh(alloc, home, policy) == .failed) return error.TestSkillRefreshFailed;
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        try std.testing.expectEqual(@as(usize, 0), runtime.diagnostics.len);
+        try std.testing.expectEqual(expected_names.len, runtime.items.len);
+        for (runtime.items, expected_names) |skill, name| try std.testing.expectEqualStrings(name, skill.name);
+    }
+}
+
 test "an empty launch catalog fills from a refresh before its startup inventory is due" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4755,7 +4863,7 @@ test "loadVisibleSkills scans only roots supplied by policy" {
     try std.testing.expect(findSkillByName(discovery.skills, "ignored-managed") == null);
 }
 
-test "loadVisibleSkills preserves root-distinct duplicate skill names" {
+test "loadVisibleSkills keeps the first valid skill name across roots" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4776,20 +4884,59 @@ test "loadVisibleSkills preserves root-distinct duplicate skill names" {
     defer discovery.deinit(alloc);
     const skills = discovery.skills;
 
-    try std.testing.expectEqual(@as(usize, 4), skills.len);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("review", skills[0].name);
     try std.testing.expectEqualStrings("closest", skills[0].description);
     try std.testing.expectEqual(SkillSource.workspace_agents, skills[0].source);
-    try std.testing.expectEqualStrings("ancestor", skills[1].description);
-    try std.testing.expectEqual(SkillSource.workspace_agents, skills[1].source);
-    try std.testing.expectEqualStrings("managed", skills[2].description);
-    try std.testing.expectEqual(SkillSource.global_fx, skills[2].source);
-    try std.testing.expectEqualStrings("global compatibility", skills[3].description);
-    try std.testing.expectEqual(SkillSource.global_agents, skills[3].source);
-    try std.testing.expectEqual(@as(usize, 4), skillMenuFilterQueryCount(skills, .all, "review"));
-    try std.testing.expectEqual(@as(usize, 3), skillMenuFilterQueryCount(skills, .agents, "review"));
+    try std.testing.expectEqual(@as(usize, 1), skillMenuFilterQueryCount(skills, .all, "review"));
+    try std.testing.expectEqual(@as(usize, 1), skillMenuFilterQueryCount(skills, .agents, "review"));
 }
 
-test "loadVisibleSkills deduplicates symlinked workspace and global roots while preserving physical same-name candidates" {
+test "loadVisibleSkills lets valid later roots replace missing or invalid candidates" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        label: []const u8,
+        first_content: ?[]const u8,
+        diagnostic_count: usize,
+    }{
+        .{ .label = "missing metadata", .first_content = null, .diagnostic_count = 0 },
+        .{ .label = "invalid metadata", .first_content = "---\nname: review\nname: review\n---\ninvalid body\n", .diagnostic_count = 1 },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace/.fx/skills/first");
+        if (case.first_content) |content| {
+            try writeTempFile(&tmp, "home/workspace/.fx/skills/first/SKILL.md", content);
+        }
+        try writeTempFile(&tmp, "home/.fx/skills/review/SKILL.md", "---\nname: review\ndescription: valid fallback\n---\nvalid body\n");
+        const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+        defer alloc.free(workspace);
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        const managed = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+        defer alloc.free(managed);
+        const workspace_roots = [_]skill_contract.RootSpec{.{ .source = .workspace_fx, .path = ".fx/skills" }};
+        var discovery = try loadVisibleSkills(alloc, workspace, home, managed, .{
+            .workspace_roots = &workspace_roots,
+            .managed_root_source = .global_fx,
+        });
+        defer discovery.deinit(alloc);
+        if (discovery.skills.len != 1) {
+            std.debug.print("{s}: expected one valid fallback skill, got {d}\n", .{ case.label, discovery.skills.len });
+            return error.TestExpectedFallbackSkill;
+        }
+        try std.testing.expectEqualStrings("review", discovery.skills[0].name);
+        try std.testing.expectEqualStrings("valid fallback", discovery.skills[0].description);
+        try std.testing.expectEqual(SkillSource.global_fx, discovery.skills[0].source);
+        try std.testing.expectEqual(case.diagnostic_count, discovery.diagnostics.len);
+        if (case.diagnostic_count > 0) {
+            try std.testing.expectEqual(SkillDiagnosticCause{ .invalid_metadata = .duplicate_recognized_key }, discovery.diagnostics[0].cause);
+        }
+    }
+}
+
+test "loadVisibleSkills deduplicates aliased roots and same-name candidates" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4807,7 +4954,7 @@ test "loadVisibleSkills deduplicates symlinked workspace and global roots while 
     try writeTempFile(
         &tmp,
         "home/.agents/skills/global/SKILL.md",
-        "---\nname: review\ndescription: global workflow\n---\n\nglobal body\n",
+        "---\nname: global-review\ndescription: global workflow\n---\n\nglobal body\n",
     );
     try createTempSymlinkOrSkip(
         &tmp,
@@ -4844,16 +4991,13 @@ test "loadVisibleSkills deduplicates symlinked workspace and global roots while 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, unused_managed_root, root_policy);
     defer discovery.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), discovery.skills.len);
+    try std.testing.expectEqual(@as(usize, 2), discovery.skills.len);
     try std.testing.expectEqualStrings("review", discovery.skills[0].name);
     try std.testing.expectEqualStrings("alpha workflow", discovery.skills[0].description);
     try std.testing.expectEqual(SkillSource.workspace_claude, discovery.skills[0].source);
-    try std.testing.expectEqualStrings("review", discovery.skills[1].name);
-    try std.testing.expectEqualStrings("beta workflow", discovery.skills[1].description);
-    try std.testing.expectEqual(SkillSource.workspace_claude, discovery.skills[1].source);
-    try std.testing.expectEqualStrings("review", discovery.skills[2].name);
-    try std.testing.expectEqualStrings("global workflow", discovery.skills[2].description);
-    try std.testing.expectEqual(SkillSource.global_claude, discovery.skills[2].source);
+    try std.testing.expectEqualStrings("global-review", discovery.skills[1].name);
+    try std.testing.expectEqualStrings("global workflow", discovery.skills[1].description);
+    try std.testing.expectEqual(SkillSource.global_claude, discovery.skills[1].source);
 
     const alpha_alias = try std.fs.path.join(alloc, &.{ workspace_root, ".claude/skills/alpha" });
     defer alloc.free(alpha_alias);
@@ -4862,13 +5006,12 @@ test "loadVisibleSkills deduplicates symlinked workspace and global roots while 
     const global_alias = try std.fs.path.join(alloc, &.{ home_root, ".claude/skills/global" });
     defer alloc.free(global_alias);
     try std.testing.expectEqualStrings(alpha_alias, discovery.skills[0].path);
-    try std.testing.expectEqualStrings(beta_alias, discovery.skills[1].path);
-    try std.testing.expectEqualStrings(global_alias, discovery.skills[2].path);
-    try std.testing.expectEqual(SkillResolution.ambiguous_name, resolveSkill(discovery.skills, "review", null));
-    switch (resolveSkill(discovery.skills, "review", beta_alias)) {
-        .found => |skill| try std.testing.expectEqualStrings("beta workflow", skill.description),
-        else => return error.TestExpectedExactSkill,
+    try std.testing.expectEqualStrings(global_alias, discovery.skills[1].path);
+    switch (resolveSkill(discovery.skills, "review", null)) {
+        .found => |skill| try std.testing.expectEqualStrings(alpha_alias, skill.path),
+        else => return error.TestExpectedFirstSkill,
     }
+    try std.testing.expectEqual(SkillResolution.not_found, resolveSkill(discovery.skills, "review", beta_alias));
     try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
 }
 
@@ -5631,7 +5774,7 @@ test "loadVisibleSkills discovers a skill whose body exceeds the old discovery c
     try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
 }
 
-test "loadVisibleSkills orders valid candidates diagnoses invalid metadata and resolves exact identity" {
+test "loadVisibleSkills keeps lexical first names diagnoses invalid metadata and rejects shadowed identity" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5653,11 +5796,10 @@ test "loadVisibleSkills orders valid candidates diagnoses invalid metadata and r
     var discovery = try loadVisibleSkills(alloc, null, null, root, test_managed_root_policy);
     defer discovery.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), discovery.skills.len);
+    try std.testing.expectEqual(@as(usize, 2), discovery.skills.len);
     try std.testing.expectEqualStrings(alpha_path, discovery.skills[0].path);
-    try std.testing.expectEqualStrings(beta_path, discovery.skills[1].path);
-    try std.testing.expectEqualStrings("zeta", discovery.skills[2].name);
-    try std.testing.expectEqualStrings("", discovery.skills[2].description);
+    try std.testing.expectEqualStrings("zeta", discovery.skills[1].name);
+    try std.testing.expectEqualStrings("", discovery.skills[1].description);
     try std.testing.expectEqual(@as(usize, 1), discovery.diagnostics.len);
     try std.testing.expectEqualStrings(bad_path, discovery.diagnostics[0].path);
     try std.testing.expectEqual(SkillSource.global_fx, discovery.diagnostics[0].source);
@@ -5667,12 +5809,12 @@ test "loadVisibleSkills orders valid candidates diagnoses invalid metadata and r
         else => return error.TestExpectedInvalidMetadataDiagnostic,
     }
 
-    try std.testing.expectEqual(SkillResolution.ambiguous_name, resolveSkill(discovery.skills, "duplicate", null));
-    switch (resolveSkill(discovery.skills, "duplicate", beta_path)) {
-        .found => |skill| try std.testing.expectEqualStrings(beta_path, skill.path),
-        else => return error.TestExpectedExactSkill,
+    switch (resolveSkill(discovery.skills, "duplicate", null)) {
+        .found => |skill| try std.testing.expectEqualStrings(alpha_path, skill.path),
+        else => return error.TestExpectedFirstSkill,
     }
-    try std.testing.expectEqual(SkillResolution.name_location_mismatch, resolveSkill(discovery.skills, "other", beta_path));
+    try std.testing.expectEqual(SkillResolution.not_found, resolveSkill(discovery.skills, "duplicate", beta_path));
+    try std.testing.expectEqual(SkillResolution.name_location_mismatch, resolveSkill(discovery.skills, "other", alpha_path));
     try std.testing.expectEqual(SkillResolution.not_found, resolveSkill(discovery.skills, "duplicate", "/outside/root"));
 }
 
@@ -5723,6 +5865,7 @@ test "loadVisibleSkills cleans every partial allocation failure" {
         "home/.fx/skills/review/SKILL.md",
         "---\nname: review\ndescription: >-\n  allocation\n  cleanup\n---\nbody\n",
     );
+    try writeTempFile(&tmp, "home/.fx/skills/shadowed/SKILL.md", "---\nname: review\ndescription: must not be admitted\n---\nshadowed body\n");
     try writeTempFile(&tmp, "home/.fx/skills/bad/SKILL.md", "---\nname: first\nname: duplicate\n---\nbad body\n");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
 
