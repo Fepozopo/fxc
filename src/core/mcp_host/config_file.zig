@@ -141,17 +141,17 @@ pub fn lockProfile(profile_path: []const u8) !io_mod.TimedAdvisoryLock {
 pub fn replaceProfile(alloc: Allocator, profile_path: []const u8, text: []const u8) !void {
     var dir = try profileDir(profile_path);
     defer dir.close();
-    try io_mod.durableReplaceVerified(alloc, &dir, std.fs.path.basename(profile_path), text);
+    try io_mod.durableReplaceVerified(alloc, &dir, std.Io.Dir.path.basename(profile_path), text);
 }
 
 fn profileDir(profile_path: []const u8) !io_mod.VerifiedDir {
-    const parent = std.fs.path.dirname(profile_path) orelse return error.McpConfigPathInvalid;
-    const grandparent = std.fs.path.dirname(parent) orelse return error.McpConfigPathInvalid;
+    const parent = std.Io.Dir.path.dirname(profile_path) orelse return error.McpConfigPathInvalid;
+    const grandparent = std.Io.Dir.path.dirname(parent) orelse return error.McpConfigPathInvalid;
     var enclosing = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), grandparent, .{ .iterate = true }),
     };
     defer enclosing.close();
-    return io_mod.openOrCreateVerifiedPrivateDir(&enclosing, std.fs.path.basename(parent));
+    return io_mod.openOrCreateVerifiedPrivateDir(&enclosing, std.Io.Dir.path.basename(parent));
 }
 
 /// A project's `.mcp.json` is shared, so it keeps its mode.
@@ -284,14 +284,14 @@ test "an older profile keeps its mcp key; a project file never uses it" {
     const old_profile = "{\"mcp\":{\"a\":{\"command\":\"x\"}}}";
     const profile = try add(testing.allocator, .profile, old_profile, "b", .{ .stdio = .{ .command = "y" } });
     defer testing.allocator.free(profile);
-    try testing.expect(std.mem.indexOf(u8, profile, "\"mcpServers\"") == null);
+    try testing.expect(std.mem.find(u8, profile, "\"mcpServers\"") == null);
     try testing.expect(has(testing.allocator, .profile, profile, "b"));
 
     const project = try add(testing.allocator, .project, old_profile, "b", .{ .stdio = .{ .command = "y" } });
     defer testing.allocator.free(project);
     try testing.expect(has(testing.allocator, .project, project, "b"));
     try testing.expect(!has(testing.allocator, .project, project, "a"));
-    try testing.expect(std.mem.indexOf(u8, project, "\"mcp\": {") != null);
+    try testing.expect(std.mem.find(u8, project, "\"mcp\": {") != null);
 }
 
 test "add refuses what it can't edit safely" {
@@ -315,10 +315,10 @@ test "remove drops one entry, keeps the rest in order, and returns its url" {
     defer removed.deinit(a);
     try testing.expectEqualStrings("https://w/mcp", removed.url.?);
     try testing.expect(!has(a, .profile, removed.text, "web"));
-    const order_a = std.mem.indexOf(u8, removed.text, "\"a\"").?;
-    const order_c = std.mem.indexOf(u8, removed.text, "\"c\"").?;
+    const order_a = std.mem.find(u8, removed.text, "\"a\"").?;
+    const order_c = std.mem.find(u8, removed.text, "\"c\"").?;
     try testing.expect(order_a < order_c);
-    try testing.expect(std.mem.indexOf(u8, removed.text, "\"x\": 1") != null);
+    try testing.expect(std.mem.find(u8, removed.text, "\"x\": 1") != null);
 
     var stdio = (try remove(a, .profile, before, "a")).?;
     defer stdio.deinit(a);

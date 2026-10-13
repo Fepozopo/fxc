@@ -65,7 +65,7 @@ pub const Writer = struct {
         if (self.parent) |parent| {
             var buffer: [256]u8 = undefined;
             var named = step;
-            named.instance = std.fmt.bufPrint(&buffer, "{s}.{s}", .{ self.prefix, step.instance }) catch return error.WriteFailed;
+            named.instance = std.mem.print(&buffer, "{s}.{s}", .{ self.prefix, step.instance }) catch return error.WriteFailed;
             return parent.write(named);
         }
         const w = self.out;

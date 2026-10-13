@@ -324,7 +324,7 @@ pub const Client = struct {
     /// JSON. Asking for identity keeps decompression out of the binary.
     const identity_only = blk: {
         var accept: @FieldType(std.http.Client.Request, "accept_encoding") = @splat(false);
-        accept[@intFromEnum(std.http.ContentEncoding.identity)] = true;
+        accept[@backingInt(std.http.ContentEncoding.identity)] = true;
         break :blk accept;
     };
 
@@ -345,7 +345,7 @@ pub const Client = struct {
             req.sendBodyComplete(b) catch return .{ .how = .broken };
         } else req.sendBodiless() catch return .{ .how = .broken };
         var response = req.receiveHead(&.{}) catch return .{ .how = .broken };
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
         // The head's bytes don't outlive reading the body.
         var challenge: std.ArrayList(u8) = .empty;
         defer challenge.deinit(c.gpa);
@@ -407,7 +407,7 @@ pub const Client = struct {
             req.sendBodyComplete(b) catch return none;
         } else req.sendBodiless() catch return none;
         var response = req.receiveHead(&.{}) catch return none;
-        var got: @FieldType(Posted, "fetched") = .{ .key = key, .status = @intFromEnum(response.head.status) };
+        var got: @FieldType(Posted, "fetched") = .{ .key = key, .status = @backingInt(response.head.status) };
         var it = response.head.iterateHeaders();
         while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "location")) {
             got.location = c.gpa.dupe(u8, h.value) catch null;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -15,6 +16,7 @@ const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
+const editor_state = @import("../input/editor_state.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const mod_registry = @import("../mods/registry.zig");
 const completion_feature = @import("../mcp/features/completion.zig");
@@ -365,7 +367,7 @@ fn appendTemplateArgumentFields(
             if (variable.len > 0 and std.mem.findScalar(u8, "+#./;?&", variable[0]) != null) {
                 variable = variable[1..];
             }
-            const modifier = std.mem.indexOfAny(u8, variable, ":*") orelse variable.len;
+            const modifier = std.mem.findAny(u8, variable, ":*") orelse variable.len;
             const name = variable[0..modifier];
             if (name.len > 0) try appendMenuArgumentField(alloc, fields, name, true);
         }
@@ -413,7 +415,7 @@ fn expandResourceTemplate(
         var variables = std.mem.splitScalar(u8, variables_text, ',');
         var variable_index: usize = 0;
         while (variables.next()) |raw_variable| : (variable_index += 1) {
-            const modifier = std.mem.indexOfAny(u8, raw_variable, ":*") orelse raw_variable.len;
+            const modifier = std.mem.findAny(u8, raw_variable, ":*") orelse raw_variable.len;
             const name = raw_variable[0..modifier];
             const value = for (arguments) |argument| {
                 if (std.mem.eql(u8, argument.name, name)) break argument.value;
@@ -969,6 +971,12 @@ pub const State = struct {
     host_menu_arena: ?std.heap.ArenaAllocator = null,
     host_menu_at_ms: i64 = 0,
     host_menu_tools: mcp_menu.Tools = .loading,
+    /// The UI thread's copy of the sink's waiting sign-in, for the menu.
+    host_menu_sign_in: ?[]u8 = null,
+    /// The status line's MCP text, which `refreshHostStatus` rebuilds.
+    host_status_buf: [120]u8 = undefined,
+    host_status_len: usize = 0,
+    host_status_at_ms: i64 = 0,
     host_menu_tools_arena: ?std.heap.ArenaAllocator = null,
     /// Counts tool loads, so one for a server no longer open is dropped.
     host_menu_load: usize = 0,
@@ -1580,8 +1588,7 @@ pub const State = struct {
                 .published => |published| if (published.health == .ready)
                     try alloc.dupe(u8, "MCP configuration reloaded.")
                 else
-                    try std.fmt.allocPrint(
-                        alloc,
+                    try alloc.print(
                         "MCP reloaded with {d} unavailable server{s}.",
                         .{
                             published.unavailable_server_names.len,
@@ -1644,13 +1651,12 @@ pub const State = struct {
                             },
                         )
                     else
-                        try std.fmt.allocPrint(
-                            alloc,
+                        try alloc.print(
                             "Authenticated '{s}'; repaired {d} credential entries.",
                             .{ completion.server_name, authenticated.repaired_entries },
                         );
                     if (completion.reconnect_error) |err| {
-                        const feedback = try std.fmt.allocPrint(alloc, "{s} Connection failed: {s}. Check /mcp list.", .{ self.menu_feedback.?, @errorName(err) });
+                        const feedback = try alloc.print("{s} Connection failed: {s}. Check /mcp list.", .{ self.menu_feedback.?, @errorName(err) });
                         alloc.free(self.menu_feedback.?);
                         self.menu_feedback = feedback;
                         _ = mcp_menu_state.apply(&self.menu, .{ .effect_failed = generation });
@@ -1728,7 +1734,6 @@ pub const State = struct {
             self.host_sink = sink;
         }
         self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify() }));
-        self.announceHost();
     }
 
     /// Loads the config again after `/mcp` changed it; calls still using the
@@ -1737,46 +1742,56 @@ pub const State = struct {
         const load = self.host_load orelse return;
         const sink = self.host_sink orelse return;
         self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify() }));
-        self.announceHost();
+        self.startHostServers();
     }
 
-    /// After a load: project servers waiting for approval, as a notice
-    /// rather than v1's prompt, and each config problem as a warning. Each is
-    /// said once; a reload says only what's new or changed.
-    fn announceHost(self: *State) void {
-        const sink = self.host_sink orelse return;
-        const lease = self.leaseHost() orelse return;
+    pub fn hostStatusText(self: *const State) []const u8 {
+        return self.host_status_buf[0..self.host_status_len];
+    }
+
+    /// Rebuilds the status line's MCP text, at most every 250 ms since
+    /// servers change on their own; true when it changed.
+    pub fn refreshHostStatus(self: *State, now_ms: i64) bool {
+        if (self.host_status_at_ms != 0 and now_ms - self.host_status_at_ms < 250) return false;
+        self.host_status_at_ms = now_ms;
+        var next: [120]u8 = undefined;
+        const text = self.hostStatusLine(&next, now_ms);
+        if (std.mem.eql(u8, text, self.hostStatusText())) return false;
+        @memcpy(self.host_status_buf[0..text.len], text);
+        self.host_status_len = text.len;
+        return true;
+    }
+
+    fn hostStatusLine(self: *State, buf: []u8, now_ms: i64) []const u8 {
+        const sink = self.host_sink orelse return "";
+        const lease = self.leaseHost() orelse return "";
         defer lease.deinit();
         var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const statuses = lease.host.runtime.statuses(a) catch return;
-        var waiting: std.ArrayList([]const u8) = .empty;
-        for (statuses) |status| if (status.state == .waiting_for_approval) waiting.append(a, status.name) catch return;
+        const statuses = lease.host.runtime.statuses(a) catch return "";
         sink.mutex.lockUncancelable(io_mod.getIo());
-        defer sink.mutex.unlock(io_mod.getIo());
-        sink.keepOnly("waiting", waiting.items);
-        sink.keepOnly("note", lease.host.notes);
-        var news: std.ArrayList(u8) = .empty;
-        var count: usize = 0;
-        var first: []const u8 = "";
-        for (waiting.items) |name| if (sink.firstTime("waiting", name)) {
-            const safe = HostSink.safeText(a, name, 160);
-            if (count == 0) first = safe;
-            if (count > 0) news.appendSlice(a, ", ") catch return;
-            news.appendSlice(a, safe) catch return;
-            count += 1;
-        };
-        if (count > 0) {
-            const text = if (count == 1)
-                std.fmt.allocPrint(std.heap.c_allocator, "This project has an MCP server waiting for approval: {s}. Use /mcp approve {s}.", .{ first, first })
-            else
-                std.fmt.allocPrint(std.heap.c_allocator, "This project has {d} MCP servers waiting for approval: {s}. Use /mcp approve NAME.", .{ count, news.items });
-            if (text) |owned| sink.pushLocked(owned, false) else |_| {}
-        }
-        for (lease.host.notes) |note| if (sink.firstTime("note", note)) {
-            const owned = std.heap.c_allocator.dupe(u8, HostSink.safeText(a, note, 600)) catch continue;
-            sink.pushLocked(owned, true);
+        const news: ?[]const u8 = if (sink.news) |text|
+            (if (now_ms - sink.news_at_ms < mcp_menu.news_ms) a.dupe(u8, text) catch null else null)
+        else
+            null;
+        const signing_in: ?[]const u8 = if (sink.sign_in) |waiting|
+            a.dupe(u8, waiting[0 .. std.mem.findScalar(u8, waiting, 0) orelse waiting.len]) catch null
+        else
+            null;
+        sink.mutex.unlock(io_mod.getIo());
+        return mcp_menu.statusLine(buf, statuses, signing_in, news, lease.host.notes.len);
+    }
+
+    /// Starts every server in the background, so each is ready before it's
+    /// needed. Nothing waits: the host's own thread connects them, and quitting
+    /// still signals them all at once.
+    pub fn startHostServers(self: *State) void {
+        const lease = self.leaseHost() orelse return;
+        defer lease.deinit();
+        for (0..lease.host.runtime.servers().len) |i| lease.host.runtime.prepare(i) catch |err| {
+            debug_trace.logf("mcp", "MCP servers not started in the background at={d} err={s}", .{ i, @errorName(err) });
+            return;
         };
     }
 
@@ -1797,6 +1812,14 @@ pub const State = struct {
         const h = self.host orelse return null;
         h.leases += 1;
         return .{ .state = self, .host = h };
+    }
+
+    /// Every configured server's status, copied into `alloc`; null when
+    /// there is no host.
+    pub fn hostStatuses(self: *State, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
+        const lease = self.leaseHost() orelse return null;
+        defer lease.deinit();
+        return try lease.host.runtime.statuses(alloc);
     }
 
     fn releaseHost(self: *State, h: *mcp_host.Host) void {
@@ -1853,20 +1876,28 @@ pub const State = struct {
     pub const HostSink = struct {
         mutex: std.Io.Mutex = .init,
         notices: std.ArrayList(HostNotice) = .empty,
-        /// What was already said, so it's said once: a kind and its subject,
-        /// such as a server that needs login.
-        told: std.ArrayList([]u8) = .empty,
+        /// Servers whose sign-in was typed as `/mcp login NAME`: its outcome
+        /// goes in the transcript, like other typed commands' output.
+        typed: std.ArrayList([]u8) = .empty,
+        /// Any other sign-in's outcome, for the status line, and when it came.
+        news: ?[]u8 = null,
+        news_at_ms: i64 = 0,
         /// The menu's tool load still running, so leaving the server cancels
         /// it, and the last one finished, until the UI thread takes it.
         menu_job: ?*MenuToolsJob = null,
         menu_tools: ?MenuTools = null,
+        /// The sign-in waiting for the browser, as its server, a 0 byte, and
+        /// its address, so the menu can say so. Owned; the next one replaces it.
+        sign_in: ?[]u8 = null,
 
         fn deinit(sink: *HostSink) void {
             if (sink.menu_tools) |*done| done.arena.deinit();
+            if (sink.sign_in) |waiting| std.heap.c_allocator.free(waiting);
             for (sink.notices.items) |n| std.heap.c_allocator.free(n.text);
             sink.notices.deinit(std.heap.c_allocator);
-            for (sink.told.items) |key| std.heap.c_allocator.free(key);
-            sink.told.deinit(std.heap.c_allocator);
+            for (sink.typed.items) |name| std.heap.c_allocator.free(name);
+            sink.typed.deinit(std.heap.c_allocator);
+            if (sink.news) |text| std.heap.c_allocator.free(text);
         }
 
         fn notify(sink: *HostSink) mcp_host.Notify {
@@ -1882,59 +1913,75 @@ pub const State = struct {
             const aa = arena.allocator();
             sink.mutex.lockUncancelable(io_mod.getIo());
             defer sink.mutex.unlock(io_mod.getIo());
-            const text: ?[]u8, const warning = switch (notice) {
-                .authorize => |n| .{ std.fmt.allocPrint(a, "Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch null, false },
-                .signed_in => |server| signed: {
-                    sink.forget("login", server);
-                    break :signed .{ std.fmt.allocPrint(a, "Signed in to {s}.", .{safeText(aa, server, 160)}) catch null, false };
+            switch (notice) {
+                .authorize => |n| {
+                    sink.waitForSignIn(n.server, n.url);
+                    // The menu shows the address; a typed login prints it.
+                    if (!sink.isTyped(n.server)) return;
+                    const text = a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
+                    sink.pushLocked(text, false);
                 },
-                .sign_in_failed => |n| .{ std.fmt.allocPrint(a, "Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch null, true },
-                .needs_login => |server| told: {
-                    if (!sink.firstTime("login", server)) break :told .{ null, false };
-                    const name = safeText(aa, server, 160);
-                    break :told .{ std.fmt.allocPrint(a, "{s} needs login: /mcp login {s}", .{ name, name }) catch null, true };
+                .signed_in => |server| {
+                    sink.endSignIn(server);
+                    sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
                 },
-            };
-            sink.pushLocked(text orelse return, warning);
-        }
-
-        fn toldKey(key: []const u8, kind: []const u8) ?[]const u8 {
-            if (key.len <= kind.len or !std.mem.startsWith(u8, key, kind) or key[kind.len] != 0) return null;
-            return key[kind.len + 1 ..];
-        }
-
-        /// Whether `kind` about `subject` is news, remembering it if so.
-        /// Locked by the caller.
-        fn firstTime(sink: *HostSink, kind: []const u8, subject: []const u8) bool {
-            const a = std.heap.c_allocator;
-            for (sink.told.items) |key| if (std.mem.eql(u8, toldKey(key, kind) orelse continue, subject)) return false;
-            // Out of memory, it's said again later rather than never.
-            const key = std.mem.concat(a, u8, &.{ kind, "\x00", subject }) catch return true;
-            sink.told.append(a, key) catch a.free(key);
-            return true;
-        }
-
-        fn forget(sink: *HostSink, kind: []const u8, subject: []const u8) void {
-            for (sink.told.items, 0..) |key, i| if (std.mem.eql(u8, toldKey(key, kind) orelse continue, subject)) {
-                std.heap.c_allocator.free(sink.told.swapRemove(i));
-                return;
-            };
-        }
-
-        /// Forgets what was said about `kind` whose subject is gone, so it's
-        /// said again if it comes back.
-        fn keepOnly(sink: *HostSink, kind: []const u8, current: []const []const u8) void {
-            var i: usize = 0;
-            while (i < sink.told.items.len) {
-                const subject = toldKey(sink.told.items[i], kind) orelse {
-                    i += 1;
-                    continue;
-                };
-                const still = for (current) |c| {
-                    if (std.mem.eql(u8, c, subject)) break true;
-                } else false;
-                if (still) i += 1 else std.heap.c_allocator.free(sink.told.swapRemove(i));
+                .sign_in_failed => |n| {
+                    sink.endSignIn(n.server);
+                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
+                },
+                // The status line says so for as long as it's true.
+                .needs_login => {},
             }
+        }
+
+        /// A sign-in's outcome: the transcript for a typed one, else the
+        /// status line's news. Takes `text`; locked by the caller.
+        fn report(sink: *HostSink, server: []const u8, text: []u8, warning: bool) void {
+            if (sink.untype(server)) return sink.pushLocked(text, warning);
+            if (sink.news) |old| std.heap.c_allocator.free(old);
+            sink.news = text;
+            sink.news_at_ms = io_mod.milliTimestamp();
+        }
+
+        /// On the UI thread, for `/mcp login NAME` typed in the shell.
+        fn markTyped(sink: *HostSink, server: []const u8) void {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            if (sink.isTyped(server)) return;
+            const a = std.heap.c_allocator;
+            // Out of memory, its outcome goes to the status line instead.
+            const name = a.dupe(u8, server) catch return;
+            sink.typed.append(a, name) catch a.free(name);
+        }
+
+        fn isTyped(sink: *const HostSink, server: []const u8) bool {
+            for (sink.typed.items) |name| if (std.mem.eql(u8, name, server)) return true;
+            return false;
+        }
+
+        fn untype(sink: *HostSink, server: []const u8) bool {
+            for (sink.typed.items, 0..) |name, i| if (std.mem.eql(u8, name, server)) {
+                std.heap.c_allocator.free(sink.typed.swapRemove(i));
+                return true;
+            };
+            return false;
+        }
+
+        /// Locked by the caller. Out of memory, the menu just doesn't say it waits.
+        fn waitForSignIn(sink: *HostSink, server: []const u8, url: []const u8) void {
+            const a = std.heap.c_allocator;
+            const next = std.mem.concat(a, u8, &.{ server, "\x00", url }) catch null;
+            if (sink.sign_in) |old| a.free(old);
+            sink.sign_in = next;
+        }
+
+        /// Locked by the caller.
+        fn endSignIn(sink: *HostSink, server: []const u8) void {
+            const waiting = sink.sign_in orelse return;
+            const end = std.mem.findScalar(u8, waiting, 0) orelse waiting.len;
+            if (!std.mem.eql(u8, waiting[0..end], server)) return;
+            std.heap.c_allocator.free(waiting);
+            sink.sign_in = null;
         }
 
         /// Takes ownership of `text`.
@@ -2010,7 +2057,7 @@ pub const State = struct {
                 .{ .verb = "reject", .ok = server.source == .workspace },
             };
             for (applies) |verb| if (verb.ok) try out.append(a, .{
-                .full = try std.fmt.allocPrint(a, "/mcp {s} {s}", .{ verb.verb, status.name }),
+                .full = try a.print("/mcp {s} {s}", .{ verb.verb, status.name }),
                 .description = description,
             });
         }
@@ -2039,6 +2086,9 @@ pub const State = struct {
         const args = try a.alloc([]const u8, argv.tokens.len);
         defer a.free(args);
         for (argv.tokens, args) |t, *arg| arg.* = t.value;
+        if (args.len >= 2 and std.mem.eql(u8, args[0], "login")) {
+            if (self.host_sink) |sink| sink.markTyped(args[args.len - 1]);
+        }
         try self.startVerbs(home, workspace_root, args);
     }
 
@@ -2130,7 +2180,26 @@ pub const State = struct {
     pub fn openHostMenu(self: *State) void {
         self.closeHostMenu();
         mcp_menu.open(&self.host_menu);
-        _ = self.refreshHostMenu();
+        _ = self.refreshHostMenu("");
+    }
+
+    /// Each screen keeps its own filter in the composer: opening a server
+    /// starts its tool filter empty, and going back brings the list's back.
+    pub fn swapHostMenuFilter(self: *State, was: mcp_menu.Screen, alloc: Allocator, composer: *editor_state.State) Allocator.Error!void {
+        if (!self.host_menu.active) return;
+        if (was == .list and self.host_menu.screen == .server) {
+            self.host_menu.keepListFilter(composer.input.items);
+            composer.clearRetainingCapacity();
+        } else if (was != .list and self.host_menu.screen == .list) {
+            try composer.setText(alloc, self.host_menu.listFilter());
+        }
+    }
+
+    /// The composer changed: on a server's screen, that's its tool filter.
+    pub fn hostMenuFilterChanged(self: *State, filter: []const u8) void {
+        if (!self.host_menu.active or self.host_menu.screen != .server) return;
+        const view = mcp_menu.viewOf(&self.host_menu, self.host_menu_rows, filter, self.host_menu_tools, &.{});
+        mcp_menu.filterChanged(&self.host_menu, view, filter.len > 0);
     }
 
     pub fn closeHostMenu(self: *State) void {
@@ -2141,6 +2210,32 @@ pub const State = struct {
         self.host_menu_rows = &.{};
         self.host_menu_notes = 0;
         self.host_menu_at_ms = 0;
+        if (self.host_menu_sign_in) |waiting| std.heap.c_allocator.free(waiting);
+        self.host_menu_sign_in = null;
+    }
+
+    /// The address the open server's sign-in waits on, if one does.
+    pub fn hostMenuSignInUrl(self: *const State) ?[]const u8 {
+        if (self.host_menu.screen == .list) return null;
+        const waiting = self.host_menu_sign_in orelse return null;
+        const end = std.mem.findScalar(u8, waiting, 0) orelse return null;
+        if (!std.mem.eql(u8, waiting[0..end], self.host_menu.selectedName())) return null;
+        return waiting[end + 1 ..];
+    }
+
+    /// Copies the sink's waiting sign-in; true when it changed.
+    fn takeSignIn(self: *State) bool {
+        const sink = self.host_sink orelse return false;
+        sink.mutex.lockUncancelable(io_mod.getIo());
+        defer sink.mutex.unlock(io_mod.getIo());
+        const now = sink.sign_in;
+        const had = self.host_menu_sign_in;
+        if (now == null and had == null) return false;
+        if (now != null and had != null and std.mem.eql(u8, now.?, had.?)) return false;
+        const a = std.heap.c_allocator;
+        if (had) |old| a.free(old);
+        self.host_menu_sign_in = if (now) |w| a.dupe(u8, w) catch null else null;
+        return true;
     }
 
     /// A key in the menu, with `filter` typed in the composer. A choice runs
@@ -2155,6 +2250,8 @@ pub const State = struct {
             .open => |name| try self.startMenuTools(name),
             .back => self.stopMenuTools(),
             .run => |run| {
+                // A confirmed Remove went back to the list already.
+                if (self.host_menu.screen == .list) self.stopMenuTools();
                 try self.startVerbs(home, workspace_root, &.{ run.choice.verb(), run.server });
                 // The status follows sooner than the next refresh would show it.
                 self.host_menu_at_ms = 0;
@@ -2165,7 +2262,8 @@ pub const State = struct {
     /// On the UI thread while the menu is open: the servers' status at most
     /// four times a second, and the open server's tools once they load.
     /// Whether anything it shows changed.
-    pub fn refreshHostMenu(self: *State) bool {
+    /// `filter` is what the composer holds: the list's, or the open server's tools'.
+    pub fn refreshHostMenu(self: *State, filter: []const u8) bool {
         if (!self.host_menu.active) return false;
         var changed = false;
         const now = io_mod.milliTimestamp();
@@ -2183,7 +2281,8 @@ pub const State = struct {
             }
         }
         if (self.takeMenuTools()) changed = true;
-        const view = mcp_menu.viewOf(&self.host_menu, self.host_menu_rows, "", self.host_menu_tools, &.{});
+        if (self.takeSignIn()) changed = true;
+        const view = mcp_menu.viewOf(&self.host_menu, self.host_menu_rows, filter, self.host_menu_tools, &.{});
         if (mcp_menu.settle(&self.host_menu, view) == .back) {
             self.stopMenuTools();
             return true;
@@ -3779,7 +3878,7 @@ test "project prompt display escapes repository control bytes" {
 }
 
 test "project prompt allocation failure releases the runtime lease" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var state: State = .{};
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     runtime.* = mcp_runtime.McpRuntime.init(alloc);
@@ -4189,18 +4288,24 @@ test "startup health notice is held during discovery and consumed once" {
     try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
 }
 
-test "MCP-v2 notices are said once, and again only after they went away" {
+test "a typed sign-in reports in the transcript, any other on the status line" {
     var sink: State.HostSink = .{};
     defer sink.deinit();
-    try std.testing.expect(sink.firstTime("waiting", "docs"));
-    try std.testing.expect(!sink.firstTime("waiting", "docs"));
-    // Kinds don't mix, and a subject's prefix isn't the subject.
-    try std.testing.expect(sink.firstTime("login", "docs"));
-    try std.testing.expect(sink.firstTime("waiting", "doc"));
-    sink.keepOnly("waiting", &.{"doc"});
-    try std.testing.expect(!sink.firstTime("login", "docs"));
-    try std.testing.expect(!sink.firstTime("waiting", "doc"));
-    try std.testing.expect(sink.firstTime("waiting", "docs"));
-    sink.forget("login", "docs");
-    try std.testing.expect(sink.firstTime("login", "docs"));
+    const notify = sink.notify();
+    sink.markTyped("docs");
+    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
+    notify.notice(notify.context, .{ .signed_in = "docs" });
+    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+    try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
+    try std.testing.expect(sink.news == null);
+    // Once reported, the next sign-in to it isn't typed.
+    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
+    try std.testing.expect(sink.sign_in != null);
+    notify.notice(notify.context, .{ .sign_in_failed = .{ .server = "docs", .reason = "it said no" } });
+    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+    try std.testing.expectEqualStrings("Couldn't sign in to docs: it said no.", sink.news.?);
+    try std.testing.expect(sink.sign_in == null);
+    // Needing a login is the status line's to say.
+    notify.notice(notify.context, .{ .needs_login = "docs" });
+    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
 }

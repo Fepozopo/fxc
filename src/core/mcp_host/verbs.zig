@@ -13,6 +13,7 @@ const project_config = @import("../mcp/project_config.zig");
 const command_provider = @import("../mcp/command_provider.zig");
 const config_file = @import("config_file.zig");
 const credentials = @import("credentials.zig");
+const slack = @import("slack.zig");
 const runtime_mod = @import("runtime.zig");
 const Host = @import("host.zig").Host;
 
@@ -108,7 +109,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             pair_flag = a;
             i += 1;
             const kv = if (i < dash) rest[i] else "";
-            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse 0;
+            const eq = std.mem.findScalar(u8, kv, '=') orelse 0;
             if (eq == 0) return usage(arena, verb, "{s} needs KEY=VALUE.", .{a});
             try pairs.append(arena, .{ .key = kv[0..eq], .value = kv[eq + 1 ..] });
             continue;
@@ -140,8 +141,11 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
                 if (pair_flag != null and std.mem.eql(u8, pair_flag.?, "--header")) return usage(arena, verb, "--header is for HTTP servers; use --env for a command.", .{});
                 return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } } } } };
             }
-            if (n.len != 2) return usage(arena, verb, "{s} add needs a URL, or -- and a command.", .{p});
-            const url = n[1];
+            // fx knows Slack's address, as `add slack` did before.
+            const url = if (n.len == 1 and std.mem.eql(u8, name, "slack")) slack.server_url else url: {
+                if (n.len != 2) return usage(arena, verb, "{s} add needs a URL, or -- and a command.", .{p});
+                break :url n[1];
+            };
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
                 return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
             if (pair_flag != null and std.mem.eql(u8, pair_flag.?, "--env")) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
@@ -174,11 +178,11 @@ fn isHelp(a: []const u8) bool {
 }
 
 fn moved(arena: Allocator, comptime fmt: []const u8, args: anytype) Allocator.Error!Parsed {
-    return .{ .moved = try std.fmt.allocPrint(arena, fmt, args) };
+    return .{ .moved = try arena.print(fmt, args) };
 }
 
 fn usage(arena: Allocator, verb: ?Verb, comptime fmt: []const u8, args: anytype) Allocator.Error!Parsed {
-    return .{ .usage = .{ .verb = verb, .message = try std.fmt.allocPrint(arena, fmt, args) } };
+    return .{ .usage = .{ .verb = verb, .message = try arena.print(fmt, args) } };
 }
 
 const overview = [_][2][]const u8{
@@ -186,6 +190,7 @@ const overview = [_][2][]const u8{
     .{ "show NAME", "connect to NAME: status, version, tools" },
     .{ "add NAME URL", "add an HTTP server" },
     .{ "add NAME -- CMD [ARGS...]", "add a stdio server" },
+    .{ "add slack", "add Slack's server" },
     .{ "remove NAME", "remove a server and its login" },
     .{ "login NAME", "sign in to an HTTP server" },
     .{ "logout NAME", "sign out and delete the login" },
@@ -201,7 +206,7 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         try w.print("usage: {s} COMMAND\n\n", .{p});
         for (overview, 0..) |row, k| {
             var buffer: [48]u8 = undefined;
-            const left = if (k < 2) std.fmt.bufPrint(&buffer, "{s}{s}", .{ row[0], json }) catch row[0] else row[0];
+            const left = if (k < 2) std.mem.print(&buffer, "{s}{s}", .{ row[0], json }) catch row[0] else row[0];
             try w.print("  {s:<28}{s}\n", .{ left, row[1] });
         }
         return w.print("\nRun '{s} COMMAND -h' for a command's flags.\n", .{p});
@@ -212,9 +217,10 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         .add => try w.print(
             \\usage: {s} add [--project] [--header K=V]... NAME URL
             \\       {s} add [--project] [--env K=V]... NAME -- COMMAND [ARGS...]
+            \\       {s} add [--project] slack
             \\  --project  write ./.mcp.json instead of ~/.fx/mcp.json
             \\
-        , .{ p, p }),
+        , .{ p, p, p }),
         .remove => try w.print("usage: {s} remove [--project | --profile] NAME\n", .{p}),
         .login => try w.print("usage: {s} login [--no-browser] NAME\n  --no-browser  print the address instead of opening it\n", .{p}),
         .logout => try w.print("usage: {s} logout NAME\n", .{p}),
@@ -315,7 +321,7 @@ const Paths = struct { profile: []const u8, project: []const u8 };
 fn paths(c: Context, arena: Allocator) !Paths {
     return .{
         .profile = try profile_paths.mcpConfigPath(arena, c.home),
-        .project = try std.fs.path.join(arena, &.{ c.workspace_root, ".mcp.json" }),
+        .project = try std.Io.Dir.path.join(arena, &.{ c.workspace_root, ".mcp.json" }),
     };
 }
 
@@ -355,9 +361,9 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
         .waiting_for_approval => "waiting for approval",
         .rejected => "rejected",
         .unsupported => "not supported",
-        .missing_env => try std.fmt.allocPrint(arena, "needs ${s}", .{s.missing orelse "a variable"}),
+        .missing_env => try arena.print("needs ${s}", .{s.missing orelse "a variable"}),
         else => if (s.needs_login) "needs login" else switch (s.state) {
-            .ready => try std.fmt.allocPrint(arena, "ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" }),
+            .ready => try arena.print("ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" }),
             .connecting => "connecting",
             .retrying => "retrying",
             .failed => "failed",
@@ -546,7 +552,7 @@ pub fn toolDescription(arena: Allocator, raw: []const u8) !?[]const u8 {
     if (value != .object) return null;
     const d = value.object.get("description") orelse return null;
     if (d != .string) return null;
-    const line = std.mem.trim(u8, d.string[0 .. std.mem.indexOfScalar(u8, d.string, '\n') orelse d.string.len], " \t\r");
+    const line = std.mem.trim(u8, d.string[0 .. std.mem.findScalar(u8, d.string, '\n') orelse d.string.len], " \t\r");
     return line;
 }
 
@@ -710,7 +716,7 @@ const Waiter = struct {
 
 fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
     const no_display = io_mod.getenv("FX_NO_OPEN_BROWSER") != null or io_mod.getenv("SSH_CONNECTION") != null or
-        (@import("builtin").os.tag != .macos and io_mod.getenv("DISPLAY") == null and io_mod.getenv("WAYLAND_DISPLAY") == null);
+        (@import("builtin").target.os.tag != .macos and io_mod.getenv("DISPLAY") == null and io_mod.getenv("WAYLAND_DISPLAY") == null);
     const open = browser and !no_display;
     var waiter: Waiter = .{ .gpa = c.gpa, .name = name };
     defer waiter.deinit();
@@ -793,7 +799,7 @@ fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
         return null;
     }
     try line.appendSlice(arena, buffer[0..n]);
-    const end = std.mem.indexOfScalar(u8, line.items, '\n') orelse return null;
+    const end = std.mem.findScalar(u8, line.items, '\n') orelse return null;
     const pasted = std.mem.trim(u8, line.items[0..end], " \t\r");
     const copy = try arena.dupe(u8, pasted);
     line.replaceRangeAssumeCapacity(0, end + 1, &.{});
@@ -823,6 +829,10 @@ test "parse reads every verb, with flags before --" {
     try testing.expectEqualStrings("https://w/mcp", http.entry.http.url);
     try testing.expectEqualStrings("X-Key", http.entry.http.headers[0].key);
     try testing.expectEqualStrings("${K}", http.entry.http.headers[0].value);
+
+    // Slack needs no URL; any other server does.
+    try testing.expectEqualStrings("https://mcp.slack.com/mcp", (try parseCli(a, &.{ "add", "slack" })).command.add.entry.http.url);
+    try testing.expectEqualStrings("https://slack.example/mcp", (try parseCli(a, &.{ "add", "slack", "https://slack.example/mcp" })).command.add.entry.http.url);
 
     const stdio = (try parseCli(a, &.{ "add", "--env", "A=1=2", "local", "--", "node", "server.js", "--help", "-h" })).command.add;
     try testing.expectEqual(config_file.File.profile, stdio.file);

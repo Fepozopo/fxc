@@ -5,6 +5,7 @@
 //! moved into `McpRuntime`.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const startup_admission = @import("startup_admission.zig");
@@ -29,8 +30,9 @@ pub fn sameServerConfig(left: McpServerConfig, right: McpServerConfig) bool {
 fn sameConfigValue(comptime T: type, left: T, right: T) bool {
     return switch (@typeInfo(T)) {
         .@"struct" => result: {
-            inline for (std.meta.fields(T)) |field| {
-                if (!sameConfigValue(field.type, @field(left, field.name), @field(right, field.name))) break :result false;
+            const info = @typeInfo(T).@"struct";
+            inline for (info.field_names, info.field_types) |field_name, field_type| {
+                if (!sameConfigValue(field_type, @field(left, field_name), @field(right, field_name))) break :result false;
             }
             break :result true;
         },
@@ -166,8 +168,7 @@ pub fn renderWorkspaceDiagnostic(
             @tagName(value)
         else
             "value";
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             "{s} server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
             .{
                 diagnosticFile(diagnostic),
@@ -178,8 +179,7 @@ pub fn renderWorkspaceDiagnostic(
             },
         );
     }
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s} server '{s}' was skipped: {s}.",
         .{ diagnosticFile(diagnostic), encoded_server.bytes, @tagName(diagnostic.cause) },
     );
@@ -403,6 +403,7 @@ fn serverEntryShape(value: std.json.Value) bool {
         return std.mem.eql(u8, kind.string, "local") or
             std.mem.eql(u8, kind.string, "stdio") or
             std.mem.eql(u8, kind.string, "http") or
+            std.mem.eql(u8, kind.string, "streamable-http") or
             std.mem.eql(u8, kind.string, "sse");
     }
     return false;
@@ -992,9 +993,10 @@ fn parseServerEntry(
         (if (kind_value == .string) kind_value.string else return failServerConfig(error.McpConfigInvalidType))
     else
         "local";
+    // Other clients' files spell Streamable HTTP out.
     const transport: McpTransport = if (std.mem.eql(u8, type_string, "sse"))
         .sse
-    else if (std.mem.eql(u8, type_string, "http"))
+    else if (std.mem.eql(u8, type_string, "http") or std.mem.eql(u8, type_string, "streamable-http"))
         .http
     else
         .stdio;
@@ -1598,7 +1600,7 @@ test "workspace template expansion is explicit bounded and deterministic" {
     long_name[0] = 'A';
     @memset(long_name[1..], 'B');
     try environment.put(&long_name, "long-name-value");
-    const long_template = try std.fmt.allocPrint(alloc, "${{{s}}}", .{long_name});
+    const long_template = try alloc.print("${{{s}}}", .{long_name});
     defer alloc.free(long_template);
     var long_budget = WorkspaceExpansionBudget.init();
     var long_expansion = try expandWorkspaceTemplate(
@@ -1730,7 +1732,7 @@ test "workspace environment expansion never refunds rejected entry work" {
 }
 
 test "workspace environment expansion rejects exhausted budget before allocation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var environment = std.process.Environ.Map.init(alloc);
     defer environment.deinit();
     try environment.put("TOKEN", "secret");
@@ -1790,6 +1792,17 @@ test "workspace parsing isolates invalid entries" {
     try std.testing.expectEqualStrings("good", result.configs.items[0].name);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
     try std.testing.expectEqualStrings("bad", result.diagnostics.items[0].server_name.?);
+}
+
+test "streamable-http reads as http in both files" {
+    const alloc = std.testing.allocator;
+    var profile = try parseProfileJson(alloc, "{\"mcpServers\":{\"web\":{\"type\":\"streamable-http\",\"url\":\"https://w.example/mcp\"}}}");
+    defer deinitConfigs(alloc, &profile);
+    try std.testing.expectEqual(McpTransport.http, profile.items[0].transport);
+    var project = try parseWorkspaceJson(alloc, "{\"mcpServers\":{\"web\":{\"type\":\"streamable-http\",\"url\":\"https://w.example/mcp\"}}}", .workspace, .{});
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(McpTransport.http, project.configs.items[0].transport);
+    try std.testing.expectEqual(@as(usize, 0), project.diagnostics.items.len);
 }
 
 test "choice transitions are normalized and reject precedence is stable" {
@@ -1903,7 +1916,7 @@ test "workspace parsing releases every partial allocation failure" {
     var fail_index: usize = 0;
     while (fail_index < 256) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         var result = parseWorkspaceJson(failing.allocator(), json, .workspace, .{}) catch |err| switch (err) {
@@ -1916,7 +1929,7 @@ test "workspace parsing releases every partial allocation failure" {
 }
 
 test "choice parsing and mutation release every partial allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,

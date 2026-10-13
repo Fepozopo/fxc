@@ -2,8 +2,12 @@
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
 import { coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice } from "./fx-sdk.js";
+import { createCredentialMemory, credentialMemory } from "./subscription.js";
 
 const encoder = new TextEncoder();
+// Every worker reads each record since the session's last checkpoint, so a
+// durable session checkpoints far sooner than the engine's default.
+const durableCheckpointAfterBytes = 64 * 1024;
 
 /**
  * The fx harness for `createDurableAgentFactory`. `createEngine(options)`
@@ -19,6 +23,8 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
       if (Object.hasOwn(engineOptions, name)) throw new TypeError(`createFxAgent() does not accept ${name}`);
     }
     const idempotent = idempotentTools(engineOptions.tools);
+    // One for all of this agent's sessions, so they refresh an account once.
+    const credentials = createCredentialMemory();
     return {
       ...(checkpoint === undefined ? {} : { seed: snapshotOf(checkpointBytesOf(checkpoint)) }),
       settings: sessionSettings,
@@ -29,12 +35,15 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
           ...(apiKey === undefined ? {} : { apiKey }),
           ...(ready === undefined || engineOptions.tools === undefined ? {} : { tools: claimedTools(engineOptions.tools, ready) }),
           sessionId,
+          [credentialMemory]: credentials,
           // The core folds the session from the marks on each record.
           persistence: { ...store, [journalMarksWanted]: true },
           inputsDurable: true,
-          // A checkpoint at every turn end; where a turn yields the core
-          // saves one itself before it lets the session go.
-          checkpointAfterBytes: 0,
+          // A turn's end saves a checkpoint once the records since the last
+          // one reach this many bytes, so a short turn writes none and a
+          // worker reads back little; where a turn yields, the core saves
+          // one itself before it lets the session go.
+          checkpointAfterBytes: durableCheckpointAfterBytes,
           ...(context === undefined || context === null ? {} : { toolContext: context }),
         });
         return fxSession(engine, idempotent);
@@ -168,9 +177,20 @@ function claimedTools(tools, ready) {
   return tools;
 }
 
+// The tools whose cut-off calls run again. Every tool the host runs must say
+// whether that is safe, so the choice is never a default: `idempotent: true`
+// when running a call twice is harmless, `false` when it is not. A tool that
+// is not an object is left for the engine to refuse.
 function idempotentTools(tools) {
   const names = new Set();
-  for (const tool of toolEntries(tools)) if (tool?.idempotent === true && typeof tool.name === "string") names.add(tool.name);
+  for (const [index, tool] of toolEntries(tools).entries()) {
+    if (!tool || typeof tool !== "object" || tool.providerExecuted === true) continue;
+    if (typeof tool.idempotent !== "boolean") {
+      const name = typeof tool.name === "string" ? tool.name : index;
+      throw new TypeError(`tool ${name} must set idempotent: true if running a call twice is safe, or idempotent: false if it is not`);
+    }
+    if (tool.idempotent && typeof tool.name === "string") names.add(tool.name);
+  }
   return names;
 }
 

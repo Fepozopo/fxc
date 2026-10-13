@@ -222,8 +222,8 @@ pub const Option = struct {
 pub const Options = struct {
     elements: wire.Elements,
 
-    pub fn init(o: *Options, field: *const Field) void {
-        o.elements.init(field.options.?) catch unreachable; // read by `parse`
+    pub fn init(o: *Options, field: *const Field) wire.DecodeError!void {
+        try o.elements.init(field.options.?); // read by `parse`
     }
 
     pub fn next(o: *Options) ?Option {
@@ -339,7 +339,7 @@ fn within(x: f64, min: ?f64, max: ?f64) bool {
 fn isOption(f: *const Field, value: []const u8) bool {
     if (value[0] != '"') return false;
     var options: Options = undefined;
-    options.init(f);
+    options.init(f) catch return false;
     while (options.next()) |o| if (std.mem.eql(u8, o.value, value)) return true;
     return false;
 }
@@ -472,7 +472,7 @@ test "reads every field kind the spec allows" {
     for (form.slice(), kinds) |f, k| try testing.expectEqual(k, f.kind);
     try testing.expectEqual(Format.date_time, form.fields[0].format);
     var options: Options = undefined;
-    options.init(&form.fields[5]);
+    try options.init(&form.fields[5]);
     const o = options.next().?;
     try testing.expectEqualStrings("\"#F00\"", o.value);
     try testing.expectEqualStrings("\"Red\"", o.title.?);

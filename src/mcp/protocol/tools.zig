@@ -252,7 +252,7 @@ test "reads a page: tools, an opaque cursor, and the TTL" {
     try testing.expectEqual(@as(u32, 300000), page.ttl_ms);
     for ([_][]const u8{ "-5", "1.5", "3e5", "\"60\"", "99999999999999999999999" }) |ttl| {
         var buffer: [96]u8 = undefined;
-        const result = try std.fmt.bufPrint(&buffer, "{{\"tools\":[],\"ttlMs\":{s}}}", .{ttl});
+        const result = try std.mem.print(&buffer, "{{\"tools\":[],\"ttlMs\":{s}}}", .{ttl});
         try testing.expectEqual(@as(u32, 0), (try parsePage(result)).ttl_ms);
     }
     try testing.expectEqual(max_ttl_ms, (try parsePage("{\"tools\":[],\"ttlMs\":999999999999}")).ttl_ms);

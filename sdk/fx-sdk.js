@@ -1,5 +1,12 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { codexSubscription } from "./chatgpt.js";
+import { customProviderDefinition, customProviderSpec } from "./custom-provider.js";
+import { grokSubscription } from "./grok.js";
+import { createSubscriptionAuthorizer, credentialMemory } from "./subscription.js";
 import { loadModule } from "./wasm-module.js";
+
+// Providers that run on a user's plan, authorized by the host's credentials.
+const subscriptionProviders = new Set(["codex", "grok"]);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -17,6 +24,9 @@ const maxModelBytes = 1024;
 // Matches the kernel's ReasoningEffort.max_name_bytes.
 const maxEffortBytes = 64;
 const maxUrlBytes = 16 * 1024;
+// The answer a resumed turn gives a call its crash left running; matches
+// unfinished_tool_output in session_adapter.zig.
+const unfinishedToolOutput = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 const maxModelCatalogBytes = 4 * 1024 * 1024;
 const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
@@ -143,8 +153,34 @@ export function normalizeAgentOptions(value) {
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
   }
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  // Derived from the caller's provider every time, so normalizing again agrees.
+  const custom = options.provider !== null && typeof options.provider === "object"
+    ? customProviderDefinition(options.provider)
+    : undefined;
+  if (!custom && options.provider !== undefined && options.provider !== "gateway" && !subscriptionProviders.has(options.provider)) {
+    throw new TypeError("provider must be \"gateway\", \"codex\", \"grok\" or a custom provider { name, baseUrl }");
+  }
+  options.customProvider = custom;
+  options.providerName = custom ? custom.name : options.provider;
+  const subscription = subscriptionProviders.has(options.provider);
+  // Gateway needs its key; every other provider runs on the host's credentials.
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !subscription && !custom);
+  if (subscription && typeof options.credentials !== "function") {
+    throw new TypeError(`provider "${options.provider}" needs a credentials() function`);
+  }
+  if (!subscription && !custom && options.credentials !== undefined) {
+    throw new TypeError("credentials needs provider \"codex\", \"grok\" or a custom provider");
+  }
+  // A custom provider's key is never refreshed, so it has no onCredentials or refreshLock.
+  for (const name of ["onCredentials", "refreshLock"]) {
+    if (!subscription && options[name] !== undefined) throw new TypeError(`${name} needs provider "codex" or "grok"`);
+  }
+  for (const name of ["credentials", "onCredentials", "refreshLock"]) {
+    if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
+  }
   Object.assign(options, normalizeModelChoice(options));
+  // fx's default model is a Gateway id; a custom provider names its own.
+  if (custom && options.model === undefined) throw new TypeError("a custom provider needs a model");
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
     throw new TypeError("resizeImage must be a function");
@@ -197,7 +233,7 @@ export class FxFencedError extends Error {
   }
 }
 
-/** The journal was written by a newer libfx than this one. */
+/** The journal, or the `checkpoint` option, was written by a newer libfx. */
 export class FxJournalVersionError extends Error {
   constructor(message) {
     super(message);
@@ -278,17 +314,28 @@ function journalAppendError(cause) {
   return error;
 }
 
-// Restoring an open turn needs only its newest progress, so an older one's
-// state is left out of a load (data: null). A load then grows with the
-// session's committed turns, not with every step of every turn.
+// Restoring an open turn needs only its newest progress, and the ones it
+// extends when it carries only what is new back to one that carries all of
+// it, and the results of calls no progress has answered yet. So an older
+// progress's state, and an answered call's result, are left out of a load
+// (data: null). A load then grows with the session's committed turns, not
+// with every step of every turn.
 function withoutSupersededProgress(events) {
   const kept = new Array(events.length);
   let superseded = false;
+  let answered = false;
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     const type = event?.type;
-    kept[index] = superseded && type === "turn_progress" && event.data != null ? { ...event, data: null } : event;
-    if (type === "turn_progress" || type === "turn_committed" || type === "turn_progress_cleared") superseded = true;
+    const dropped = event?.data != null && ((type === "turn_progress" && superseded) || (type === "tool_result" && answered));
+    kept[index] = dropped ? { ...event, data: null } : event;
+    if (type === "turn_committed" || type === "turn_progress_cleared") {
+      superseded = true;
+      answered = true;
+    } else if (type === "turn_progress") {
+      answered = true;
+      if (event.base === undefined) superseded = true;
+    }
   }
   return kept;
 }
@@ -411,8 +458,9 @@ function journalMarks(events) {
   for (const event of events) {
     if (event?.type === "turn_progress") {
       if (typeof event.turnId === "string") marks.push({ start: event.turnId });
-      const steps = event.data?.execution?.tool_steps;
-      if (Array.isArray(steps)) marks.push({ step: `${steps.length}:${String(event.data.tool_state ?? "none")}` });
+      // A progress that carries only what is new counts all the turn's steps.
+      const steps = Number.isSafeInteger(event.steps) ? event.steps : event.data?.execution?.tool_steps?.length;
+      if (Number.isSafeInteger(steps)) marks.push({ step: `${steps}:${String(event.data?.tool_state ?? "none")}` });
     } else if (event?.type === "turn_committed" || event?.type === "turn_progress_cleared") marks.push({ end: true });
     else if (event?.type === "turn_yielded") marks.push({ yield: true });
     else if (event?.type === "input_accepted" && typeof event.data?.id === "string") marks.push({ accepted: event.data.id });
@@ -422,7 +470,9 @@ function journalMarks(events) {
 
 function agentEnvironment(options) {
   return {
-    AI_GATEWAY_API_KEY: options.apiKey,
+    ...(options.apiKey === undefined ? {} : { AI_GATEWAY_API_KEY: options.apiKey }),
+    ...(options.providerName === undefined ? {} : { FX_PROVIDER: options.providerName }),
+    ...(options.customProvider === undefined ? {} : { FX_CONFIGURED_PROVIDERS: options.customProvider.json }),
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
     ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
     ...(options.fast === undefined ? {} : { FX_FAST: options.fast ? "true" : "false" }),
@@ -2053,8 +2103,10 @@ function normalizeHostTools(value) {
       description,
       inputSchema: schema,
       ...(writes === undefined ? {} : { writes }),
-      // The engine does not read `idempotent`, but it stays in the shape a
-      // checkpoint records, so a change to it counts as a changed tool set.
+      // The engine reads `idempotent`: such a tool runs beside others unless
+      // it `writes`, and one that does not write starts before its intent is
+      // stored. It is also in the shape a checkpoint records, so a change to
+      // it counts as a changed tool set.
       ...(idempotent === true ? { idempotent: true } : {}),
     });
     executors.set(name, execute);
@@ -2182,12 +2234,15 @@ export async function createFxEngine(options = {}) {
   let closing = false;
   let coreExitError = null;
   const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
-  // Events go to the store in the order the core sends them: events that
-  // arrive together become one record, and each record's append names the
-  // cursor of the one before it, so a store refuses a write that does not
-  // continue what it holds. The core waits for a record only before an
-  // action others can see: a model request or a tool call.
+  // Events go to the store in the order the core sends them, one append at
+  // a time: events that arrive together become one record, and so do all
+  // the events that arrive while an append is in flight. Each record's append
+  // names the cursor of the one before it, so a store refuses a write that
+  // does not continue what it holds, and says with `barrier` whether anyone
+  // waits for it: the core before an action others can see, such as a tool
+  // call with effects, or a caller for its input.
   const persistence = options.persistence ?? null;
+  const wantsMarks = persistence?.marks === true || persistence?.[journalMarksWanted] === true;
   const checkpointAfterBytes = options.checkpointAfterBytes ?? defaultCheckpointAfterBytes;
   // The store's last cursor, and the last seq its records hold.
   let journalHead = null;
@@ -2198,13 +2253,13 @@ export async function createFxEngine(options = {}) {
   // One per agent, so a store can tell a repeated write from another writer's.
   const writerId = crypto.randomUUID();
   const journal = persistence && {
-    append(events) {
+    append(events, barrier) {
       const data = encodeJournalRecord(events);
       const lastSeq = events.at(-1)?.seq;
       // A store that tracks turns without reading records asks for marks.
-      const marks = persistence[journalMarksWanted] === true ? { marks: journalMarks(events) } : {};
+      const marks = wantsMarks ? { marks: journalMarks(events) } : {};
       const appended = appendTail.then(async () => {
-        const result = await persistence.append({ expected: journalHead, idempotencyKey: `${writerId}:${events[0]?.seq}`, data, ...marks });
+        const result = await persistence.append({ expected: journalHead, idempotencyKey: `${writerId}:${events[0]?.seq}`, data, barrier, ...marks });
         if (!validCursor(result?.cursor)) throw new TypeError("persistence.append() must resolve to { cursor }");
         journalHead = result.cursor;
         if (Number.isSafeInteger(lastSeq)) appendedSeq = lastSeq;
@@ -2220,17 +2275,26 @@ export async function createFxEngine(options = {}) {
   // ended, so a retried prompt continues or skips its turn.
   let openTurnId = null;
   let lastTurnId = null;
-  // The calls the open turn left running: `{ id, name, arguments }`.
+  // The calls the open turn left running: `{ id, name, arguments }`, and
+  // what the resume tells the model about each one it does not run again.
   let ambiguousCalls = [];
-  // Asks `onAmbiguous` about each of them, once, and returns the ids of the
-  // calls to run again; the resume answers the rest as possibly run.
-  const rerunIds = (onAmbiguous) => {
+  // Asks `onAmbiguous` about each of them, once. Returns the ids of the
+  // calls to run again, and the rest, which the resume answers as possibly
+  // run.
+  const settleAmbiguous = (onAmbiguous) => {
     const calls = ambiguousCalls;
     ambiguousCalls = [];
-    if (onAmbiguous === undefined) return [];
-    return calls
-      .filter((call) => onAmbiguous({ executionId: call.id, name: call.name, input: parsedToolInput(call.arguments) }) === "rerun")
-      .map((call) => call.id);
+    const rerun = onAmbiguous === undefined
+      ? []
+      : calls.filter((call) => onAmbiguous({ executionId: call.id, name: call.name, input: parsedToolInput(call.arguments) }) === "rerun").map((call) => call.id);
+    return { rerun, answered: calls.filter((call) => !rerun.includes(call.id)) };
+  };
+  // Continues the open turn: the calls it left running run again or are
+  // answered as possibly run, and each answered one ends for the turn's
+  // viewers as it does for the model.
+  const resumeOpenTurn = (promptOptions) => {
+    const { rerun, answered } = settleAmbiguous(promptOptions.onAmbiguous);
+    return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerun }), answered);
   };
   // Follow-ups waiting for the turn ahead of them, oldest first.
   const followUps = [];
@@ -2254,6 +2318,10 @@ export async function createFxEngine(options = {}) {
   let journalQueue = [];
   let journalFlushScheduled = false;
   const journalPending = new Set();
+  // The append in flight, and whether anyone waits for the events queued
+  // behind it.
+  let journalInFlight = null;
+  let journalBarrier = false;
   let journalFailure = null;
   // Set by `turn.cancel({ reason: "handoff" })`: the journal keeps the open
   // turn for another agent, so this one stores nothing more.
@@ -2293,7 +2361,8 @@ export async function createFxEngine(options = {}) {
     journalFailureReported = true;
     return journalFailure;
   };
-  const queueJournalEvents = (events) => {
+  // `barrier`: the core waits for these events before it goes on.
+  const queueJournalEvents = (events, barrier = false) => {
     if (journalFailure || !Array.isArray(events) || events.length === 0) return;
     if (handedOff) {
       // The agent that opens the session next decides about these inputs.
@@ -2304,6 +2373,8 @@ export async function createFxEngine(options = {}) {
       return;
     }
     journalQueue.push(...events);
+    // A caller waits for its steer or withdrawal to be stored.
+    if (barrier || events.some((event) => event?.type === "input_accepted" || event?.type === "input_withdrawn")) journalBarrier = true;
     // A turn notes a new config right before its first progress, a barrier:
     // the two go out in one write instead of two in a row.
     if (events.every((event) => event?.type === "session_config")) return;
@@ -2311,15 +2382,20 @@ export async function createFxEngine(options = {}) {
     journalFlushScheduled = true;
     queueMicrotask(flushJournal);
   };
+  // Sends the queued events as one record, unless an append is in flight:
+  // then they wait for it, with any that arrive meanwhile, and go out
+  // together once it lands.
   function flushJournal() {
     journalFlushScheduled = false;
-    if (journalFailure || journalQueue.length === 0) return;
+    if (journalFailure || journalInFlight || journalQueue.length === 0) return;
     const batch = journalQueue;
     journalQueue = [];
-    emit("journal.append", { events: batch.length });
+    const barrier = journalBarrier;
+    journalBarrier = false;
+    emit("journal.append", { events: batch.length, barrier });
     let appended;
     try {
-      appended = Promise.resolve(journal.append(batch));
+      appended = Promise.resolve(journal.append(batch, barrier));
     } catch (error) {
       appended = Promise.reject(error);
     }
@@ -2335,7 +2411,12 @@ export async function createFxEngine(options = {}) {
       // Nothing the turn does from here can be saved, and after a fence the
       // session has another owner: stop the turn and its effects now.
       activeTurn?.cancel();
-    }).finally(() => journalPending.delete(settled));
+    }).finally(() => {
+      journalPending.delete(settled);
+      journalInFlight = null;
+      flushJournal();
+    });
+    journalInFlight = settled;
     journalPending.add(settled);
   }
   // The journal's own work, such as a heartbeat, ends with the agent: once,
@@ -2347,6 +2428,8 @@ export async function createFxEngine(options = {}) {
   }
   async function journalSettled() {
     for (;;) {
+      // This caller waits for every event queued so far.
+      if (journalQueue.length > 0) journalBarrier = true;
       if (journalFlushScheduled || journalQueue.length > 0) flushJournal();
       if (journalPending.size === 0) break;
       await Promise.all([...journalPending]);
@@ -2395,6 +2478,12 @@ export async function createFxEngine(options = {}) {
     return checkpointing;
   };
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  // Adds the host's credentials to the provider's own requests.
+  const providerAuth = subscriptionProviders.has(options.provider)
+    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, refreshLock: options.refreshLock, fetch: hostFetch, memory: options[credentialMemory] })
+    : options.customProvider && options.credentials
+      ? createSubscriptionAuthorizer([customProviderSpec(options.customProvider, () => sessionId)], { credentials: options.credentials, fetch: hostFetch })
+      : null;
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
     let endpoint = String(input?.url ?? input);
@@ -2422,7 +2511,10 @@ export async function createFxEngine(options = {}) {
           throw new DOMException("Aborted", "AbortError");
         }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
-        const response = await hostFetch(input, init);
+        const spec = providerAuth?.specFor(endpoint);
+        const response = spec
+          ? await providerAuth.fetch(spec, endpoint, hostFetch, input, init)
+          : await hostFetch(input, init);
         const headers = response.headers;
         emit("transport.response", {
           attempt,
@@ -2608,7 +2700,7 @@ export async function createFxEngine(options = {}) {
     emit("acp.receive", { message });
     if (message.method === "libfx/journal_append") {
       if (journal && message.params?.sessionId === sessionId) {
-        queueJournalEvents(message.params.events);
+        queueJournalEvents(message.params.events, message.params.barrier === true);
       }
       return;
     }
@@ -2680,7 +2772,10 @@ export async function createFxEngine(options = {}) {
     sessionId = sessionResult.sessionId;
     if (initialCheckpoint) {
       const [checkpointAttachment] = attachBytes([initialCheckpoint]);
-      const restored = await request("libfx/restore", { sessionId, checkpointAttachment });
+      const restored = await request("libfx/restore", { sessionId, checkpointAttachment }).catch((error) => {
+        if (/newer fx/.test(error?.message ?? "")) throw new FxJournalVersionError(error.message);
+        throw error;
+      });
       compareCheckpointMeta(restored?.checkpointMeta);
     }
     if (journal) {
@@ -2772,7 +2867,7 @@ export async function createFxEngine(options = {}) {
       if (turnId !== undefined && journal) {
         if (resumable && turnId === openTurnId) {
           resumable = false;
-          return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerunIds(promptOptions.onAmbiguous) }));
+          return resumeOpenTurn(promptOptions);
         }
         if (turnId === lastTurnId) return endedTurn(turnId);
       }
@@ -2796,7 +2891,7 @@ export async function createFxEngine(options = {}) {
       checkOnAmbiguous(promptOptions.onAmbiguous);
       if (resumable) {
         resumable = false;
-        return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerunIds(promptOptions.onAmbiguous) }));
+        return resumeOpenTurn(promptOptions);
       }
       // With no open turn, the follow-ups the journal held are the work left.
       const next = followUps.find((entry) => entry.held);
@@ -2900,7 +2995,9 @@ export async function createFxEngine(options = {}) {
   };
   return agent;
 
-  function normalizeTurn(rawTurn) {
+  // `answered`: calls a resumed turn answers as possibly run before it goes
+  // on, whose `tool_end` comes first.
+  function normalizeTurn(rawTurn, answered = []) {
     const toolNames = new Map();
     const started = new Set();
     const eventFor = (update) => {
@@ -2955,6 +3052,9 @@ export async function createFxEngine(options = {}) {
       withdraw(id) { return rawTurn.withdraw(id); },
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
+          for (const call of answered) {
+            yield { type: "tool_end", id: call.id, name: call.name, content: unfinishedToolOutput, isError: true };
+          }
           for await (const update of rawTurn) {
             const event = eventFor(update);
             if (event) yield event;

@@ -114,7 +114,7 @@ pub const Catalog = struct {
         if (!c.known(name)) return .not_available;
         tools_feature.validateArguments(arena, arguments_json, .{}) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            return .{ .invalid = try std.fmt.allocPrint(arena, "Invalid arguments for MCP tool {s}: {s}", .{ name, @errorName(err) }) };
+            return .{ .invalid = try arena.print("Invalid arguments for MCP tool {s}: {s}", .{ name, @errorName(err) }) };
         };
         return .{ .valid = c.generation };
     }
@@ -512,9 +512,9 @@ pub const Catalog = struct {
             if (!tool_names.matchesServer(name, s.name)) continue;
             const text = switch (l.state) {
                 .needs_login => try needsLoginText(alloc, s.name),
-                .failed => try std.fmt.allocPrint(alloc, "MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
+                .failed => try alloc.print("MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
                 else => if (s.held == .missing_env)
-                    try std.fmt.allocPrint(alloc, "MCP server '{s}' needs {s} set before fx starts.", .{ s.name, s.missing orelse "a variable" })
+                    try alloc.print("MCP server '{s}' needs {s} set before fx starts.", .{ s.name, s.missing orelse "a variable" })
                 else
                     continue,
             };
@@ -532,7 +532,7 @@ pub const Catalog = struct {
         for (c.runtime.servers(), c.lists) |s, l| {
             if (!tool_search.queryContainsCompleteIdentity(named, s.name)) continue;
             if (l.state == .needs_login) {
-                const guidance = try std.fmt.allocPrint(alloc, "Run fx mcp login {s} in a terminal, then search again.", .{s.name});
+                const guidance = try alloc.print("Run fx mcp login {s} in a terminal, then search again.", .{s.name});
                 defer alloc.free(guidance);
                 return try tool_search.writeAuthenticationRequired(alloc, s.name, .{ .oauth = guidance });
             }
@@ -599,10 +599,10 @@ const Asking = struct {
 fn render(arena: Allocator, server: []const u8, name: []const u8, answer: runtime_mod.CallResult, max_bytes: usize) !?tool_mcp_runtime.CallResult {
     const response = switch (answer) {
         .result => |r| if (r.structured) |structured|
-            try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"content\":{s},\"structuredContent\":{s},\"isError\":{s}}}}}", .{ r.content, structured, if (r.is_error) "true" else "false" })
+            try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"content\":{s},\"structuredContent\":{s},\"isError\":{s}}}}}", .{ r.content, structured, if (r.is_error) "true" else "false" })
         else
-            try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"content\":{s},\"isError\":{s}}}}}", .{ r.content, if (r.is_error) "true" else "false" }),
-        .failure => |f| try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{{\"code\":{d},\"message\":{s}}}}}", .{ f.code, f.message }),
+            try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"content\":{s},\"isError\":{s}}}}}", .{ r.content, if (r.is_error) "true" else "false" }),
+        .failure => |f| try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{{\"code\":{d},\"message\":{s}}}}}", .{ f.code, f.message }),
         .ended => |e| return try ended(arena, server, name, e, max_bytes),
         .unknown_server => return null,
     };
@@ -631,7 +631,7 @@ fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(r
         .denied => "fx's permission refused it",
         else => @tagName(e.outcome),
     };
-    const text = try std.fmt.allocPrint(arena, "MCP server '{s}' ended the call: {s}{s}{s}", .{
+    const text = try arena.print("MCP server '{s}' ended the call: {s}{s}{s}", .{
         server,
         if (e.timed_out) "it did not answer in time" else why,
         if (e.maybe_ran) ". The tool may have run" else "",
@@ -641,7 +641,7 @@ fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(r
 }
 
 fn needsLoginText(alloc: Allocator, server: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "MCP server '{s}' needs a login. Ask the user to run fx mcp login {s}, then try again.", .{ server, server });
+    return alloc.print("MCP server '{s}' needs a login. Ask the user to run fx mcp login {s}, then try again.", .{ server, server });
 }
 
 fn catalog(raw: *anyopaque) *Catalog {
@@ -699,14 +699,14 @@ test "an MCP-v2 server's tools reach the model under fx's names" {
 
     const query = try lexical_relevance.prepare("echo");
     const found = try c.searchTools(a, .{ .query = &query, .kind = .mcp }, .{}, .{}, .unrestricted, null);
-    try testing.expect(std.mem.indexOf(u8, found.model_output, "\"name\":\"mcp_fake_echo\",\"server\":\"fake\"") != null);
+    try testing.expect(std.mem.find(u8, found.model_output, "\"name\":\"mcp_fake_echo\",\"server\":\"fake\"") != null);
     try testing.expectEqual(@as(usize, 1), found.selected_tools.len);
     const binding = found.selected_tools[0].mcp_binding.?;
     try testing.expectEqual(c.generation, binding.runtime_generation);
 
     const schema = (try c.toolSchema(a, "mcp_fake_echo", .{}, .{}, .unrestricted, null)).?;
     try testing.expect(std.meta.eql(binding, schema.selected.mcp_binding.?));
-    try testing.expect(std.mem.indexOf(u8, schema.selected.model_output, "mcp_fake_echo") != null);
+    try testing.expect(std.mem.find(u8, schema.selected.model_output, "mcp_fake_echo") != null);
     try testing.expect((try c.snapshotToolDefinition(a, "mcp_fake_echo", binding, .{}, .{}, .unrestricted)) == .current);
 
     try testing.expectEqual(c.generation, (try c.validateTool(a, "mcp_fake_echo", "{}", .unrestricted)).valid);
@@ -714,7 +714,7 @@ test "an MCP-v2 server's tools reach the model under fx's names" {
 
     const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .expected_binding = binding })).?;
     try testing.expectEqual(tool_mcp_runtime.CallStatus.success, result.status);
-    try testing.expect(std.mem.indexOf(u8, result.model_output, "hi") != null);
+    try testing.expect(std.mem.find(u8, result.model_output, "hi") != null);
     var stale = binding;
     stale.runtime_generation +%= 1;
     try testing.expectError(error.McpAdvertisedToolChanged, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .expected_binding = stale }));
@@ -758,13 +758,13 @@ test "a search says why a server it names has no tools, and calls that end say h
         keyed.model_output,
     );
     const missing = try c.searchTools(a, .{ .query = &query, .kind = .mcp, .server = "nope" }, .{}, .{}, .unrestricted, null);
-    try testing.expect(std.mem.indexOf(u8, missing.model_output, "\"state\":\"server_not_found\"") != null);
+    try testing.expect(std.mem.find(u8, missing.model_output, "\"state\":\"server_not_found\"") != null);
 
     const login = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .needs_auth, .maybe_ran = false, .timed_out = false }, 4096);
     try testing.expectEqual(tool_mcp_runtime.CallStatus.tool_failure, login.status);
-    try testing.expect(std.mem.indexOf(u8, login.model_output, "fx mcp login linear") != null);
+    try testing.expect(std.mem.find(u8, login.model_output, "fx mcp login linear") != null);
     const lost = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .lost, .maybe_ran = true, .timed_out = false }, 4096);
     try testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, lost.status);
-    try testing.expect(std.mem.indexOf(u8, lost.model_output, "the server went away. The tool may have run.") != null);
+    try testing.expect(std.mem.find(u8, lost.model_output, "the server went away. The tool may have run.") != null);
     try testing.expectError(error.Cancelled, ended(a, "linear", "mcp_linear_list", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false }, 4096));
 }

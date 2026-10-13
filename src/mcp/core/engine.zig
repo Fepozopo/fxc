@@ -268,7 +268,7 @@ fn record(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Ev
             .{ .name = "n", .value = .{ .int = @min(out.n, 1 << 30) } },
             .{ .name = "allowed", .value = .{ .boolean = event == .asked and event.asked.allowed } },
             .{ .name = "keep", .value = .{ .boolean = event == .drop and event.drop.keep } },
-            .{ .name = "phase", .value = .{ .int = @intFromEnum(p.phase) } },
+            .{ .name = "phase", .value = .{ .int = @backingInt(p.phase) } },
             .{ .name = "attempts", .value = .{ .int = p.attempts } },
             .{ .name = "need", .value = .{ .boolean = p.need } },
             .{ .name = "waiting", .value = .{ .int = p.waiting } },

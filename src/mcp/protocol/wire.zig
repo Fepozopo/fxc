@@ -510,7 +510,7 @@ test "decodes results with numeric, string, and foreign ids" {
 
     for ([_][]const u8{ "\"abc\"", "\"012\"", "\"1_0\"", "-3", "null", "1.5", "99999999999999999999" }) |foreign| {
         var buffer: [96]u8 = undefined;
-        const input = try std.fmt.bufPrint(&buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{foreign});
+        const input = try std.mem.print(&buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{foreign});
         try testing.expectEqual(@as(?RequestId, null), (try decode(input)).response.id);
     }
     try testing.expectEqual(@as(?RequestId, null), (try decode("{\"jsonrpc\":\"2.0\",\"result\":{}}")).response.id);
@@ -597,7 +597,7 @@ test "decodes notifications and 2025 server requests" {
 }
 
 test "rejects malformed and ambiguous messages" {
-    const deep = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":" ++ "[" ** 5000 ++ "]" ** 5000 ++ "}}";
+    const deep = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":" ++ &@as([5000]u8, @splat('[')) ++ &@as([5000]u8, @splat(']')) ++ "}}";
     const cases = [_]struct { []const u8, DecodeError }{
         .{ "", error.InvalidJson },
         .{ "[{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}]", error.NotAnObject },
@@ -643,7 +643,7 @@ test "mutated messages never crash and slices stay inside the input" {
             1 => len = random.intRangeAtMost(usize, 0, len),
             else => if (len < buffer.len) {
                 const at = random.uintLessThan(usize, len + 1);
-                std.mem.copyBackwards(u8, buffer[at + 1 .. len + 1], buffer[at..len]);
+                @memmove(buffer[at + 1 .. len + 1], buffer[at..len]);
                 buffer[at] = "{}[]\",:0\\"[random.uintLessThan(usize, 10)];
                 len += 1;
             },

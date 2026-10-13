@@ -88,7 +88,7 @@ pub const ModelMenuProjection = struct {
     query: []const u8 = "",
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
-        return @enumFromInt(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1));
+        return @fromBackingInt(@intCast(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1)));
     }
 
     pub fn filteredItemCount(self: ModelMenuProjection) usize {
@@ -471,6 +471,8 @@ pub const RenderContext = struct {
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
+    /// What MCP has to say, after everything else on the right.
+    mcp_status: []const u8 = "",
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,

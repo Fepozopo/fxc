@@ -254,7 +254,7 @@ pub fn rank(
 }
 
 fn appendSearchNotice(alloc: Allocator, notice: *?[]u8, message: []const u8) !void {
-    const combined = if (notice.*) |current| try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ current, message }) else try alloc.dupe(u8, message);
+    const combined = if (notice.*) |current| try alloc.print("{s}\n{s}", .{ current, message }) else try alloc.dupe(u8, message);
     if (notice.*) |current| alloc.free(current);
     notice.* = combined;
 }
@@ -410,8 +410,8 @@ pub fn boundedEncodedScalar(alloc: Allocator, value: []const u8, max_bytes: usiz
     if (observed <= max_bytes) return .{ .text = encoded, .observed_bytes = observed };
 
     var prefix_len = context_limits.utf8PrefixLength(encoded, max_bytes);
-    if (std.mem.lastIndexOfScalar(u8, encoded[0..prefix_len], '&')) |amp_index| {
-        if (std.mem.indexOfScalar(u8, encoded[amp_index..prefix_len], ';') == null) prefix_len = amp_index;
+    if (std.mem.findScalarLast(u8, encoded[0..prefix_len], '&')) |amp_index| {
+        if (std.mem.findScalar(u8, encoded[amp_index..prefix_len], ';') == null) prefix_len = amp_index;
     }
     return .{ .text = try alloc.realloc(encoded, prefix_len), .observed_bytes = observed };
 }
@@ -449,7 +449,7 @@ pub fn renderAuthenticationRequired(
         const failed = server.state.load(.acquire) == .failed;
         server.status_lock.unlock(io_mod.getIo());
         if (authentication == .required) {
-            const guidance = try std.fmt.allocPrint(alloc, "Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
+            const guidance = try alloc.print("Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
             defer alloc.free(guidance);
             return try writeAuthenticationRequired(alloc, server.config.name, .{ .oauth = guidance });
         }
@@ -513,7 +513,7 @@ pub fn renderServerFailure(
 
 /// The page a search returns when the server it names is down.
 pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []const u8) ![]u8 {
-    const message = try std.fmt.allocPrint(alloc, "MCP server '{s}' is unavailable: {s}", .{ server_name, failure });
+    const message = try alloc.print("MCP server '{s}' is unavailable: {s}", .{ server_name, failure });
     defer alloc.free(message);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();

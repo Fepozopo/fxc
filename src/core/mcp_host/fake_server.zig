@@ -36,7 +36,7 @@ pub const Fixture = struct {
         try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "server", .data = script, .flags = .{ .permissions = .executable_file } });
         f.home = try io_mod.dirRealpathAlloc(testing.allocator, f.tmp.dir, ".");
         errdefer testing.allocator.free(f.home);
-        f.server = try std.fs.path.join(testing.allocator, &.{ f.home, "server" });
+        f.server = try std.Io.Dir.path.join(testing.allocator, &.{ f.home, "server" });
         f.inherited = .init(testing.allocator);
     }
 

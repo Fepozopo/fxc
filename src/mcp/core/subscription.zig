@@ -17,7 +17,7 @@ pub const Kind = enum(u2) { tools, prompts, resources };
 pub const Filter = u8;
 
 pub fn bit(kind: Kind) Filter {
-    return @as(Filter, 1) << @intFromEnum(kind);
+    return @as(Filter, 1) << @backingInt(kind);
 }
 
 pub const Phase = enum { off, pending, active, waiting, ended };
@@ -252,7 +252,7 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, 
     var acked: i64 = 0;
     for (t.subs, 0..) |s, i| {
         const shift: u6 = @intCast(4 * i);
-        phases |= @as(i64, @intFromEnum(s.phase)) << shift;
+        phases |= @as(i64, @backingInt(s.phase)) << shift;
         tries |= @as(i64, @min(s.tries, 15)) << shift;
         acked |= @as(i64, s.acked) << shift;
     }

@@ -315,7 +315,7 @@ test "session and event ids are echoed only when they are safe header values" {
     try testing.expect(!validSessionId("\xc3\xa9"));
     try testing.expect(validEventId("stream 1:7"));
     try testing.expect(!validEventId("tab\t"));
-    try testing.expect(!validEventId("x" ** 1025));
+    try testing.expect(!validEventId(&@as([1025]u8, @splat('x'))));
 }
 
 test "encodes values that can't be sent as is" {

@@ -17,13 +17,13 @@ pub fn writeListen(out: *std.Io.Writer, id: wire.RequestId, meta: wire.Meta, fil
     try w.field("notifications");
     var buffer: [96]u8 = undefined;
     var object: std.Io.Writer = .fixed(&buffer);
-    object.writeByte('{') catch unreachable;
+    try object.writeByte('{');
     var first = true;
     for (filter_fields, 0..) |name, i| if (filter & (@as(core.Filter, 1) << @intCast(i)) != 0) {
-        object.print("{s}\"{s}\":true", .{ if (first) "" else ",", name }) catch unreachable;
+        try object.print("{s}\"{s}\":true", .{ if (first) "" else ",", name });
         first = false;
     };
-    object.writeByte('}') catch unreachable;
+    try object.writeByte('}');
     try w.raw(object.buffered());
     try w.end();
 }

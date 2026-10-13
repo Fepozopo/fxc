@@ -967,14 +967,15 @@ pub fn composeFooterFrame(
         try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .settings)
         try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
-    else if (input.show_picker and input.picker_kind == .mcp and ctx.mcp_host_menu.active())
-        try input_presentation.composeVariantHintRow(
+    else if (input.show_picker and input.picker_kind == .mcp and ctx.mcp_host_menu.active()) blk: {
+        var hints: mcp_host_menu_presentation.HintBuf = .{};
+        break :blk try input_presentation.composeVariantHintRow(
             alloc,
             shell.layout.cols,
             ctx.ctrl_c_pending,
-            mcp_host_menu_presentation.hintVariants(ctx.mcp_host_menu),
-        )
-    else if (input.show_picker and input.picker_kind == .mcp)
+            mcp_host_menu_presentation.hintVariants(ctx.mcp_host_menu, &hints),
+        );
+    } else if (input.show_picker and input.picker_kind == .mcp)
         try input_presentation.composeMcpMenuHintRow(
             alloc,
             shell.layout.cols,

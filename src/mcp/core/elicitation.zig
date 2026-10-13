@@ -218,7 +218,7 @@ pub const Table = struct {
 pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, event: Event, out: *const Output) std.Io.Writer.Error!void {
     if (out.action.len == 0) return;
     const phase: i64 = if (out.n == 0) 0 else for (t.slots) |s| {
-        if (s.used and s.n == out.n) break @as(i64, @intFromEnum(s.phase)) + 1;
+        if (s.used and s.n == out.n) break @as(i64, @backingInt(s.phase)) + 1;
     } else 3;
     const asked = if (event == .asked) event.asked else null;
     const answered = if (event == .answered) event.answered else null;
@@ -236,10 +236,10 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, t: *const Table, 
             .{ .name = "url", .value = .{ .boolean = if (asked) |a| a.mode == .url else false } },
             .{ .name = "eid", .value = .{ .boolean = if (asked) |a| a.eid else false } },
             .{ .name = "readable", .value = .{ .boolean = if (asked) |a| a.readable else false } },
-            .{ .name = "act", .value = .{ .int = if (answered) |a| @intFromEnum(a.action) else 0 } },
+            .{ .name = "act", .value = .{ .int = if (answered) |a| @backingInt(a.action) else 0 } },
             .{ .name = "valid", .value = .{ .boolean = if (answered) |a| a.valid else false } },
             .{ .name = "phase", .value = .{ .int = phase } },
-            .{ .name = "sent", .value = .{ .int = @intFromEnum(out.sent) } },
+            .{ .name = "sent", .value = .{ .int = @backingInt(out.sent) } },
             .{ .name = "declared", .value = .{ .int = @as(i64, @intFromBool(t.config.form)) | @as(i64, @intFromBool(t.config.url)) << 1 } },
         },
     });

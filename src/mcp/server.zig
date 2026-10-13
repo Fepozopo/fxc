@@ -474,7 +474,7 @@ pub const Server = struct {
         // An elicitation's answer is checked before anything goes out.
         for (l.round.slice(), values) |q, v| if (q.kind == .elicitation) {
             var form: elicitation.Form = .{};
-            const read = elicitation.parse(q.params.?, &form) catch unreachable; // read with the round
+            const read = elicitation.parse(q.params.?, &form) catch return error.InvalidInputResponses; // read with the round
             _ = elicitation.readAnswer(read.mode, &form, v) catch return error.InvalidInputResponses;
         };
         const a = l.arena.allocator();
@@ -490,7 +490,7 @@ pub const Server = struct {
     pub fn answerElicitation(r: *Server, slot: u8, answer: elicitation.Answer) Error!void {
         const s = r.elicit.held(slot) orelse return error.UnknownElicitation;
         var form: elicitation.Form = .{};
-        _ = elicitation.parse(r.elicit_held[slot].params, &form) catch unreachable; // read when asked
+        _ = elicitation.parse(r.elicit_held[slot].params, &form) catch return error.InvalidAnswer; // read when asked
         const valid = if (elicitation.check(s.mode, &form, answer)) true else |err| switch (err) {
             error.InvalidAnswer => return error.InvalidAnswer,
             error.InvalidContent => false,
@@ -612,7 +612,7 @@ pub const Server = struct {
     fn take(r: *Server) ?Event {
         if (r.event_count == 0) return null;
         const event = r.events[0];
-        std.mem.copyForwards(Event, r.events[0 .. r.event_count - 1], r.events[1..r.event_count]);
+        @memmove(r.events[0 .. r.event_count - 1], r.events[1..r.event_count]);
         r.event_count -= 1;
         return event;
     }
@@ -773,7 +773,7 @@ pub const Server = struct {
         _ = l.arena.reset(.retain_capacity);
         l.* = .{ .used = true, .handle = r.next_handle, .what = what, .exchange = .init(r.options.exchange, kind), .arena = l.arena, .chain = .init(r.options.mrtr) };
         r.next_handle +%= 1;
-        l.instance = try std.fmt.allocPrint(l.arena.allocator(), "x{d}", .{l.handle});
+        l.instance = try l.arena.allocator().print("x{d}", .{l.handle});
         l.chain_instance = l.instance;
         return l;
     }
@@ -1144,7 +1144,7 @@ pub const Server = struct {
                 // exchange, traced under its own instance.
                 l.exchange = .init(r.options.exchange, .call);
                 l.id = null;
-                if (s.round > 1) l.instance = try std.fmt.allocPrint(l.arena.allocator(), "x{d}.{d}", .{ l.handle, s.round });
+                if (s.round > 1) l.instance = try l.arena.allocator().print("x{d}.{d}", .{ l.handle, s.round });
                 if (r.stdio) try r.sendAttempt(l) else try r.stepExchange(l, .send);
             },
             .ask_host => r.emit(.{ .input = .{ .handle = l.handle, .requests = l.round.slice() } }),
@@ -1708,7 +1708,7 @@ pub const Server = struct {
     fn newEraRun(r: *Server) void {
         r.detector = .init(r.options.era);
         r.era_run += 1;
-        r.era_instance = std.fmt.bufPrint(&r.era_instance_buf, "remote.{d}", .{r.era_run}) catch "remote.n";
+        r.era_instance = std.mem.print(&r.era_instance_buf, "remote.{d}", .{r.era_run}) catch "remote.n";
     }
 
     // ---- shared machines ----

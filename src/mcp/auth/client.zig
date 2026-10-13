@@ -31,6 +31,11 @@ pub const Options = struct {
     /// A credential `save` wrote before, which the host kept
     /// securely; its tokens are used again.
     saved: ?[]const u8 = null,
+    /// The resource to ask tokens for, when a bridge already asked the
+    /// authorization server for it spelled another way (fx.sh asks Slack for
+    /// `https://mcp.slack.com/`). Used only when it names the server's own
+    /// resource, give or take a trailing slash.
+    resource: ?[]const u8 = null,
 };
 
 /// Why a sign-in ended without a token.
@@ -120,7 +125,7 @@ pub const Auth = struct {
     prm: ?discovery.ResourceMetadata = null,
     meta: ?discovery.ServerMetadata = null,
     pkce: oauth.Pkce = undefined,
-    state: [22]u8 = undefined,
+    state: [43]u8 = undefined,
     authorization_url: []const u8 = "",
     response_error: ?[]const u8 = null,
     /// Why the code wasn't redeemed, in the token endpoint's words.
@@ -441,10 +446,10 @@ pub const Auth = struct {
         const fa = a.flow_arena.allocator();
         const meta = a.meta.?;
         const reg = a.registrations[a.flow.flow_issuer - 1].?;
-        var random: [48]u8 = undefined;
+        var random: [64]u8 = undefined;
         a.io.random(&random);
         a.pkce = .init(random[0..32].*);
-        a.state = oauth.state(random[32..48].*);
+        a.state = oauth.state(random[32..64].*);
         // Offline_access when the authorization server lists it.
         const offline = if (meta.scopes) |s| (wire.arrayHasString(s, "offline_access") catch false) else false;
         var url: std.Io.Writer.Allocating = .init(fa);
@@ -455,10 +460,18 @@ pub const Auth = struct {
             .scope = try a.scopes.list(fa, mask, offline),
             .state = &a.state,
             .challenge = &a.pkce.challenge,
-            .resource = a.prm.?.resource,
+            .resource = a.tokenResource(),
         });
         a.authorization_url = url.written();
         try a.actions.append(a.gpa, .{ .authorize = a.authorization_url });
+    }
+
+    /// The resource tokens are asked for: the metadata's, or the host's
+    /// spelling of the same one.
+    fn tokenResource(a: *const Auth) []const u8 {
+        const own = a.prm.?.resource;
+        const wanted = a.options.resource orelse return own;
+        return if (std.mem.eql(u8, std.mem.trimEnd(u8, wanted, "/"), std.mem.trimEnd(u8, own, "/"))) wanted else own;
     }
 
     fn redeem(a: *Auth) Error!void {
@@ -467,7 +480,7 @@ pub const Auth = struct {
         const client: oauth.Client = .{ .id = reg.client_id, .secret = reg.client_secret, .method = oauth.chooseMethod(reg.method, reg.client_secret != null, meta.auth_methods) };
         var body: std.Io.Writer.Allocating = .init(a.gpa);
         defer body.deinit();
-        try oauth.writeTokenRequest(&body.writer, .{ .code = .{ .code = a.pending_code.?, .verifier = &a.pkce.verifier, .redirect_uri = a.redirect_uri } }, a.prm.?.resource, client);
+        try oauth.writeTokenRequest(&body.writer, .{ .code = .{ .code = a.pending_code.?, .verifier = &a.pkce.verifier, .redirect_uri = a.redirect_uri } }, a.tokenResource(), client);
         a.stage = .token;
         a.flow_key = a.newKey();
         a.post(a.flow_key, meta.token_endpoint, body.written(), "application/x-www-form-urlencoded", try oauth.basicAuthorization(a.flow_arena.allocator(), client)) catch {
@@ -567,7 +580,7 @@ pub const Auth = struct {
         a.cred = .{
             .token_endpoint = try ca.dupe(u8, meta.token_endpoint),
             .revocation_endpoint = if (meta.revocation_endpoint) |r| try ca.dupe(u8, r) else null,
-            .resource = try ca.dupe(u8, a.prm.?.resource),
+            .resource = try ca.dupe(u8, a.tokenResource()),
             .client = .{
                 .id = try ca.dupe(u8, reg.client_id),
                 .secret = if (reg.client_secret) |s| try ca.dupe(u8, s) else null,

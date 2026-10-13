@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -178,7 +179,7 @@ pub fn runSequentialCalls(
         } else completed: {
             const execution = options.execute(options.exec_ctx, alloc, call, index) catch |err| blk: {
                 const output = options.format_error(options.format_ctx, alloc, call.name, err) catch
-                    try std.fmt.allocPrint(alloc, "Tool execution failed: {s}", .{@errorName(err)});
+                    try alloc.print("Tool execution failed: {s}", .{@errorName(err)});
                 defer alloc.free(output);
                 break :blk ToolExecutionResult{
                     .status = .failure,
@@ -326,8 +327,7 @@ fn materializeParallelAttempt(
     const execution: ToolExecutionResult = if (slot.err) |err| .{
         .status = .failure,
         .model_output = blk: {
-            const output = options.format_error(options.format_ctx, alloc, call.name, err) catch |format_err| try std.fmt.allocPrint(
-                alloc,
+            const output = options.format_error(options.format_ctx, alloc, call.name, err) catch |format_err| try alloc.print(
                 "Tool execution failed: {s}; additionally failed to format error: {s}",
                 .{ @errorName(err), @errorName(format_err) },
             );
@@ -578,7 +578,7 @@ fn updateMaxInFlight(max_in_flight: *std.atomic.Value(usize), candidate: usize) 
 }
 
 fn parallelTestFormatError(_: *anyopaque, alloc: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s} failed with {s}", .{ tool_name, @errorName(err) });
+    return alloc.print("{s} failed with {s}", .{ tool_name, @errorName(err) });
 }
 
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
@@ -661,7 +661,7 @@ test "parallel classifier keeps only a leading safe read-only group" {
 test "host calls run together until a writer, which runs alone" {
     const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\[{"name":"list","description":"List","inputSchema":{}},
+        \\[{"name":"list","description":"List","inputSchema":{},"idempotent":true},
         \\ {"name":"read","description":"Read","inputSchema":{},"writes":false},
         \\ {"name":"write","description":"Write","inputSchema":{},"writes":true}]
     , .{});
@@ -688,7 +688,7 @@ test "host calls run together until a writer, which runs alone" {
 test "a host group holds at most max_parallel_host_calls calls" {
     const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\[{"name":"read","description":"Read","inputSchema":{}}]
+        \\[{"name":"read","description":"Read","inputSchema":{},"idempotent":true}]
     , .{});
     defer parsed.deinit();
     var host = try host_tool_runtime.Runtime.init(std.testing.allocator, parsed.value);
@@ -972,7 +972,7 @@ fn checkParallelRunAllocationFailures(alloc: Allocator) !void {
 
 test "parallel run cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkParallelRunAllocationFailures,
         .{},
     );
@@ -1043,7 +1043,7 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
 
 test "parallel result duplication cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkParallelResultDuplicationAllocationFailures,
         .{},
     );

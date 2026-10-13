@@ -1676,12 +1676,30 @@ const App = struct {
 
     /// The composer's text is the menu's filter.
     pub fn mcpHostMenuKey(self: *App, key: mcp_host.menu.Key) !void {
+        const was = self.mcp.host_menu.screen;
         try self.mcp.hostMenuKey(key, self.input_runtime.edit_state.input.items, io_mod.getenv("HOME") orelse "", self.workspace_root);
+        try self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state);
         self.shell.render_requests.request(.footer);
     }
 
+    pub fn mcpHostStatuses(self: *App, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
+        return self.mcp.hostStatuses(alloc);
+    }
+
+    pub fn refreshMcpHostStatus(self: *App) void {
+        if (self.mcp.refreshHostStatus(io_mod.milliTimestamp())) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+    }
+
+    pub fn startMcpHostServers(self: *App) void {
+        self.mcp.startHostServers();
+    }
+
     pub fn refreshMcpHostMenu(self: *App) void {
-        if (self.mcp.refreshHostMenu()) self.shell.render_requests.request(.footer);
+        const was = self.mcp.host_menu.screen;
+        const changed = self.mcp.refreshHostMenu(self.input_runtime.edit_state.input.items);
+        self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state) catch |err|
+            debug_trace.logf("mcp", "MCP menu kept the tool filter in the composer err={s}", .{@errorName(err)});
+        if (changed) self.shell.render_requests.request(.footer);
     }
 
     pub fn applyMcpHostReload(self: *App) !void {
@@ -3433,8 +3451,6 @@ comptime {
     if (!builtin.is_test and !host_target.is_wasm) {
         @export(&main, .{ .name = "main" });
     }
-    // Replaces compiler_rt's byte-at-a-time memset in Linux executables.
-    _ = @import("core/shared/memset.zig");
 }
 
 pub fn runWasmTerminal(init: std.process.Init) !void {
@@ -3673,12 +3689,12 @@ fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: 
 }
 
 fn stdoutIsTerminal() bool {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return false;
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return false;
     return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
 
 fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return null;
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return null;
 
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
@@ -3723,7 +3739,7 @@ fn processAllocator() Allocator {
 
 fn writeStdoutFast(text: []const u8) !void {
     @setRuntimeSafety(false);
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         var remaining = text;
         while (remaining.len > 0) {
             const written = std.c.write(std.posix.STDOUT_FILENO, remaining.ptr, remaining.len);
@@ -3737,7 +3753,7 @@ fn writeStdoutFast(text: []const u8) !void {
 
 fn writeStderrFast(text: []const u8) !void {
     @setRuntimeSafety(false);
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         var remaining = text;
         while (remaining.len > 0) {
             const written = std.c.write(std.posix.STDERR_FILENO, remaining.ptr, remaining.len);
@@ -3750,14 +3766,14 @@ fn writeStderrFast(text: []const u8) !void {
 }
 
 fn exitFast(code: u8) noreturn {
-    if (comptime builtin.link_libc and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+    if (comptime builtin.link_libc and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
         std.c._exit(@intCast(code));
     }
     std.process.exit(code);
 }
 
 fn hasPosixArgVector() bool {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows, .freestanding, .other => false,
         .wasi => builtin.link_libc,
         else => true,
@@ -4090,7 +4106,7 @@ test "session reset traces and clears active paste state" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "session-reset-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "session-reset-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4861,6 +4877,7 @@ test {
     _ = @import("ui/render_engine/transcript_blocks.zig");
     _ = @import("ui/render_engine/viewport_selection.zig");
     _ = @import("core/agent/assistant_presentation.zig");
+    _ = @import("core/agent/presentation/inline_render.zig");
     _ = @import("core/upgrade/auto_upgrade.zig");
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");
@@ -5033,4 +5050,9 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
+    _ = @import("gateway/vercel_failure_diagnostics.zig");
+    _ = @import("gateway/host_model_catalog.zig");
+    _ = @import("gateway/host_openai_codex.zig");
+    _ = @import("gateway/host_xai_grok.zig");
+    _ = @import("gateway/host_chat_completions.zig");
 }

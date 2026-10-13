@@ -24,8 +24,9 @@ pub const Phase = core.Phase;
 pub const Handle = core.Handle;
 
 pub const Transport = union(enum) {
-    /// `environ_map` is the host's and must outlive the engine.
-    stdio: struct { argv: []const []const u8, environ_map: ?*const std.process.Environ.Map = null },
+    /// `environ_map` is the host's and must outlive the engine; `cwd` is
+    /// where the server starts, the host's own directory when null.
+    stdio: struct { argv: []const []const u8, environ_map: ?*const std.process.Environ.Map = null, cwd: ?[]const u8 = null },
     http: struct { url: []const u8, headers: []const std.http.Header = &.{} },
 };
 
@@ -460,6 +461,7 @@ pub const Engine = struct {
                 .stdio => |p| .{ .stdio = .{
                     .argv = p.argv,
                     .environ_map = p.environ_map,
+                    .cwd = p.cwd,
                     .trace = tracer,
                     .bell = &e.bell,
                     .stderr = .{ .context = slot, .line = logLine },
@@ -507,7 +509,7 @@ pub const Engine = struct {
         slot.config = .{
             .name = try a.dupe(u8, c.name),
             .transport = switch (c.transport) {
-                .stdio => |p| .{ .stdio = .{ .argv = try dupeAll(a, p.argv), .environ_map = p.environ_map } },
+                .stdio => |p| .{ .stdio = .{ .argv = try dupeAll(a, p.argv), .environ_map = p.environ_map, .cwd = if (p.cwd) |dir| try a.dupe(u8, dir) else null } },
                 .http => |h| blk: {
                     const headers = try a.alloc(std.http.Header, h.headers.len);
                     for (h.headers, headers) |from, *to| to.* = .{ .name = try a.dupe(u8, from.name), .value = try a.dupe(u8, from.value) };
@@ -554,7 +556,7 @@ pub const Engine = struct {
     fn take(e: *Engine) ?Event {
         if (e.event_count == 0) return null;
         const event = e.events[0];
-        std.mem.copyForwards(Event, e.events[0 .. e.event_count - 1], e.events[1..e.event_count]);
+        @memmove(e.events[0 .. e.event_count - 1], e.events[1..e.event_count]);
         e.event_count -= 1;
         return event;
     }
@@ -581,6 +583,7 @@ fn same(a: Config, b: Config) bool {
         .stdio => |p| {
             const q = b.transport.stdio;
             if (p.environ_map != q.environ_map or p.argv.len != q.argv.len) return false;
+            if (!std.mem.eql(u8, p.cwd orelse "", q.cwd orelse "") or (p.cwd == null) != (q.cwd == null)) return false;
             for (p.argv, q.argv) |x, y| if (!std.mem.eql(u8, x, y)) return false;
         },
         .http => |h| {
@@ -632,4 +635,15 @@ test "wake from another thread ends a waiting next early" {
     e.wake();
     try std.testing.expectEqual(@as(?Event, null), try e.next(10_000));
     try std.testing.expect(e.now() - started < 5_000);
+}
+
+test "a stdio server's directory is part of its config, so a new one restarts it" {
+    const argv = [_][]const u8{ "node", "s.js" };
+    const a: Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv, .cwd = "/a" } } };
+    var b = a;
+    try std.testing.expect(same(a, b));
+    b.transport.stdio.cwd = "/b";
+    try std.testing.expect(!same(a, b));
+    b.transport.stdio.cwd = null;
+    try std.testing.expect(!same(a, b));
 }

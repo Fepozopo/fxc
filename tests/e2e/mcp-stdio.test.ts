@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -22,6 +22,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { buildMcpDispatcherDriver, ZIG_BUILD_WARMUP_TIMEOUT_MS } from "./zig-build";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -67,6 +68,10 @@ type WireEntry = {
 let tui: TmuxSession | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let cleanupRoot: string | null = null;
+
+beforeAll(() => {
+  buildMcpDispatcherDriver(REPO_ROOT);
+}, ZIG_BUILD_WARMUP_TIMEOUT_MS);
 
 afterEach(async () => {
   const activeTui = tui;
@@ -4138,6 +4143,50 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await tui.kill();
       tui = null;
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "interactive fx ask on MCP-v2 puts a server's form question to the user",
+    async () => {
+      const root = createRoot("ask-interactive-mrtr-v2", MODERN_FIXTURE, {
+        mode: "mrtr_input_required",
+        expectedElicitation: "both",
+        specClient: true,
+      });
+      const activeGateway = startToolGateway("Interactive Ask elicitation complete.");
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      const prompt = "Call the MRTR MCP fixture interactively.";
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify(prompt)}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        remainOnExit: true,
+        env: { ...fixtureEnv(root, activeGateway), FX_MCP_ENGINE: "v2" },
+      });
+
+      await tui.waitForText("MCP server fixture requests confirmed", 20_000);
+      await tui.sendText("1");
+      await tui.waitForText("- confirmed: true", 20_000);
+      await tui.sendText("1");
+      await tui.waitForText("Interactive Ask elicitation complete.", 20_000);
+
+      // The answer went back to the server in the call's second round.
+      const calls = readWire(root.wireLogPath).filter((entry) =>
+        entry.message.method === "tools/call"
+      );
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.message.params?.inputResponses).toEqual({
+        confirm: { action: "accept", content: { confirmed: true } },
+      });
+      expect(await tui.captureFullScrollback()).not.toContain("the server asked for input fx can't give");
+
+      await tui.kill();
+      tui = null;
     },
     30_000,
   );

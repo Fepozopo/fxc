@@ -67,8 +67,7 @@ pub const AlwaysLoaded = struct {
 
     /// Hands the tools over, with a notice when the budget left any out.
     pub fn finish(b: *AlwaysLoaded, alloc: Allocator) !AlwaysLoadedTools {
-        const notice = if (b.omitted > 0) try std.fmt.allocPrint(
-            alloc,
+        const notice = if (b.omitted > 0) try alloc.print(
             "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through capability_search",
             .{ b.omitted, if (b.omitted == 1) "" else "s" },
         ) else null;
@@ -116,13 +115,12 @@ fn buildToolSchemaJsonWithLimitMarker(
     defer if (encoded_instructions) |text| alloc.free(text);
     const merged_description = if (instructions != null)
         if (instructions_truncated)
-            try std.fmt.allocPrint(
-                alloc,
+            try alloc.print(
                 "{s}\n\nServer instructions: {s}\n<context_limit name=\"mcp_server_instructions_bytes\" action=\"truncated\" observed_bytes=\"{d}\" effective_bytes=\"{d}\" source=\"{s}\" override=\"--context-limit mcp_server_instructions_bytes=BYTES|off\" />",
                 .{ encoded_description, encoded_instructions.?, instruction_observed_bytes, limit.effectiveBytes(), limit.source.label() },
             )
         else
-            try std.fmt.allocPrint(alloc, "{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
+            try alloc.print("{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
     else
         try alloc.dupe(u8, encoded_description);
     defer alloc.free(merged_description);

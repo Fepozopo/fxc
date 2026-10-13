@@ -11,6 +11,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const secret = @import("../auth/secret.zig");
+const v1_auth = @import("../mcp/mcp_auth.zig");
+const v1_store = @import("../mcp/mcp_auth_store.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -29,7 +31,7 @@ pub const Store = struct {
 
     /// The Keychain on macOS unless it is turned off or unusable, else the file.
     pub fn detect(alloc: Allocator, home: []const u8) Store {
-        const keychain = builtin.os.tag == .macos and !native_keychain.isDisabled() and
+        const keychain = builtin.target.os.tag == .macos and !native_keychain.isDisabled() and
             (native_keychain.userDefaultKeychainAvailable(alloc) catch false);
         return .{ .home = home, .backend = if (keychain) .keychain else .file };
     }
@@ -102,9 +104,30 @@ pub const Store = struct {
         return .{ .dir = dir, .lock = advisory };
     }
 
+    /// The store, holding v1's logins too the first time it's read.
+    fn read(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir) !Doc {
+        var doc = try s.readSaved(alloc, dir);
+        errdefer doc.deinit(alloc);
+        if (!doc.imported_v1) {
+            s.importV1(alloc, dir, &doc);
+            try s.write(alloc, dir, doc);
+        }
+        return doc;
+    }
+
+    /// Takes over the logins v1 kept, once: what MCP-v2 already has stays,
+    /// and a login signed out later isn't brought back. One that can't be
+    /// carried over stays behind, and that server signs in again.
+    fn importV1(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir, doc: *Doc) void {
+        doc.imported_v1 = true;
+        v1_store.eachLocked(alloc, dir, s.backend == .keychain, ImportV1{ .alloc = alloc, .doc = doc }, ImportV1.add) catch |err| {
+            debug_trace.logf("mcp", "MCP v1 logins not taken over err={s}", .{@errorName(err)});
+        };
+    }
+
     /// The store as saved; an unreadable one counts as empty, and the next
     /// change replaces it.
-    fn read(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir) !Doc {
+    fn readSaved(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir) !Doc {
         const bytes = (switch (s.backend) {
             .keychain => native_keychain.loadMcpHostCredentials(alloc) catch |err| switch (err) {
                 error.KeychainItemNotFound => null,
@@ -128,7 +151,7 @@ pub const Store = struct {
             std.crypto.secureZero(u8, out.writer.buffer);
             out.deinit();
         }
-        try std.json.Stringify.value(.{ .version = 1, .servers = doc.entries.items }, .{}, &out.writer);
+        try std.json.Stringify.value(.{ .version = 1, .imported_v1 = doc.imported_v1, .servers = doc.entries.items }, .{}, &out.writer);
         switch (s.backend) {
             .keychain => try native_keychain.storeMcpHostCredentials(out.written()),
             .file => try io_mod.durableReplaceVerified(alloc, dir, file_name, out.written()),
@@ -164,6 +187,8 @@ const Entry = struct {
 
 const Doc = struct {
     entries: std.ArrayList(Entry) = .empty,
+    /// v1's logins were taken over; never again after that.
+    imported_v1: bool = false,
 
     fn deinit(d: *Doc, alloc: Allocator) void {
         for (d.entries.items) |*e| e.deinit(alloc);
@@ -180,13 +205,14 @@ const Doc = struct {
     fn parse(alloc: Allocator, bytes: []const u8) !Doc {
         const Saved = struct {
             version: u32,
+            imported_v1: bool = false,
             servers: []const struct { name: []const u8, url: []const u8, credential: []const u8 },
         };
         var arena: std.heap.ArenaAllocator = .init(alloc);
         defer arena.deinit();
         const saved = try std.json.parseFromSliceLeaky(Saved, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
         if (saved.version != 1) return error.UnsupportedVersion;
-        var doc: Doc = .{};
+        var doc: Doc = .{ .imported_v1 = saved.imported_v1 };
         errdefer doc.deinit(alloc);
         try doc.entries.ensureTotalCapacity(alloc, saved.servers.len);
         for (saved.servers) |entry| {
@@ -201,6 +227,47 @@ const Doc = struct {
         return doc;
     }
 };
+
+const ImportV1 = struct {
+    alloc: Allocator,
+    doc: *Doc,
+
+    fn add(ctx: ImportV1, server: []const u8, c: *const v1_auth.Credentials) Allocator.Error!void {
+        if (ctx.doc.find(server, c.endpoint) != null) return;
+        const credential = try fromV1(ctx.alloc, c) orelse return;
+        errdefer secret.zeroAndFree(ctx.alloc, credential);
+        try ctx.doc.entries.ensureUnusedCapacity(ctx.alloc, 1);
+        const name = try ctx.alloc.dupe(u8, server);
+        errdefer ctx.alloc.free(name);
+        const url = try ctx.alloc.dupe(u8, c.endpoint);
+        ctx.doc.entries.appendAssumeCapacity(.{ .name = name, .url = url, .credential = credential });
+    }
+};
+
+/// A v1 login as the credential MCP-v2 saves, or null for one it can't use:
+/// a token that isn't a bearer token, or a client method it doesn't know.
+fn fromV1(alloc: Allocator, c: *const v1_auth.Credentials) Allocator.Error!?[]u8 {
+    if (!std.ascii.eqlIgnoreCase(c.token_type, "bearer")) return null;
+    const Method = enum { none, client_secret_basic, client_secret_post };
+    const method = std.meta.stringToEnum(Method, c.token_endpoint_auth_method) orelse return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer {
+        std.crypto.secureZero(u8, out.writer.buffer);
+        out.deinit();
+    }
+    std.json.Stringify.value(.{
+        .access = c.access_token,
+        .refresh = c.refresh_token,
+        .expires_at_ms = if (c.expires_at_ms == std.math.maxInt(i64)) null else @as(?i64, c.expires_at_ms),
+        .token_endpoint = c.token_endpoint,
+        .revocation_endpoint = c.revocation_endpoint,
+        .resource = c.resource,
+        .client_id = c.client_id,
+        .client_secret = c.client_secret,
+        .method = @tagName(method),
+    }, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
 
 const testing = std.testing;
 
@@ -229,6 +296,41 @@ test "a credential is kept per server name and URL, replaced, and removed" {
 
     try testing.expect(try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
     try testing.expect(!try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
+}
+
+test "v1's logins are taken over once, and a sign-out isn't undone" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    {
+        var home_dir = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) };
+        defer home_dir.close();
+        var root = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+        defer root.close();
+        var dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.mcp_credentials_dir_name);
+        defer dir.close();
+        const entry =
+            \\"endpoint":"https://mcp.linear.app/mcp","resource":"https://mcp.linear.app/mcp","issuer":"https://linear.app",
+            \\"client_id":"c1","client_secret":null,"access_token":"v1-access","refresh_token":"v1-refresh","scope":"read",
+            \\"token_endpoint_auth_method":"none","authorization_endpoint":"https://linear.app/oauth/authorize",
+            \\"token_endpoint":"https://linear.app/oauth/token","revocation_endpoint":null,"expires_at_ms":null
+        ;
+        try io_mod.durableReplaceVerified(testing.allocator, &dir, profile_paths.mcp_credentials_file_name, "{\"version\":1,\"credentials\":[" ++
+            "{\"server_identity\":\"linear\",\"token_type\":\"Bearer\"," ++ entry ++ "}," ++
+            "{\"server_identity\":\"bound\",\"token_type\":\"DPoP\"," ++ entry ++ "}]}");
+    }
+    const store: Store = .{ .home = home, .backend = .file };
+    const got = (try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp")).?;
+    defer secret.zeroAndFree(testing.allocator, got);
+    try testing.expectEqualStrings(
+        \\{"access":"v1-access","refresh":"v1-refresh","expires_at_ms":null,"token_endpoint":"https://linear.app/oauth/token","revocation_endpoint":null,"resource":"https://mcp.linear.app/mcp","client_id":"c1","client_secret":null,"method":"none"}
+    , got);
+    // A token bound to a key isn't one MCP-v2 can send.
+    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "bound", "https://mcp.linear.app/mcp"));
+    // Signed out, it stays signed out: v1's copy isn't taken again.
+    try testing.expect(try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
     try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
 }
 

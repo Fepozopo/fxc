@@ -4221,6 +4221,55 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP on MCP-v2 starts a project stdio server in its project",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-cwd-v2-");
+      const pidPath = join(root.root, "project-cwd.pid");
+      // A path relative to the project: it only resolves when the server starts there.
+      mkdirSync(join(root.workspace, "tools"), { recursive: true });
+      writeFileSync(join(root.workspace, "tools", "server.mjs"), `import ${JSON.stringify(MCP_STDIO_FIXTURE)};\n`);
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: ["tools/server.mjs"],
+              env: { FX_MCP_RESULT_TEXT: "ACP_PROJECT_CWD_RESULT", FX_MCP_PID_PATH: pidPath },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_project", "mcp_select_tool", { name: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_project", MCP_TOOL_NAME, { text: "acp" }),
+        finalText("ACP project MCP complete"),
+      ]);
+      const env = { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" };
+      try {
+        const approved = await runFx(["mcp", "approve", "fixture"], { cwd: root.workspace, env });
+        expect(approved.code).toBe(0);
+        // fx itself runs elsewhere; the session names the project.
+        client = await AcpClient.create({ cwd: root.root, env });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        await runMcpToolPrompt(client, gateway, "call_project", "ACP_PROJECT_CWD_RESULT");
+        expect(existsSync(pidPath)).toBe(true);
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP keeps duplicate primary server names and excludes a workspace collision",
     async () => {
       const root = createIsolatedRoot("fx-acp-project-mcp-collision-");

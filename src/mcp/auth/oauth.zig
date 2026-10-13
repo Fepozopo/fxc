@@ -28,9 +28,10 @@ pub const Pkce = struct {
     }
 };
 
-/// The state: 16 random bytes in base64url.
-pub fn state(random: [16]u8) [22]u8 {
-    var out: [22]u8 = undefined;
+/// The state: 32 random bytes in base64url, as long as the PKCE verifier;
+/// a bridge such as fx.sh's Slack sign-in takes no shorter one.
+pub fn state(random: [32]u8) [43]u8 {
+    var out: [43]u8 = undefined;
     _ = b64.encode(&out, &random);
     return out;
 }
@@ -274,13 +275,22 @@ pub const Token = struct {
     scope: ?[]const u8 = null,
 };
 
-/// Reads a token response. Only Bearer tokens are used.
+/// Token types that can't be sent as a bearer token: bound to a key (DPoP,
+/// RFC 9449; PoP; MAC) or not an access token at all (N_A, RFC 8693). Any
+/// other, such as Slack's `user`, is sent as Bearer, as MCP requires.
+fn unsendable(kind: []const u8) bool {
+    for ([_][]const u8{ "dpop", "pop", "mac", "n_a" }) |k| if (std.ascii.eqlIgnoreCase(kind, k)) return true;
+    return false;
+}
+
+/// Reads a token response. Every token is sent as Bearer; a type that
+/// can't be is refused.
 pub fn parseToken(a: Allocator, raw: []const u8) error{ OutOfMemory, Malformed }!Token {
     var f: [5]?[]const u8 = undefined;
     wire.objectFields(raw, &.{ "access_token", "token_type", "refresh_token", "expires_in", "scope" }, &f) catch return error.Malformed;
     const access = (try wire.decodeString(a, f[0] orelse return error.Malformed)) orelse return error.Malformed;
     const kind = wire.plainString(f[1] orelse return error.Malformed) orelse return error.Malformed;
-    if (access.len == 0 or !std.ascii.eqlIgnoreCase(kind, "bearer")) return error.Malformed;
+    if (access.len == 0 or unsendable(kind)) return error.Malformed;
     var t: Token = .{ .access = access };
     if (f[2]) |v| t.refresh = try wire.decodeString(a, v);
     if (f[3]) |v| t.expires_in = std.fmt.parseInt(u64, v, 10) catch null;
@@ -289,22 +299,22 @@ pub fn parseToken(a: Allocator, raw: []const u8) error{ OutOfMemory, Malformed }
 }
 
 /// Why a token endpoint's answer gave no token, to show the person signing
-/// in: its own `error` and `error_description` (RFC 6749 §5.2), or what a 200
-/// answer lacked. Owned by `a`; never any part of a token.
+/// in: its own `error` and `error_description` (RFC 6749 §5.2), at any
+/// status since some answer 200 with one (Slack's `ok:false`), or what a
+/// 200 answer lacked. Owned by `a`; never any part of a token.
 pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error![]const u8 {
     var f: [3]?[]const u8 = .{ null, null, null };
     const json = if (wire.objectFields(raw, &.{ "error", "error_description", "token_type" }, &f)) true else |_| false;
     if (!json) f = .{ null, null, null };
-    if (status != 200) {
-        const code = wire.plainString(f[0] orelse return std.fmt.allocPrint(a, "its token endpoint answered HTTP {d}", .{status})) orelse
-            return std.fmt.allocPrint(a, "its token endpoint answered HTTP {d}", .{status});
+    if (f[0]) |raw_code| if (wire.plainString(raw_code)) |code| {
         const text = if (f[1]) |v| try wire.decodeString(a, v) else null;
-        return if (text) |t| std.fmt.allocPrint(a, "{s}: {s}", .{ code, t }) else a.dupe(u8, code);
-    }
+        return if (text) |t| a.print("{s}: {s}", .{ code, t }) else a.dupe(u8, code);
+    };
+    if (status != 200) return a.print("its token endpoint answered HTTP {d}", .{status});
     if (!json) return a.dupe(u8, "its token endpoint's answer isn't a JSON object");
     const kind = wire.plainString(f[2] orelse return a.dupe(u8, "its token response has no token_type")) orelse
         return a.dupe(u8, "its token response has no token_type");
-    if (!std.ascii.eqlIgnoreCase(kind, "bearer")) return std.fmt.allocPrint(a, "its token is of type {s}, not Bearer", .{kind});
+    if (unsendable(kind)) return a.print("its token is of type {s}, which can't be sent as a Bearer token", .{kind});
     return a.dupe(u8, "its token response has no access_token");
 }
 
@@ -383,7 +393,8 @@ test "PKCE S256 and the state (RFC 7636 appendix B)" {
     const p: Pkce = .init(random);
     try testing.expectEqualStrings("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", &p.verifier);
     try testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", &p.challenge);
-    try testing.expectEqual(@as(usize, 22), state(@splat(7)).len);
+    // As long as the verifier: a bridge such as fx.sh's takes no shorter one.
+    try testing.expectEqual(@as(usize, 43), state(@splat(7)).len);
 }
 
 test "the authorization URL carries every parameter, encoded" {
@@ -482,6 +493,10 @@ test "token responses: Bearer only, refresh and expiry optional" {
     const bare = try parseToken(a, "{\"access_token\":\"at\",\"token_type\":\"Bearer\"}");
     try testing.expect(bare.refresh == null and bare.expires_in == null);
     try testing.expectError(error.Malformed, parseToken(a, "{\"access_token\":\"at\",\"token_type\":\"DPoP\"}"));
+    try testing.expectError(error.Malformed, parseToken(a, "{\"access_token\":\"at\",\"token_type\":\"N_A\"}"));
+    // Slack's user tokens are sent as Bearer.
+    const slack = try parseToken(a, "{\"ok\":true,\"access_token\":\"xoxp-1\",\"token_type\":\"user\",\"scope\":\"search:read\"}");
+    try testing.expectEqualStrings("xoxp-1", slack.access);
     try testing.expectError(error.Malformed, parseToken(a, "{\"token_type\":\"Bearer\"}"));
     try testing.expect(refusesGrant("{\"error\":\"invalid_grant\"}"));
     try testing.expect(!refusesGrant("{\"error\":\"temporarily_unavailable\"}"));
@@ -513,7 +528,9 @@ test "a token endpoint's refusal is said in its own words, and a token never" {
     try std.testing.expectEqualStrings("its token endpoint answered HTTP 502", try tokenFailure(a, 502, "<html>bad gateway</html>"));
     try std.testing.expectEqualStrings("its token endpoint answered HTTP 400", try tokenFailure(a, 400, "{\"errors\":[\"nope\"]}"));
     try std.testing.expectEqualStrings("its token endpoint's answer isn't a JSON object", try tokenFailure(a, 200, "access_token=secret"));
-    try std.testing.expectEqualStrings("its token is of type mac, not Bearer", try tokenFailure(a, 200, "{\"access_token\":\"secret\",\"token_type\":\"mac\"}"));
+    try std.testing.expectEqualStrings("its token is of type mac, which can't be sent as a Bearer token", try tokenFailure(a, 200, "{\"access_token\":\"secret\",\"token_type\":\"mac\"}"));
+    // Slack answers 200 with its error.
+    try std.testing.expectEqualStrings("invalid_code", try tokenFailure(a, 200, "{\"ok\":false,\"error\":\"invalid_code\"}"));
     try std.testing.expectEqualStrings("its token response has no token_type", try tokenFailure(a, 200, "{\"access_token\":\"secret\"}"));
     try std.testing.expectEqualStrings("its token response has no access_token", try tokenFailure(a, 200, "{\"token_type\":\"bearer\"}"));
 }
