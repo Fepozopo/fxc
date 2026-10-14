@@ -525,7 +525,7 @@ pub fn addProfileServer(
     alloc: Allocator,
     intent: command_provider_contract.AddIntent,
 ) !command_provider_contract.ProfileAddResult {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     const config_path = try configPathFromHome(alloc, home);
     errdefer alloc.free(config_path);
     const warning = try addProfileServerToPath(alloc, config_path, intent);
@@ -536,7 +536,7 @@ pub fn removeProfileServer(
     alloc: Allocator,
     name: []const u8,
 ) !command_provider_contract.ProfileRemoveResult {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     const config_path = try configPathFromHome(alloc, home);
     errdefer alloc.free(config_path);
     const result = try removeProfileServerFromPath(alloc, config_path, name);
@@ -564,7 +564,7 @@ pub const NativeConfigs = struct {
 pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeConfigs {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     errdefer freeConfigs(alloc, &profile);
-    if (io_mod.getenv("HOME")) |home| {
+    if (io_mod.homeDir()) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
         profile = try loadConfigFromPath(alloc, config_path);
@@ -647,7 +647,7 @@ pub fn loadHost(
     if (!mcp_host.selected()) return null;
     var loaded = try loadNativeConfigs(alloc, workspace_root);
     defer loaded.deinit(alloc);
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     // Read only while the host starts.
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
@@ -720,7 +720,7 @@ fn traceWorkspaceDiagnostics(diagnostics: []const project_config.WorkspaceDiagno
 pub fn inspectProfileConfig(
     alloc: Allocator,
 ) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
-    const home = io_mod.getenv("HOME") orelse return .clear;
+    const home = io_mod.homeDir() orelse return .clear;
     const config_path = try configPathFromHome(alloc, home);
     defer alloc.free(config_path);
 
@@ -742,7 +742,7 @@ pub fn inspectLocalConfig(
     var profile: std.ArrayList(McpServerConfig) = .empty;
     defer freeConfigs(alloc, &profile);
     var profile_diagnostic: mcp_contract.ProfileConfigDiagnostic = .clear;
-    if (io_mod.getenv("HOME")) |home| {
+    if (io_mod.homeDir()) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
         var document = loadProfileDocumentFromPath(alloc, config_path) catch |err| {

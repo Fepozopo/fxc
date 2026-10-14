@@ -94,12 +94,11 @@ try {
   agent = await createFxEngine(options());
   const turn = agent.prompt("start work");
   const events = [];
-  let steered = false;
+  let steered = null;
   for await (const event of turn) {
     events.push(event);
     if (!steered && event.type === "text_delta" && event.delta === "before") {
-      steered = true;
-      await turn.steer([
+      steered = await turn.steer([
         { type: "text", text: "focus on" },
         { type: "text", text: "tests" },
       ]);
@@ -110,7 +109,8 @@ try {
     events.filter((event) => event.type === "text_delta" || event.type === "user_message"),
     [
       { type: "text_delta", delta: "before" },
-      { type: "user_message", text: "focus on\ntests" },
+      // The steer shows where it joined the turn, with its id.
+      { type: "user_message", text: "focus on\ntests", id: steered.id },
       { type: "text_delta", delta: "after" },
     ],
   );

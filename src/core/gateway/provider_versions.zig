@@ -88,7 +88,7 @@ fn cacheFile(provider: Provider) []const u8 {
 
 fn loadCache(_: ?*anyopaque, alloc: Allocator, provider: Provider) !?Cached {
     if (comptime host_target.is_wasm) return null;
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
@@ -129,7 +129,7 @@ fn readCached(alloc: Allocator, dir: std.Io.Dir, provider: Provider) !?Cached {
 
 fn saveCache(_: ?*anyopaque, alloc: Allocator, provider: Provider, cached: Cached) !void {
     if (comptime host_target.is_wasm) return;
-    const home = io_mod.getenv("HOME") orelse return;
+    const home = io_mod.homeDir() orelse return;
     try saveCacheAtHome(alloc, provider, cached, home);
 }
 

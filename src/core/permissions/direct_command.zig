@@ -2,6 +2,7 @@ const std = @import("std");
 const display_width = @import("../shared/display_width.zig");
 const builtin = @import("builtin");
 const command_effect = @import("../shell_command/command_effect.zig");
+const safe_git = @import("../shell_command/safe_git.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -412,24 +413,17 @@ fn environmentForProfile(
     alloc: std.mem.Allocator,
     profile: command_effect.EnvironmentProfile,
 ) !std.process.Environ.Map {
-    var environment = std.process.Environ.Map.init(alloc);
-    errdefer environment.deinit();
     switch (profile) {
-        .basic_read_only, .git_read_only => {
+        .basic_read_only => {
+            var environment = std.process.Environ.Map.init(alloc);
+            errdefer environment.deinit();
             try environment.put("PATH", "/usr/bin:/bin");
             try environment.put("LC_ALL", "C");
             try environment.put("LANG", "C");
+            return environment;
         },
+        .git_read_only => return safe_git.environment(alloc),
     }
-    if (profile == .git_read_only) {
-        try environment.put("GIT_CONFIG_NOSYSTEM", "1");
-        try environment.put("GIT_CONFIG_GLOBAL", "/dev/null");
-        try environment.put("GIT_OPTIONAL_LOCKS", "0");
-        try environment.put("GIT_TERMINAL_PROMPT", "0");
-        try environment.put("GIT_PAGER", "cat");
-        try environment.put("PAGER", "cat");
-    }
-    return environment;
 }
 
 test "direct commands receive fx agent environment" {
@@ -978,17 +972,19 @@ test "direct executor runs fixed argv with sanitized environment and no artifact
     try std.testing.expectEqual(@as(?[]const u8, null), result.command_result.?.output_file);
 }
 
-test "git direct profile removes ambient authority and disables optional mutation" {
+test "git direct profile uses the safe-git environment" {
     var environment = try environmentForProfile(std.testing.allocator, .git_read_only);
     defer environment.deinit();
+    var expected = try safe_git.environment(std.testing.allocator);
+    defer expected.deinit();
 
-    try std.testing.expectEqualStrings("/usr/bin:/bin", environment.get("PATH").?);
-    try std.testing.expectEqualStrings("1", environment.get("GIT_CONFIG_NOSYSTEM").?);
-    try std.testing.expectEqualStrings("/dev/null", environment.get("GIT_CONFIG_GLOBAL").?);
+    try std.testing.expectEqual(expected.count(), environment.count());
+    var entries = expected.iterator();
+    while (entries.next()) |entry| {
+        try std.testing.expectEqualStrings(entry.value_ptr.*, environment.get(entry.key_ptr.*).?);
+    }
     try std.testing.expectEqualStrings("0", environment.get("GIT_OPTIONAL_LOCKS").?);
-    try std.testing.expectEqualStrings("0", environment.get("GIT_TERMINAL_PROMPT").?);
-    try std.testing.expectEqualStrings("cat", environment.get("GIT_PAGER").?);
-    try std.testing.expect(environment.get("HOME") == null);
+    try std.testing.expect(environment.get("GIT_CONFIG_PARAMETERS") == null);
 }
 
 test "direct executor runs a supported pipeline and reports final output" {

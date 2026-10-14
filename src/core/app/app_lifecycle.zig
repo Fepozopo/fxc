@@ -1090,7 +1090,7 @@ pub fn writeLastShutdownReport(alloc: Allocator, trace: *const ShutdownStageTrac
 }
 
 fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTrace) !void {
-    const home = io_mod.getenv("HOME") orelse return;
+    const home = io_mod.homeDir() orelse return;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1127,7 +1127,7 @@ fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTra
 /// Reads the persisted shutdown breakdown for the /trace report. Returns the
 /// owned file contents; caller frees. Missing or unreadable file is null.
 pub fn readLastShutdownReport(alloc: Allocator) ?[]u8 {
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     const path = profile_paths.lastShutdownReportPath(alloc, home) catch return null;
     defer alloc.free(path);
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;

@@ -592,7 +592,7 @@ pub const Runtime = struct {
         if (self.backend) |backend| return backend;
         if (self.backend_closed) return error.RuntimeStopping;
         const alloc = self.alloc.?;
-        const home = self.profile_home orelse io_mod.getenv("HOME") orelse
+        const home = self.profile_home orelse io_mod.homeDir() orelse
             return error.HomeNotSet;
 
         const pid = std.c.getpid();

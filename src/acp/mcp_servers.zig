@@ -131,7 +131,7 @@ fn prepareHost(
     questions: elicitation.Capabilities,
     url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink,
 ) Allocator.Error!Preparation {
-    const home = io_mod.getenv("HOME") orelse return .{ .failed = try alloc.dupe(u8, "MCP servers need HOME to be set.") };
+    const home = io_mod.homeDir() orelse return .{ .failed = try alloc.dupe(u8, "MCP servers need HOME to be set.") };
     // Read only while the host starts.
     var inherited = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

@@ -7,9 +7,27 @@ const max_id_bytes: usize = 128;
 
 extern "fx" fn fx_steering_take(output_ptr: [*]u8, output_cap: usize) i32;
 extern "fx" fn fx_steering_close() void;
+extern "fx" fn fx_steering_state() i32;
 
 pub fn close() void {
     fx_steering_close();
+}
+
+/// The host's steering for the running turn: closed once the turn takes no
+/// more, as when the user cancels it, or how many steers wait for a boundary
+/// and whether one that cannot join the turn waits to run next.
+pub const State = union(enum) {
+    closed,
+    open: struct { queued: usize, handoff: bool },
+};
+
+/// The host reports -1 when closed, else twice the queued count, plus one
+/// for a pending handoff.
+pub fn state() State {
+    const raw = fx_steering_state();
+    if (raw < 0) return .closed;
+    const value: usize = @intCast(raw);
+    return .{ .open = .{ .queued = value >> 1, .handoff = value & 1 == 1 } };
 }
 
 /// One steer the host handed over, with the input id a journaled session

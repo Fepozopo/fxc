@@ -532,18 +532,10 @@ pub fn Runtime(comptime App: type) type {
                 prompt_history_unavailable =
                     (try app.prompt_history.initialize(
                         app.alloc,
-                        shared_io.getenv("HOME"),
+                        shared_io.homeDir(),
                         startup.prompt_history_enabled,
                         startup.prompt_history_store_allowed,
                     )) == .unavailable;
-            }
-            if (comptime @hasField(App, "session") and
-                @hasDecl(@TypeOf(app.session), "initializeProfileUsage"))
-            {
-                _ = try app.session.initializeProfileUsage(
-                    app.alloc,
-                    shared_io.getenv("HOME"),
-                );
             }
 
             var selected_model = startup.takeSelectedModel();

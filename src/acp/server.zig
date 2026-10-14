@@ -83,6 +83,7 @@ const AcpMethod = enum {
     libfx_new,
     libfx_steer,
     libfx_withdraw,
+    libfx_handoff,
     libfx_follow_up,
     libfx_snapshot,
     libfx_journal_open,
@@ -107,6 +108,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
         if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         if (std.mem.eql(u8, method, "libfx/withdraw")) return .libfx_withdraw;
+        if (std.mem.eql(u8, method, "libfx/handoff")) return .libfx_handoff;
         if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
         if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
@@ -127,6 +129,7 @@ const AcpMethod = enum {
             .libfx_new,
             .libfx_steer,
             .libfx_withdraw,
+            .libfx_handoff,
             .libfx_follow_up,
             => false,
             .session_list,
@@ -145,7 +148,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_handoff, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open => true,
             else => false,
         };
     }
@@ -226,6 +229,10 @@ pub const ActiveSessionState = struct {
     wasm_state: ?session_codec.DurableSessionState = null,
     wasm_revision: ?[]u8 = null,
     session_write_mutex: std.Io.Mutex = .init,
+    /// Input plus output tokens of the latest main-model completion, the
+    /// context `usage_update` reports; 0 until a completion reports both.
+    /// `usize` keeps it atomic on wasm32.
+    context_used: std.atomic.Value(usize) = .init(0),
     model: []u8,
     provider: model_provider.ProviderId = .gateway,
     mode: []const u8,
@@ -460,11 +467,6 @@ pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Crede
         active.credential_source = state.credential_source;
         active.credential_refresh_after_ms = state.credential_refresh_after_ms;
         active.account_id = state.account_id;
-        if (comptime !host_target.is_wasm) {
-            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
-                active.session_rt.usage.clearReconciliationCredential();
-            }
-        }
     }
 }
 
@@ -727,46 +729,14 @@ pub fn sessionsBackend(state: *ServerState) SessionsBackend {
 
 pub fn releaseActiveSession(state: *ServerState) !void {
     clearPendingLegacyUrls(state);
-    const active = if (state.active_session) |*session| session else return;
+    if (state.active_session == null) return;
     disableSubagentHost(state);
-    if (comptime !host_target.is_wasm) {
-        active.session_rt.usage.cancelReconciliation();
-        active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
-        flushActiveSessionUsage(state) catch |err| {
-            if (state.cfg.provider_set.select(active.provider).deferred_usage == null) {
-                active.session_rt.usage.clearReconciliationCredential();
-            } else if (active.credential_source) |source| {
-                active.session_rt.usage.replaceProviderReconciliationCredential(
-                    state.alloc,
-                    active.provider,
-                    source,
-                    active.account_id,
-                    state.api_key,
-                );
-            } else {
-                active.session_rt.usage.clearReconciliationCredential();
-            }
-            return err;
-        };
-        active.session_rt.usage.configurePublicationSink(null);
-        active.session_rt.usage.configureCheckpointSink(null);
-    }
     destroyActiveSession(state);
 }
 
 fn closeActiveSession(state: *ServerState) !void {
-    const active = if (state.active_session) |*session| session else return;
+    if (state.active_session == null) return;
     disableSubagentHost(state);
-    if (comptime !host_target.is_wasm) {
-        active.session_rt.usage.cancelReconciliation();
-        active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
-        flushActiveSessionUsage(state) catch |err| {
-            destroyActiveSession(state);
-            return err;
-        };
-        active.session_rt.usage.configurePublicationSink(null);
-        active.session_rt.usage.configureCheckpointSink(null);
-    }
     destroyActiveSession(state);
 }
 
@@ -922,45 +892,6 @@ pub fn disableSubagentHost(state: *ServerState) void {
         store.deinit(state.alloc);
         state.subagent_store = null;
     }
-}
-
-fn flushActiveSessionUsage(state: *ServerState) !void {
-    const active = if (state.active_session) |*session| session else return;
-    if (active.v2) |v2| {
-        if (!active.session_rt.usage.isDirty()) return;
-        var usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
-        defer usage_snapshot.deinit(state.alloc);
-        try v2.persistUsage(usage_snapshot);
-        active.session_rt.usage.markClean(usage_snapshot);
-        return;
-    }
-    const writable = if (active.writable) |*value| value else return;
-    if (!active.session_rt.usage.isDirty()) return;
-
-    const usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
-    defer {
-        var owned = usage_snapshot;
-        owned.deinit(state.alloc);
-    }
-    const store = if (active.store) |*value|
-        value
-    else
-        return error.SessionPersistenceUnavailable;
-    const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
-        state.alloc,
-        writable,
-        usage_snapshot,
-    );
-    _ = try writable.appendEvent(
-        state.alloc,
-        .{ .usage_checkpointed = .{ .usage = usage_snapshot } },
-        recovery_checkpoint.timestamp_ms,
-    );
-    try store.finishUsageRecoveryCheckpoint(
-        writable.active_id,
-        recovery_checkpoint,
-    );
-    active.session_rt.usage.markClean(usage_snapshot);
 }
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
@@ -1512,6 +1443,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
             .libfx_steer => handleKernelSteer(state, alloc, msg),
             .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
+            .libfx_handoff => handleKernelHandoff(state, alloc, msg),
             .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
             .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
             .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
@@ -1536,6 +1468,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
         .libfx_steer => handleKernelSteer(state, alloc, msg),
         .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
+        .libfx_handoff => handleKernelHandoff(state, alloc, msg),
         .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
         .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
         .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
@@ -1669,6 +1602,29 @@ fn handleKernelWithdraw(
         break :withdrawn true;
     };
     try state.writer.writeResponse(alloc, msg.id, if (withdrawn) "{\"result\":\"withdrawn\"}" else "{\"result\":\"already_placed\"}");
+}
+
+/// A libfx steer that cannot join the running turn, such as one with images,
+/// ends that turn at its next safe point so the host can run it next.
+fn handleKernelHandoff(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx handoff params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    if (active.steering.requestHandoff(&active.cancel_flag)) {
+        debug_trace.logf("acp", "libfx handoff interrupts the streaming reply", .{});
+    }
+    try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
 pub fn takeSteering(
@@ -2176,14 +2132,11 @@ fn handleKernelSteer(
             },
         });
     };
-    var update: std.Io.Writer.Allocating = .init(alloc);
-    defer update.deinit();
-    try update.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(active.session_id, &update.writer);
-    try update.writer.writeAll(",\"update\":");
-    try acp_types.writeUserMessageChunk(&update.writer, "libfx-steering", text.string);
-    try update.writer.writeByte('}');
-    try state.writer.writeNotification(alloc, "session/update", update.written());
+    // While the model streams a reply, the steer cuts it short, as in the fx
+    // CLI. The turn shows the steer when a boundary places it.
+    if (active.steering.claimInterrupt(&active.cancel_flag)) {
+        debug_trace.logf("acp", "libfx steer interrupts the streaming reply bytes={d}", .{text.string.len});
+    }
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
@@ -2317,6 +2270,71 @@ fn promptWorkerMain(active: *ActivePrompt) void {
     publishPromptOutcome(active, outcome) catch {};
     if (finished_steering) |finished| publishSteeringOutcomes(active, outcome, finished) catch {};
     prompt_test_controls.pauseAfterTerminalWrite();
+}
+
+/// At a cancel boundary of a libfx turn: whether steering, not the user,
+/// cancelled it, and why. A steer's cancel is spent so the turn goes on.
+pub fn takeSteeringInterrupt(state: *ServerState) ?libfx_steering.Runtime.Interrupt {
+    const active = if (state.active_session) |*session| session else return null;
+    return active.steering.takeInterrupt(&active.cancel_flag);
+}
+
+/// Spends a steer's interrupt the running libfx turn no longer needs, so its
+/// cancel flag reports only a user cancel.
+pub fn releaseSteeringInterrupt(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    active.steering.releaseInterrupt(&active.cancel_flag);
+}
+
+/// Records that the running libfx turn's step works on an announced tool call.
+pub fn noteSteeringToolsPhase(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    active.steering.noteToolsPhase();
+}
+
+/// Whether the running libfx turn ends at this boundary for a handoff.
+pub fn steeringHandoffPending(state: *ServerState) bool {
+    const active = if (state.active_session) |*session| session else return false;
+    return active.steering.handoffPending();
+}
+
+/// Records what the running libfx turn's current step does, which decides
+/// whether a queued steer interrupts it.
+pub fn noteSteeringPhase(state: *ServerState, step: u64, phase: libfx_steering.Phase) void {
+    const active = if (state.active_session) |*session| session else return;
+    if (active.steering.notePhase(step, phase, &active.cancel_flag)) {
+        debug_trace.logf("acp", "queued libfx steer interrupts the streaming reply step={d}", .{step});
+    }
+}
+
+/// Whether the `queued` steers a web host holds should interrupt the running
+/// libfx turn's streaming reply now; if so the turn's cancel flag is set.
+pub fn claimHostSteeringInterrupt(state: *ServerState, queued: usize) bool {
+    const active = if (state.active_session) |*session| session else return false;
+    return active.steering.claimHostInterrupt(queued, &active.cancel_flag);
+}
+
+/// A handoff a web host holds for the running libfx turn: the turn ends at its
+/// next safe point, as with `libfx/handoff`.
+pub fn noteHostSteeringHandoff(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    _ = active.steering.requestHandoff(&active.cancel_flag);
+}
+
+/// A boundary of a libfx turn whose web host keeps the steering queue.
+pub fn noteSteeringBoundary(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    active.steering.noteBoundary();
+}
+
+/// Records a libfx turn's tool call `call_id` starting or ending.
+pub fn noteSteeringTool(state: *ServerState, call_id: []const u8, started: bool) void {
+    const active = if (state.active_session) |*session| session else return;
+    if (started) {
+        active.steering.noteToolStarted(state.alloc, call_id);
+    } else {
+        active.steering.noteToolEnded(state.alloc, call_id);
+    }
 }
 
 fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalOutcome) !void {
@@ -3105,7 +3123,9 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
-        if (state.cfg.minimal_kernel) session.steering.close(state.alloc, "cancelled");
+        // A libfx turn keeps its queued steering until it ends, which hands
+        // back what never reached the model.
+        if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);
     }
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
@@ -3976,7 +3996,7 @@ fn saveSessionPermissionMode(state: *ServerState, alloc: Allocator, mode: types.
     if (comptime !host_target.is_wasm) {
         if (state.cfg.minimal_kernel) return;
         const label = permissions.permissionModeLabel(mode);
-        const home = state.cfg.home_override orelse io_mod.getenv("HOME") orelse {
+        const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
             debug_trace.logf("acp", "permission_mode_save_failed mode={s} err=HomeNotSet", .{label});
             return;
         };
@@ -4094,11 +4114,14 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("libfx/restore"));
     try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
     try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
+    try std.testing.expectEqual(AcpMethod.libfx_handoff, AcpMethod.parse("libfx/handoff"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
     try std.testing.expect(AcpMethod.libfx_new.isLibfx());
     try std.testing.expect(AcpMethod.libfx_steer.isLibfx());
+    try std.testing.expect(AcpMethod.libfx_handoff.isLibfx());
+    try std.testing.expect(!AcpMethod.libfx_handoff.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_new.isLibfx());
 }
 
@@ -4676,70 +4699,4 @@ test "ACP rejects refreshed Codex tokens for another account" {
         null,
     ));
     try std.testing.expectEqualStrings("stale-token", state.api_key);
-}
-
-test "ACP usage flush preserves snapshot ownership on allocation failure" {
-    const alloc = testing_allocator.no_resize;
-    var runtime: session_runtime.SessionRuntime = .{ .max_history_turns = 8 };
-    var runtime_owned = true;
-    defer if (runtime_owned) runtime.deinit(alloc);
-    try runtime.appendAssistantHistoryTurn(alloc, "question", "answer");
-    const sequence = try runtime.usage.reserveInvocation();
-    try runtime.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-
-    var durable = try acpModelTestState(
-        alloc,
-        "acp-usage-flush",
-        "/tmp/workspace",
-    );
-    var durable_owned = true;
-    defer if (durable_owned) durable.deinit(alloc);
-    durable.usage = try runtime.usage.snapshot(alloc);
-
-    var writable: session_store.LoadedWritableSession = undefined;
-    writable.state = durable;
-    durable_owned = false;
-    var active: ActiveSessionState = undefined;
-    active.v2 = null;
-    active.writable = writable;
-    active.session_rt = runtime;
-    runtime_owned = false;
-    var state: ServerState = undefined;
-    state.active_session = active;
-    defer {
-        state.active_session.?.session_rt.deinit(alloc);
-        state.active_session.?.writable.?.state.deinit(alloc);
-    }
-
-    var counting = std.testing.FailingAllocator.init(alloc, .{});
-    {
-        var usage = try state.active_session.?.session_rt.usage.snapshot(
-            counting.allocator(),
-        );
-        defer usage.deinit(counting.allocator());
-    }
-    try std.testing.expect(counting.alloc_index > 0);
-
-    var failing = std.testing.FailingAllocator.init(
-        alloc,
-        .{ .fail_index = counting.alloc_index - 1 },
-    );
-    state.alloc = failing.allocator();
-    try std.testing.expectError(
-        error.OutOfMemory,
-        flushActiveSessionUsage(&state),
-    );
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(
-        failing.allocated_bytes,
-        failing.freed_bytes,
-    );
 }

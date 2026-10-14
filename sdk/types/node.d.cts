@@ -21,6 +21,7 @@ export {
   listModels,
   memory,
   supportsJspi,
+  wakeHandler,
   xtermAdapter,
 } from "./libfx.cjs";
 
@@ -90,6 +91,8 @@ export type {
   FxSessionTurnEvent,
   FxSharedOptions,
   FxSteer,
+  FxSteerOptions,
+  FxSteered,
   FxSteeringInput,
   FxStopReason,
   FxStreamLine,

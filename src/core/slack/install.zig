@@ -42,7 +42,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SlackInstallationUnsupported;
     const origin = io.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
     if (!std.mem.eql(u8, origin, "https://fx.sh") and !test_origin(origin)) return error.InvalidSlackTestOrigin;
-    const home = io.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io.homeDir() orelse return error.HomeNotSet;
     var home_dir = io.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io.getIo(), home, .{ .iterate = true }) };
     defer home_dir.close();
     var root = try io.openOrCreateVerifiedPrivateDir(&home_dir, ".fx");

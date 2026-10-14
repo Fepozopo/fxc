@@ -219,8 +219,8 @@ export type FxAgentTools = readonly FxAgentTool[] | { readonly [name: string]: F
 export type FxTurnEvent =
   | { type: "text_delta"; delta: string }
   | { type: "reasoning_delta"; delta: string }
-  /** Accepted mid-turn steering entering the turn. */
-  | { type: "user_message"; text: string }
+  /** Steering entering the turn as its model request carries it; `id` is the steer's id. */
+  | { type: "user_message"; text: string; id?: string }
   | { type: "tool_start"; id: string; name: string; input?: JsonValue; inputTruncated?: undefined; inputPreview?: undefined }
   /** A tool input over 64 KiB of JSON arrives as a prefix. The tool still receives complete arguments. */
   | { type: "tool_start"; id: string; name: string; input?: undefined; inputTruncated: true; inputPreview: string }
@@ -292,6 +292,8 @@ export type FxEngineEvent = FxEventBase & (
 export type FxSessionEvent = FxEventBase & (
   | { type: "session.error"; sessionId: string; error: FxErrorSummary }
   | { type: "session.fenced"; sessionId: string; epoch: number }
+  /** A message for a session of the agent `agent` reached this one, which sent it on. */
+  | { type: "session.forwarded"; sessionId: string; agent: string }
   /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
@@ -615,6 +617,12 @@ export type FxAgentOptions = Omit<FxSharedOptions<FxAgentEvent>, "tools"> & FxMo
   durability?: Durability | undefined;
   /** Checkpoint bytes the agent's new sessions start from. */
   checkpoint?: FxBytes;
+  /**
+   * The agent's name, 1 to 64 letters, digits, `.`, `_` or `-`, starting with a letter or digit. Default `"default"`.
+   * A session's turns run only on agents with the name of the agent that created it, so an app can have several
+   * durable agents. Agents with the same name are copies of one agent and share its sessions' turns.
+   */
+  name?: string;
 };
 
 /** Options for `agent.session()`. Each applies to the turns this session object starts. */
@@ -633,6 +641,22 @@ export interface FxPromptOptions {
   messageId?: string;
   /** Cancels this prompt's turn when it aborts, whether it runs or still waits, and never a later turn. */
   signal?: AbortSignal;
+}
+
+/** Options for a durable session's `steer()`. */
+export interface FxSteerOptions {
+  /**
+   * The steer's id, so a retried request adds nothing. Follows the session id rule. Reusing a prompt's id rejects
+   * with `FX_MESSAGE_ID_IN_USE`; on a queue that outlives the process, the worker drops the steer and emits a
+   * `session.error` with that code instead.
+   */
+  messageId?: string;
+}
+
+/** What a durable session's `steer()` resolves to once the steer is stored. */
+export interface FxSteered {
+  /** The steer's id. Its `user_message` event carries it as `id` when it joins a turn, and its own turn's events carry it as `messageId`. */
+  messageId: string;
 }
 
 /** What `turn.accepted` resolves to once the prompt is stored. */
@@ -719,8 +743,12 @@ export interface FxSession {
   resume(): FxResumeTurn;
   /** Every event the session has produced from `cursor` on, as NDJSON, staying open for the events after them. */
   stream(cursor?: number): ReadableStream<Uint8Array>;
-  /** Adds guidance to the running turn at its next model request, or to the next turn when none is running. */
-  steer(text: string): Promise<void>;
+  /**
+   * Steers the running turn the way the fx CLI does: it cuts a streaming reply short, waits for a running tool, and
+   * joins a turn waiting to start. When no turn runs or waits, it starts one. A steer with images or resources cannot
+   * join a turn: the running one ends at its next safe point and the steer runs next.
+   */
+  steer(input: FxSessionPromptInput, options?: FxSteerOptions): Promise<FxSteered>;
   /** Cancels the running turn. */
   cancel(): Promise<void>;
   /** The session's history as opaque bytes, read without changing the session. */
@@ -729,6 +757,8 @@ export interface FxSession {
 
 /** An agent: the configuration its sessions run under. Create one per server and open a session per conversation. */
 export interface FxAgent {
+  /** The agent's name, `"default"` unless `createFxAgent()` gave one. */
+  readonly name: string;
   /** Opens the session `id`, or starts a new one without it. Any other value, `null` included, throws. */
   session(id?: string, options?: FxSessionOptions): FxSession;
   /** An id for a new session, before its first prompt. */
@@ -739,11 +769,17 @@ export interface FxAgent {
   prompt(input: FxSessionPromptInput, options?: FxPromptOptions): FxTurn;
   /** The history of the session `agent.prompt()` uses, as opaque bytes. */
   checkpoint(): Promise<Uint8Array>;
-  /** The request handler a deployment mounts for queue deliveries. */
+  /** The request handler a deployment mounts for queue deliveries; it delivers to whichever agent in the process a message names. */
   wakeHandler(): (request: Request) => Promise<Response>;
   /** Waits for the turns this process is running, then lets their sessions go. */
   close(): Promise<void>;
 }
+
+/**
+ * The request handler a deployment mounts for queue deliveries, for every durable agent in the process: each
+ * delivery goes to the agent its message names. One route and one queue trigger serve any number of agents.
+ */
+export declare function wakeHandler(): (request: Request) => Promise<Response>;
 
 // ---------------------------------------------------------------------------
 // Backend diagnostics (Node.js)

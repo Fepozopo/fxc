@@ -40,7 +40,7 @@ const session_commands = @import("../session/session_commands.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_runtime = @import("../session/session.zig");
 const session_store = @import("../session/session_store.zig");
-const usage_report = @import("../session/usage_report.zig");
+const usage = @import("../../usage/usage.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -838,6 +838,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub const prepareFilePicker = completion_rt.prepareFilePicker;
         pub const collectFilePickerFacts = completion_rt.collectFilePickerFacts;
+        pub const holdFrameForFileListing = completion_rt.holdFrameForFileListing;
+        pub const fileListingHoldPending = completion_rt.fileListingHoldPending;
 
         pub fn handleByte(app: *App, byte: u8, max_input_len: usize, max_prompt_history: usize) !void {
             return handleTerminalByteWithLimits(
@@ -1374,15 +1376,12 @@ pub fn Runtime(comptime App: type) type {
                 }
                 switch (byte) {
                     '\t' => if (menu == .usage) {
-                        try cycleUsageMenuScope(app, 1);
+                        try refreshUsageMenu(app, app.input_runtime.usage_menu.period.next());
                     },
                     '\r' => try submitCompactCommandMenuSelection(app, menu, max_input_len),
                     'r', 'R' => if (menu == .usage) {
                         if (comptime runtime_profile.allows(App, .profile_usage)) {
-                            try reloadUsageMenu(
-                                app,
-                                app.input_runtime.usage_menu.navigationScope(),
-                            );
+                            try reloadUsageMenu(app, app.input_runtime.usage_menu.period);
                         }
                     },
                     10 => {
@@ -2608,10 +2607,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (menu == .usage) {
-                _ = app.input_runtime.usage_menu.toggleExpanded(
-                    usageMenuVisibleModelItems(app),
-                );
-                app.shell.render_requests.request(.footer);
+                if (app.input_runtime.usage_menu.openDetail()) app.shell.render_requests.request(.footer);
                 return;
             }
             const snapshot = app_commands.settingsCatalogSnapshot(app);
@@ -2687,11 +2683,10 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 app.shell.layout.rows -| 3,
             );
-            return compact_command_menu_presentation.usageVisibleModelItems(
+            return std.math.cast(u16, compact_command_menu_presentation.usageVisibleModelItems(
                 projection,
                 visible_rows,
-                app.shell.layout.cols,
-            );
+            )) orelse std.math.maxInt(u16);
         }
 
         fn routeCompactCommandMenuEscapeAction(
@@ -2702,7 +2697,7 @@ pub fn Runtime(comptime App: type) type {
             if (menu == .usage and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
-                const current = app.input_runtime.usage_menu.navigationScope();
+                const current = app.input_runtime.usage_menu.period;
                 const next = if (resolved == .cursor_left)
                     current.previous()
                 else
@@ -2713,7 +2708,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (menu == .usage and resolved == .toggle_permission_mode) {
-                try cycleUsageMenuScope(app, -1);
+                try refreshUsageMenu(app, app.input_runtime.usage_menu.period.previous());
                 return;
             }
             if (menu == .statusline and
@@ -2739,7 +2734,7 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn refreshUsageMenu(app: *App, scope: usage_report.Scope) !void {
+        fn refreshUsageMenu(app: *App, scope: usage.Period) !void {
             if (comptime !runtime_profile.allows(App, .profile_usage)) return;
             if (comptime @hasDecl(App, "refreshUsageMenu")) {
                 try app.refreshUsageMenu(scope);
@@ -2748,7 +2743,7 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn reloadUsageMenu(app: *App, scope: usage_report.Scope) !void {
+        fn reloadUsageMenu(app: *App, scope: usage.Period) !void {
             if (comptime !runtime_profile.allows(App, .profile_usage)) return;
             if (comptime @hasDecl(App, "reloadUsageMenu")) {
                 try app.reloadUsageMenu(scope);
@@ -2757,24 +2752,6 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try app_commands.Handlers(App).reloadUsageMenu(app, scope);
             }
-        }
-
-        fn cycleUsageMenuScope(app: *App, delta: i32) !void {
-            const current = app.input_runtime.usage_menu.navigationScope();
-            const next: usage_report.Scope = if (delta < 0)
-                switch (current) {
-                    .days_30 => .session,
-                    .days_7 => .days_30,
-                    .hours_24 => .days_7,
-                    .session => .hours_24,
-                }
-            else switch (current) {
-                .days_30 => .days_7,
-                .days_7 => .hours_24,
-                .hours_24 => .session,
-                .session => .days_30,
-            };
-            try refreshUsageMenu(app, next);
         }
 
         fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
@@ -3301,7 +3278,12 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (app.input_runtime.usage_menu.active) {
-                app.input_runtime.usage_menu.close(app.alloc);
+                // Esc on a model's detail screen goes back to the tables.
+                if (app.input_runtime.usage_menu.closeDetail()) {
+                    app.shell.render_requests.request(.footer);
+                } else {
+                    app_commands.Handlers(App).closeUsageMenu(app);
+                }
                 return true;
             }
             if (app.input_runtime.workspace_menu.active) {
@@ -4085,9 +4067,9 @@ const RoutingFakeApp = struct {
 
     pub fn refreshUsageMenu(
         self: *RoutingFakeApp,
-        scope: usage_report.Scope,
+        period: usage.Period,
     ) !void {
-        self.input_runtime.usage_menu.requested_scope = scope;
+        self.input_runtime.usage_menu.period = period;
     }
 
     pub fn isCurrentFileCompletion(self: *RoutingFakeApp, _: []const u8, _: []const u8, kind: file_index.CandidateKind) bool {
@@ -5422,21 +5404,18 @@ test "app_input_runtime Tab advances help categories before autocomplete" {
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.window_start);
 }
 
-test "app_input_runtime Tab cycles usage scopes in both directions" {
+test "app_input_runtime Tab cycles usage periods in both directions" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.active = true;
+    app.input_runtime.usage_menu.period = .month;
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
-    try std.testing.expectEqual(usage_report.Scope.days_7, app.input_runtime.usage_menu.navigationScope());
+    try std.testing.expectEqual(usage.Period.today, app.input_runtime.usage_menu.period);
 
     try feedRoutingBytes(&app, "\x1b[Z");
-    try std.testing.expectEqual(usage_report.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
+    try std.testing.expectEqual(usage.Period.month, app.input_runtime.usage_menu.period);
 }
 
 test "app_input_runtime Tab toggles session picker scope before autocomplete" {
@@ -7226,30 +7205,37 @@ test "app_input_runtime file picker reuses one existing terminator and preserves
     }
 }
 
-test "app_input_runtime accepts typed directories with one synthetic slash" {
+test "app_input_runtime opens typed directories with Tab and selects them with Enter" {
     const alloc = std.testing.allocator;
     const completions = [_]file_index.Candidate{.{ .path = "src/nested", .kind = .directory }};
     const cases = [_]struct {
         input: []const u8,
         cursor: usize,
-        expected: []const u8,
-        expected_cursor: usize,
+        opened: []const u8,
+        opened_cursor: usize,
+        selected: []const u8,
+        selected_cursor: usize,
     }{
         .{
             .input = "@srcn",
             .cursor = "@srcn".len,
-            .expected = "@src/nested/",
-            .expected_cursor = "@src/nested/".len,
+            .opened = "@src/nested/",
+            .opened_cursor = "@src/nested/".len,
+            .selected = "@src/nested/ ",
+            .selected_cursor = "@src/nested/ ".len,
         },
         .{
             .input = "before @srcn tail",
             .cursor = "before @srcn".len,
-            .expected = "before @src/nested/ tail",
-            .expected_cursor = "before @src/nested/".len,
+            .opened = "before @src/nested/ tail",
+            .opened_cursor = "before @src/nested/".len,
+            .selected = "before @src/nested/ tail",
+            .selected_cursor = "before @src/nested/ ".len,
         },
     };
 
     for ([_]u8{ '\t', '\r' }) |byte| {
+        const opens = byte == '\t';
         for (cases) |case| {
             var app = try RoutingFakeApp.init(alloc);
             defer app.deinit();
@@ -7261,10 +7247,10 @@ test "app_input_runtime accepts typed directories with one synthetic slash" {
             presentRoutingFilePicker(&app);
             try Runtime(RoutingFakeApp).handleByte(&app, byte, 4096, 100);
 
-            try std.testing.expectEqualStrings(case.expected, app.input_runtime.edit_state.input.items);
-            try std.testing.expectEqual(case.expected_cursor, app.input_runtime.edit_state.cursor);
+            try std.testing.expectEqualStrings(if (opens) case.opened else case.selected, app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(if (opens) case.opened_cursor else case.selected_cursor, app.input_runtime.edit_state.cursor);
             try std.testing.expectEqual(file_index.CandidateKind.directory, app.validated_file_completion_kind.?);
-            try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null);
+            try std.testing.expectEqual(opens, app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null);
             try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
         }
     }
@@ -8342,14 +8328,26 @@ test "app_input_runtime Ghostty Escape press closes the usage dashboard" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.active = true;
+    app.input_runtime.usage_menu.period = .month;
 
     try feedRoutingBytes(&app, "\x1b[27;1:1u");
 
+    try std.testing.expect(!app.input_runtime.usage_menu.active);
+}
+
+test "app_input_runtime Escape on a usage detail screen goes back to the tables" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.input_runtime.usage_menu.active = true;
+    app.input_runtime.usage_menu.detail = true;
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
+    try std.testing.expect(app.input_runtime.usage_menu.active);
+    try std.testing.expect(!app.input_runtime.usage_menu.detail);
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
     try std.testing.expect(!app.input_runtime.usage_menu.active);
 }
 
@@ -8357,11 +8355,8 @@ test "app_input_runtime Ghostty Escape release leaves the usage dashboard open" 
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.active = true;
+    app.input_runtime.usage_menu.period = .month;
 
     try feedRoutingBytes(&app, "\x1b[27;1:3u");
 

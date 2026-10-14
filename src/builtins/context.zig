@@ -237,7 +237,7 @@ const SelectionScratch = struct {
 
 fn gatherProjectContext(alloc: Allocator, input: InitialContextInput) context_contract.ProviderError!ProviderContext {
     const home: ?[]const u8 = switch (input.instruction_files) {
-        .filesystem => io_mod.getenv("HOME"),
+        .filesystem => io_mod.homeDir(),
         .host => |host_files| host_files.home,
         .host_unreadable, .none => null,
     };
@@ -2580,7 +2580,7 @@ fn shellPath(arena: Allocator) ?[]const u8 {
 }
 
 fn homeDir() ?[]const u8 {
-    return io_mod.getenv("HOME") orelse io_mod.getenv("USERPROFILE");
+    return io_mod.homeDir() orelse io_mod.getenv("USERPROFILE");
 }
 
 fn todayUtcText(arena: Allocator) ![]const u8 {

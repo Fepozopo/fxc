@@ -519,7 +519,10 @@ pub const Tracker = struct {
         defer self.alloc.free(task_path);
         var task_dir = (try openLinuxProcDir(task_path)) orelse return;
         defer task_dir.close(io_mod.getIo());
-        var tasks = task_dir.iterate();
+        // The directory was just opened, so skip the rewind that `iterate`
+        // does first. gVisor fails that lseek with ENOENT once the process
+        // has exited, which would abort the whole scan.
+        var tasks = task_dir.iterateAssumeFirstIteration();
         while (try tasks.next(io_mod.getIo())) |entry| {
             const tid = std.fmt.parseInt(
                 std.posix.pid_t,

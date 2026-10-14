@@ -91,6 +91,11 @@ const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
 const foreground_target_termination_grace_ms: i64 = 700;
 const foreground_target_cleanup_wait_ms: i64 = 250;
+/// How long `finishDetachedSession` waits after closing the lifeline. The
+/// supervisor's own cleanup ends within its termination grace and cleanup
+/// wait; the rest is margin.
+const detached_session_exit_wait_ms: i64 =
+    foreground_target_termination_grace_ms + foreground_target_cleanup_wait_ms + 1000;
 const foreground_supervisor_handoff_ms: i64 = 200;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
@@ -1476,8 +1481,8 @@ fn executeProcessWithDetachedSession(
 /// has no controlling terminal: an interactive login shell can neither stop
 /// on nor draw over the terminal fx runs in. The target's stdin is empty;
 /// stdout and stderr are pipes. `child.stdin` stays open as the supervisor's
-/// lifeline: closing it ends the session. The caller owns the child and its
-/// process group.
+/// lifeline: closing it ends the session. The caller owns the child and ends
+/// the session with `finishDetachedSession`.
 pub fn spawnDetachedSession(
     scratch: Allocator,
     argv: []const []const u8,
@@ -1489,6 +1494,7 @@ pub fn spawnDetachedSession(
     var helper_argv: std.ArrayList([]const u8) = .empty;
     try helper_argv.appendSlice(scratch, &.{ executable, foreground_session_token, "none" });
     try helper_argv.appendSlice(scratch, argv);
+    const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
@@ -1497,10 +1503,18 @@ pub fn spawnDetachedSession(
         .cwd = .{ .path = cwd },
         .environ_map = environ_map,
     });
+    debug_trace.logf("core", "detached session supervisor spawned pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
     var phase: ForegroundSessionPhase = .pre_ready;
     errdefer cleanupForegroundSessionChild(&child, phase);
     try waitForForegroundSessionReady(&child, .{ .max_command_output_bytes = 0 });
     phase = .group_ready;
+    debug_trace.logf("core", "detached session supervisor ready pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
 
     const input = child.stdin orelse return error.SpawnFailed;
     var nonce_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
@@ -1516,7 +1530,53 @@ pub fn spawnDetachedSession(
         .little,
     );
     try input.writeStreamingAll(io_mod.getIo(), &control);
+    debug_trace.logf("core", "detached session released pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
     return child;
+}
+
+/// Ends a live session from `spawnDetachedSession` and returns how its
+/// supervisor exited. Closing the lifeline makes the supervisor stop the
+/// target and every descendant it tracks, then exit on its own. fx does not
+/// signal the supervisor first: it is a child subreaper, and on gVisor
+/// killing a subreaper that still has children ends the whole sandbox. Its
+/// process group is killed only if it is still running after
+/// `detached_session_exit_wait_ms`.
+pub fn finishDetachedSession(
+    child: *std.process.Child,
+) std.process.Child.WaitError!std.process.Child.Term {
+    const io = io_mod.getIo();
+    const pid = child.id.?;
+    if (child.stdin) |lifeline| {
+        lifeline.close(io);
+        child.stdin = null;
+    }
+    debug_trace.logf("core", "detached session lifeline closed pid={d}", .{pid});
+    var waiter = ChildWaiter.init(child);
+    waiter.start() catch |err| {
+        // The supervisor still exits on its own, so wait for it here.
+        debug_trace.logf("core", "detached session exit watch unavailable pid={d} err={s}", .{ pid, @errorName(err) });
+        return child.wait(io);
+    };
+    const deadline_ms = io_mod.milliTimestamp() + detached_session_exit_wait_ms;
+    while (!waiter.isReady()) {
+        if (io_mod.milliTimestamp() >= deadline_ms) {
+            debug_trace.logf(
+                "core",
+                "detached session supervisor still running after {d} ms; killing its process group pid={d}",
+                .{ detached_session_exit_wait_ms, pid },
+            );
+            signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
+                debug_trace.logf("core", "detached session process group kill failed pid={d} err={s}", .{ pid, @errorName(err) });
+            };
+            break;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    waiter.awaitDiscard();
+    return waiter.result;
 }
 
 fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
@@ -3845,6 +3905,58 @@ test "foreground session owner loss kills the target and descendant before delay
     try expectProcessGoneWithinForTest(target_pid, 2_000);
     try expectProcessGoneWithinForTest(descendant_pid, 2_000);
     try std.testing.expect(!absoluteFileExists(effect_path));
+}
+
+test "finishing a detached session leaves cleanup to its supervisor" {
+    if (comptime !supports_foreground_session) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "grouped.pid" });
+    defer alloc.free(pid_path);
+    const quoted_pid = try shellQuote(alloc, pid_path);
+    defer alloc.free(quoted_pid);
+    // The descendant leaves the supervisor's process group before it records
+    // its PID, so killing that group cannot stop it. Only the supervisor's
+    // own cleanup can.
+    const script = try alloc.print(
+        "python3 -c 'import os,sys,time; os.setpgid(0,0); p=sys.argv[1]; " ++
+            "open(p+\".pending\",\"w\").write(str(os.getpid())); os.rename(p+\".pending\",p); " ++
+            "time.sleep(30)' {s} & wait",
+        .{quoted_pid},
+    );
+    defer alloc.free(script);
+
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    var child = try spawnDetachedSession(
+        scratch_state.allocator(),
+        &.{ "/bin/sh", "-c", script },
+        workspace,
+        null,
+    );
+    var finished = false;
+    defer if (!finished) {
+        _ = finishDetachedSession(&child) catch {};
+    };
+
+    const marker_deadline_ms = io_mod.milliTimestamp() + 2_000;
+    while (!absoluteFileExists(pid_path) and
+        io_mod.milliTimestamp() < marker_deadline_ms)
+    {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 32);
+    defer alloc.free(pid_text);
+    const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, pid_text, 10);
+    defer signalProcess(descendant_pid, std.posix.SIG.KILL) catch {};
+
+    finished = true;
+    _ = try finishDetachedSession(&child);
+    try expectProcessGoneWithinForTest(descendant_pid, 2_000);
 }
 
 test "foreground session bootstrap EOF executes no target" {

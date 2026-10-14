@@ -419,6 +419,16 @@ pub fn getenv(key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The home directory fx keeps its own files under: `HOME` when it is an
+/// absolute path, otherwise null. An empty or relative `HOME` counts as
+/// unset, so fx never builds profile paths relative to the current folder.
+/// Child processes still inherit `HOME` unchanged.
+pub fn homeDir() ?[]const u8 {
+    const home = getenv("HOME") orelse return null;
+    if (!std.Io.Dir.path.isAbsolute(home)) return null;
+    return home;
+}
+
 pub fn e2eFailIfDurableMutationAttempted() void {
     const enabled = getenv("FX_E2E_FAIL_ON_DURABLE_MUTATION") orelse return;
     if (!std.mem.eql(u8, enabled, "1")) return;
@@ -1123,6 +1133,26 @@ test "getenv returns set value after setEnvironMap" {
     setEnvironMap(&environ);
     try std.testing.expectEqualStrings("present", getenv("FX_IO_TEST").?);
     global_environ = null;
+}
+
+test "homeDir accepts only an absolute HOME" {
+    const previous = global_environ;
+    defer global_environ = previous;
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    setEnvironMap(&environ);
+    try std.testing.expect(homeDir() == null);
+
+    for ([_][]const u8{ "", "relative/home", "./home", "~" }) |value| {
+        try environ.put("HOME", value);
+        try std.testing.expect(homeDir() == null);
+        // The raw value stays available to code that passes it on.
+        try std.testing.expectEqualStrings(value, getenv("HOME").?);
+    }
+
+    try environ.put("HOME", "/Users/example");
+    try std.testing.expectEqualStrings("/Users/example", homeDir().?);
 }
 
 test "environMap returns borrowed process environment map" {

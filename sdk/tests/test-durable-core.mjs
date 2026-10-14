@@ -8,7 +8,7 @@ import { strict as assert } from "node:assert";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDurableAgentFactory, foldSessionLog, memory } from "../durable.js";
+import { createDurableAgentFactory, foldSessionLog, memory, wakeHandler } from "../durable.js";
 import { world } from "../durable/world.mjs";
 
 const durabilityKind = process.argv[2] || "memory";
@@ -218,6 +218,18 @@ function chain(before, next) {
 
 const createAgent = createDurableAgentFactory({ harness: scriptedHarness(), defaultDurability: async () => memory(), name: "createScriptedAgent" });
 
+// Agents that record which of them opened each session's engine, by `tag`.
+const openedBy = [];
+const createTaggedAgent = createDurableAgentFactory({
+  harness: ({ tag }) => {
+    const plugged = scriptedHarness()();
+    return { open: (args) => { openedBy.push([tag, args.sessionId]); return plugged.open(args); } };
+  },
+  defaultDurability: async () => memory(),
+  name: "createTaggedAgent",
+});
+const openersOf = (sessionId) => [...new Set(openedBy.filter(([, id]) => id === sessionId).map(([tag]) => tag))];
+
 async function durabilityFor(options = {}) {
   if (durabilityKind === "memory") return memory(options);
   const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
@@ -323,6 +335,76 @@ test("two agents prompting one session run its turns one at a time, in one histo
   }
   await first.close();
   await second.close();
+});
+
+test("agents with different names each run only their own sessions' turns", async () => {
+  const durability = await durabilityFor();
+  // Each agent's own prompts reach it directly, never through the other.
+  const forwarded = [];
+  const onEvent = (event) => { if (event.type === "session.forwarded") forwarded.push(event); };
+  const support = createTaggedAgent({ durability, name: "support", tag: "support", onEvent });
+  const coding = createTaggedAgent({ durability, name: "coding", tag: "coding", onEvent });
+  assert.equal(support.name, "support");
+  const ours = support.session();
+  const theirs = coding.session();
+  for (let round = 0; round < 4; round += 1) {
+    const [a, b] = await Promise.all([textOf(ours.prompt(`s${round}`)), textOf(theirs.prompt(`c${round}`))]);
+    assert.equal(a.text, `s${round}-0 s${round}-1 s${round}-2`);
+    assert.equal(b.text, `c${round}-0 c${round}-1 c${round}-2`);
+  }
+  assert.deepEqual(openersOf(ours.id), ["support"]);
+  assert.deepEqual(openersOf(theirs.id), ["coding"]);
+  assert.deepEqual(forwarded, [], "every delivery went to the agent its message names");
+  await support.close();
+  await coding.close();
+});
+
+test("a prompt to another agent's session runs on that session's agent", async () => {
+  const durability = await durabilityFor();
+  const events = [];
+  const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+  const coding = createTaggedAgent({ durability, name: "coding", tag: "coding", onEvent: (event) => events.push(event) });
+  const session = support.session();
+  await textOf(session.prompt("first"));
+  const { text, result } = await textOf(coding.session(session.id).prompt("second"));
+  assert.equal(text, "second-0 second-1 second-2");
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(openersOf(session.id), ["support"]);
+  assert.ok(events.some((event) => event.type === "session.forwarded" && event.sessionId === session.id && event.agent === "support"), "the sender says it sent the message on");
+  await support.close();
+  await coding.close();
+});
+
+if (durabilityKind === "local") {
+  // local() makes each agent a World of its own, which delivers only the
+  // messages it queued, as world-local does.
+  test("agents on one durability, each on a World of its own, still send each other's prompts on", async () => {
+    const durability = await durabilityFor();
+    const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+    const coding = createTaggedAgent({ durability, name: "coding", tag: "coding" });
+    const ours = support.session();
+    const theirs = coding.session();
+    await Promise.all([textOf(ours.prompt("one")), textOf(theirs.prompt("two"))]);
+    const [a, b] = await Promise.all([textOf(coding.session(ours.id).prompt("three")), textOf(support.session(theirs.id).prompt("four"))]);
+    assert.equal(a.text, "three-0 three-1 three-2");
+    assert.equal(b.text, "four-0 four-1 four-2");
+    assert.deepEqual(openersOf(ours.id), ["support"]);
+    assert.deepEqual(openersOf(theirs.id), ["coding"]);
+    await support.close();
+    await coding.close();
+  });
+}
+
+test("an agent's name defaults to default, and a malformed one is refused", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  assert.equal(agent.name, "default");
+  await agent.close();
+  for (const name of ["", "two words", "-dash", "x".repeat(65), 7, null]) {
+    assert.throws(() => createAgent({ name }), /createScriptedAgent\(\) name must be 1 to 64 letters/, `refuses ${JSON.stringify(name)}`);
+  }
+  const named = createAgent({ name: "a.b_c-9" });
+  assert.equal(named.name, "a.b_c-9");
+  await named.close();
 });
 
 test("a retried message runs its turn once", async () => {
@@ -1258,6 +1340,90 @@ if (durabilityKind === "queue") {
     assert.equal(refused, 1);
     assert.ok(Date.now() - started < 10_000, `the next prompt ran ${Date.now() - started} ms after it was sent`);
     await agent.close();
+  });
+}
+
+if (durabilityKind === "memory") {
+  test("a session belongs to the agent its first input or its checkpoint names, and one from before names to default", () => {
+    const input = (messageId, agent) => ({ k: "input", key: `${messageId}:prompt`, type: "prompt", messageId, ...(agent ? { agent } : {}) });
+    const ownerOf = (...entries) => foldSessionLog(entries.map((entry, index) => ({ cursor: String(index + 1), entry }))).agent;
+    assert.equal(ownerOf(), null);
+    assert.equal(ownerOf(input("m1", "support"), input("m2", "coding")), "support");
+    assert.equal(ownerOf(input("m1"), input("m2", "coding")), "default");
+    assert.equal(ownerOf({ k: "checkpoint", through: null, data: "seed", agent: "coding" }, input("m1", "support")), "coding");
+    assert.equal(ownerOf({ k: "checkpoint", through: null, data: "seed" }, input("m1", "support")), "support");
+    assert.equal(ownerOf({ k: "checkpoint", through: "7", data: "saved" }), "default");
+    assert.equal(ownerOf({ k: "checkpoint", through: "7", data: "saved", agent: "support" }, input("m9", "coding")), "support");
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("one route serves every agent in the process, each delivery to the agent its message names", async () => {
+    const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
+    dirs.push(dir);
+    const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
+    await stored.start();
+    // A World that delivers only over HTTP, to the route the test posts to.
+    const sent = [];
+    const instance = {
+      ...stored,
+      registerHandler: undefined,
+      queue: async (queueName, payload) => { sent.push({ queueName, payload }); return { messageId: `msg_${sent.length}` }; },
+      createQueueHandler: (_prefix, handler) => async (request) => {
+        const { payload, meta } = await request.json();
+        try {
+          await handler(payload, meta);
+          return new Response("ok");
+        } catch (error) {
+          return Response.json({ code: error?.code, agent: error?.agent }, { status: 500 });
+        }
+      },
+    };
+    const durability = world(instance, { name: "route", queueDurable: true });
+    const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+    const coding = createTaggedAgent({ durability, name: "coding", tag: "coding" });
+    // An agent on another durability of the same kind, as an app that gives
+    // one agent vercel() and another vercel({ leaseMs }) has.
+    const ops = createTaggedAgent({ durability: world(instance, { name: "route", queueDurable: true }), name: "ops", tag: "ops" });
+    let attempt = 0;
+    const post = (route, { queueName, payload }) => {
+      attempt += 1;
+      const meta = { queueName, messageId: `msg_post_${attempt}`, attempt: 1 };
+      return route(new Request("https://app.example/wake", { method: "POST", body: JSON.stringify({ payload, meta }) }));
+    };
+    const ours = support.session();
+    const theirs = coding.session();
+    const opsSession = ops.session();
+    const first = ours.prompt("alpha");
+    const second = theirs.prompt("beta");
+    const fourth = opsSession.prompt("delta");
+    await Promise.all([first.accepted, second.accepted, fourth.accepted]);
+    const shared = wakeHandler();
+    // Every message reaches the one route, whichever agent sent it.
+    for (const message of sent.splice(0)) assert.equal((await post(shared, message)).status, 200);
+    assert.equal((await textOf(first)).text, "alpha-0 alpha-1 alpha-2");
+    assert.equal((await textOf(second)).text, "beta-0 beta-1 beta-2");
+    assert.equal((await textOf(fourth)).text, "delta-0 delta-1 delta-2");
+    assert.deepEqual(openersOf(opsSession.id), ["ops"]);
+    // An agent's own route delivers to the agent a message names, too.
+    const third = ours.prompt("gamma");
+    await third.accepted;
+    const [message] = sent.splice(0);
+    assert.equal((await post(coding.wakeHandler(), message)).status, 200);
+    assert.equal((await textOf(third)).text, "gamma-0 gamma-1 gamma-2");
+    assert.deepEqual(openersOf(ours.id), ["support"]);
+    assert.deepEqual(openersOf(theirs.id), ["coding"]);
+    // A name no agent here has is refused for the queue to deliver again.
+    const ghost = { ...message, payload: { ...message.payload, input: { ...message.payload.input, agent: "ghost", messageId: "ghost-1" } } };
+    const refused = await post(shared, ghost);
+    assert.equal(refused.status, 500);
+    assert.deepEqual(await refused.json(), { code: "FX_NO_AGENT", agent: "ghost" });
+    await support.close();
+    await coding.close();
+    await ops.close();
+    assert.equal((await post(shared, message)).status, 503, "with no agent left, the route says so");
+    await stored.close();
   });
 }
 

@@ -22,7 +22,7 @@ pub const LoadedSkills = struct {
 };
 
 pub fn resolveSkillsHome(alloc: Allocator) Allocator.Error!?[]u8 {
-    const configured_home = io_mod.getenv("HOME") orelse return null;
+    const configured_home = io_mod.homeDir() orelse return null;
     return io_mod.realpathAlloc(alloc, configured_home) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => try alloc.dupe(u8, configured_home),

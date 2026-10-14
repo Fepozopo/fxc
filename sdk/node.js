@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { CoreOutput } from "./core-output.js";
 import { loadModule, withModuleFailure } from "./wasm-module.js";
 import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit } from "./fetch-cleanup.js";
-import { createDurableAgentFactory, memory } from "./durable.js";
+import { createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
 import { fxHarness } from "./fx-harness.js";
 import {
   createFxEngine as createWasmAgent,
@@ -24,7 +24,7 @@ import {
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, memory, supportsJspi, xtermAdapter };
+export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, memory, supportsJspi, wakeHandler, xtermAdapter };
 export const libfxApiVersion = 3;
 const nativeCoreApiVersion = 4;
 
@@ -676,14 +676,30 @@ export async function createFxEngine(options = {}) {
 // on Vercel, otherwise files in the temporary directory. Each is its own
 // module, loaded only here: a bundler copies the file the URL names and
 // leaves the import itself to Node.
-async function environmentDurability() {
+// Agents created without a durability share one for each place sessions
+// live, as agents passed one durability do, so they can send each other's
+// prompts on.
+const environments = new Map();
+function environmentDurability() {
+  const dir = process.env.VERCEL ? null : process.env.FX_SESSIONS_DIR || resolve(tmpdir(), "libfx", "sessions");
+  const key = dir ?? "vercel";
+  if (!environments.has(key)) {
+    environments.set(key, chooseEnvironmentDurability(dir).catch((error) => {
+      environments.delete(key);
+      throw error;
+    }));
+  }
+  return environments.get(key);
+}
+
+async function chooseEnvironmentDurability(dir) {
   const load = (asset) => import(/* webpackIgnore: true */ /* turbopackIgnore: true */ (asset.protocol === "" ? bundledAssetUrl(asset) : asset).href);
-  if (process.env.VERCEL) {
+  if (dir === null) {
     const { vercel } = await load(new URL("./durable/vercel.mjs", import.meta.url));
     return vercel();
   }
   const { local } = await load(new URL("./durable/local.mjs", import.meta.url));
-  return local({ dir: process.env.FX_SESSIONS_DIR || resolve(tmpdir(), "libfx", "sessions") });
+  return local({ dir });
 }
 
 /**

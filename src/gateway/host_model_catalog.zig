@@ -13,14 +13,16 @@ pub fn provider(transport: *host_stream.Transport) model_catalog.Provider {
 
 fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
     const transport: *host_stream.Transport = @ptrCast(@alignCast(raw.?));
-    const url = try alloc.print("{s}{s}", .{ builtin_gateway.default_model_catalog_base_url, input.endpoint });
+    const team_path = try builtin_gateway.modelCatalogTeamPath(alloc, input.endpoint, input.access);
+    defer if (team_path) |owned| alloc.free(owned);
+    const url = try alloc.print("{s}{s}", .{ builtin_gateway.default_model_catalog_base_url, team_path orelse input.endpoint });
     defer alloc.free(url);
     const auth = if (input.access.authorizationCredential()) |credential| try alloc.print("Bearer {s}", .{credential}) else null;
     defer if (auth) |value| alloc.free(value);
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(alloc);
     if (auth) |value| try headers.append(alloc, .{ .name = "authorization", .value = value });
-    if (input.access.teamContext()) |team| try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
+    if (builtin_gateway.modelCatalogHeaderTeam(input.access)) |team| try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
     const body = switch (try get(alloc, transport.*, url, headers.items, input.cancel_flag, max_catalog_bytes)) {
         .body => |body| body,
         .failure => |failure| return .{ .failure = failure },
@@ -125,5 +127,75 @@ test "catalog GET fails cleanly on a status outside the HTTP range" {
             try std.testing.expectEqual(@as(?std.http.Status, null), result.failure.http_status);
         }
         try std.testing.expectEqual(@as(usize, 1), fake.close_calls);
+    }
+}
+
+test "catalog sends an fx login team as teamId and other teams in the team header" {
+    const credentials = @import("../core/auth/credentials.zig");
+    const RecordingTransport = struct {
+        url: [256]u8 = undefined,
+        url_len: usize = 0,
+        headers: [512]u8 = undefined,
+        headers_len: usize = 0,
+
+        fn open(raw: ?*anyopaque, _: []const u8, url: []const u8, headers_json: []const u8, _: []const u8) anyerror!i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (url.len > self.url.len or headers_json.len > self.headers.len) return error.TestRequestTooLarge;
+            @memcpy(self.url[0..url.len], url);
+            self.url_len = url.len;
+            @memcpy(self.headers[0..headers_json.len], headers_json);
+            self.headers_len = headers_json.len;
+            return 3;
+        }
+        fn status(_: ?*anyopaque, _: i32, status_out: *u16) i32 {
+            status_out.* = 401;
+            return 1;
+        }
+        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
+            return 0;
+        }
+        fn close(_: ?*anyopaque, _: i32) void {}
+    };
+    const catalog_url = builtin_gateway.default_model_catalog_base_url ++ builtin_gateway.models_path;
+    const cases = [_]struct {
+        access: credentials.CatalogAccess,
+        url: []const u8,
+        team_header: ?[]const u8,
+    }{
+        .{ .access = credentials.catalogAccessForCredential(.fx_login, "login-token", "team_123"), .url = catalog_url ++ "?teamId=team_123", .team_header = null },
+        .{ .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "api-key", "team_123"), .url = catalog_url, .team_header = "team_123" },
+    };
+
+    for (cases) |case| {
+        var recorder: RecordingTransport = .{};
+        var transport: host_stream.Transport = .{
+            .context = &recorder,
+            .open_fn = RecordingTransport.open,
+            .status_fn = RecordingTransport.status,
+            .next_fn = RecordingTransport.next,
+            .close_fn = RecordingTransport.close,
+        };
+        const result = try provider(&transport).fetch(std.testing.allocator, .{
+            .access = case.access,
+            .endpoint = builtin_gateway.models_path,
+        });
+        try std.testing.expect(result == .failure);
+        try std.testing.expectEqualStrings(case.url, recorder.url[0..recorder.url_len]);
+
+        const Header = struct { name: []const u8, value: []const u8 };
+        const parsed = try std.json.parseFromSlice([]const Header, std.testing.allocator, recorder.headers[0..recorder.headers_len], .{});
+        defer parsed.deinit();
+        var authorized = false;
+        var team_header: ?[]const u8 = null;
+        for (parsed.value) |header| {
+            if (std.mem.eql(u8, header.name, "authorization")) authorized = true;
+            if (std.mem.eql(u8, header.name, "x-vercel-ai-gateway-team")) team_header = header.value;
+        }
+        try std.testing.expect(authorized);
+        if (case.team_header) |want| {
+            try std.testing.expectEqualStrings(want, team_header orelse return error.TestExpectedTeamHeader);
+        } else {
+            try std.testing.expect(team_header == null);
+        }
     }
 }

@@ -4448,7 +4448,7 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(start.searchParams.get("state")).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(start.searchParams.get("challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(start.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
-    expect(start.searchParams.get("scope")!.split(" ")).toHaveLength(9);
+    expect(start.searchParams.get("scope")!.split(" ").sort()).toEqual([...FX_SLACK_SCOPES, "groups:history", "im:history", "mpim:history"].sort());
     // fx.sh's page posts what Slack sent back; only its origin is taken.
     const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
     const body = await authorizePersonalFixture(auth, start);

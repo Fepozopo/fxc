@@ -283,6 +283,10 @@ pub const DispatchContext = struct {
     terminal_owner_session_id: ?[]const u8 = null,
     terminal_transport_role: terminal_contracts.TransportRole = .interactive,
     lifecycle_allocator: Allocator = std.heap.c_allocator,
+    /// Thread-safe allocator whose frees return memory, for work that must not
+    /// outlive one call, such as a workspace scan. `allocator` is often the
+    /// turn's arena, which keeps everything until the turn ends.
+    scratch_allocator: Allocator = std.heap.c_allocator,
     command_timeout_ms: ?usize = null,
     captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,

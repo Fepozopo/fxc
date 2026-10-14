@@ -653,7 +653,7 @@ fn runPendingCapture(pending: *PendingCapture) void {
 
 fn currentFingerprint(shell_path: []const u8, snapshot_zdotdir: ?[]const u8) Fingerprint {
     const kind = shell_resolver.shellKind(shell_path) orelse return .{};
-    const dirs = [_]?[]const u8{ io_mod.getenv("ZDOTDIR"), io_mod.getenv("HOME"), snapshot_zdotdir };
+    const dirs = [_]?[]const u8{ io_mod.getenv("ZDOTDIR"), io_mod.homeDir(), snapshot_zdotdir };
     return fingerprintFor(kind, if (kind == .zsh) &dirs else dirs[1..2]);
 }
 
@@ -741,6 +741,7 @@ fn isShellOwned(key: []const u8) bool {
 /// contents.
 fn captureWithShell(request: CaptureRequest) CaptureOutcome {
     const started_ms = io_mod.milliTimestamp();
+    debug_trace.logf("core", "shell snapshot capture thread running shell={s}", .{request.shell_path});
     const outcome = captureWithShellChecked(request) catch |err| switch (err) {
         error.OutOfMemory => CaptureOutcome{ .failed = .out_of_memory },
         else => CaptureOutcome{ .failed = .spawn_failed },
@@ -769,7 +770,6 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
     const invocation = try shell_resolver.capturedInvocation(scratch, .{ .user = request.shell_path }, script);
     const end_marker = try markerText(scratch, &nonce, "END", "\x00", "\x00");
 
-    const io = io_mod.getIo();
     // The capture runs an interactive login shell. Without its own session
     // it would share fx's controlling terminal, stop on job control, and its
     // startup files could write over the fx interface.
@@ -782,22 +782,21 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
         debug_trace.logf("core", "shell snapshot capture spawn failed err={s}", .{@errorName(err)});
         return .{ .failed = .spawn_failed };
     };
-    const process_group: std.posix.pid_t = child.id orelse return .{ .failed = .spawn_failed };
-    defer {
-        // Ends the shell and anything its startup files left running in its
-        // process group, as the command supervisor does after each command.
-        std.posix.kill(-process_group, std.posix.SIG.KILL) catch {};
-        if (child.stdin) |lifeline| {
-            lifeline.close(io);
-            child.stdin = null;
-        }
-        if (child.wait(io)) |_| {} else |err| {
-            debug_trace.logf("core", "shell snapshot capture wait failed err={s}", .{@errorName(err)});
-        }
-    }
+    const supervisor_pid: std.posix.pid_t = child.id orelse return .{ .failed = .spawn_failed };
+    // The supervisor, not fx, stops the shell and anything its startup files
+    // left running, then exits on its own.
+    defer if (command_runner.finishDetachedSession(&child)) |term| {
+        traceSupervisorExit(supervisor_pid, term);
+    } else |err| {
+        debug_trace.logf("core", "shell snapshot capture wait failed err={s}", .{@errorName(err)});
+    };
 
     var payload: std.ArrayList(u8) = .empty;
     const read_status = try readPayload(scratch, &payload, child.stdout.?.handle, child.stderr.?.handle, end_marker);
+    debug_trace.logf("core", "shell snapshot capture read status={s} payload_bytes={d}", .{
+        @tagName(read_status),
+        payload.items.len,
+    });
     switch (read_status) {
         .complete => {},
         .timed_out => return .{ .failed = .timed_out },
@@ -811,11 +810,26 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
     parsePayload(generation, payload.items, &nonce) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MissingSection, error.InvalidEntry => {
+            debug_trace.logf("core", "shell snapshot capture payload rejected err={s}", .{@errorName(err)});
             generation.destroy();
             return .{ .failed = .incomplete };
         },
     };
+    debug_trace.logf("core", "shell snapshot capture payload parsed env_entries={d} names={d} replay_bytes={d}", .{
+        generation.environ.count(),
+        generation.names.count(),
+        generation.replay.len,
+    });
     return .{ .ready = generation };
+}
+
+fn traceSupervisorExit(pid: std.posix.pid_t, term: std.process.Child.Term) void {
+    switch (term) {
+        .exited => |code| debug_trace.logf("core", "shell snapshot capture supervisor pid={d} exited code={d}", .{ pid, code }),
+        .signal => |signal| debug_trace.logf("core", "shell snapshot capture supervisor pid={d} signaled signal={d}", .{ pid, @backingInt(signal) }),
+        .stopped => |signal| debug_trace.logf("core", "shell snapshot capture supervisor pid={d} stopped signal={d}", .{ pid, @backingInt(signal) }),
+        .unknown => |status| debug_trace.logf("core", "shell snapshot capture supervisor pid={d} unknown status={d}", .{ pid, status }),
+    }
 }
 
 const ReadStatus = enum { complete, timed_out, too_large, incomplete };
@@ -829,26 +843,57 @@ fn readPayload(
     stderr_fd: std.posix.fd_t,
     end_marker: []const u8,
 ) !ReadStatus {
-    const deadline = io_mod.milliTimestamp() + capture_timeout_ms;
+    const started_ms = io_mod.milliTimestamp();
+    const deadline = started_ms + capture_timeout_ms;
     var chunk: [64 * 1024]u8 = undefined;
     var fds = [_]std.posix.pollfd{
         .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
         .{ .fd = stderr_fd, .events = std.posix.POLL.IN, .revents = 0 },
     };
+    var stderr_bytes: usize = 0;
     while (true) {
         const now = io_mod.milliTimestamp();
         if (now >= deadline) return .timed_out;
         const wait_ms: i32 = @intCast(@min(deadline - now, read_poll_ms));
-        const ready = std.posix.poll(&fds, wait_ms) catch return .incomplete;
+        const ready = std.posix.poll(&fds, wait_ms) catch |err| {
+            debug_trace.logf("core", "shell snapshot capture poll failed err={s}", .{@errorName(err)});
+            return .incomplete;
+        };
         if (ready == 0) continue;
         if (fds[1].revents != 0) {
             const drained = std.posix.read(stderr_fd, &chunk) catch 0;
+            if (stderr_bytes == 0 and drained > 0) {
+                debug_trace.logf("core", "shell snapshot capture first stderr bytes={d} elapsed_ms={d}", .{
+                    drained,
+                    io_mod.milliTimestamp() - started_ms,
+                });
+            }
+            stderr_bytes += drained;
             // Stop watching stderr once it closes.
             if (drained == 0) fds[1].fd = -1;
         }
         if (fds[0].revents == 0) continue;
-        const read_len = std.posix.read(fd, &chunk) catch return .incomplete;
-        if (read_len == 0) return .incomplete;
+        const read_len = std.posix.read(fd, &chunk) catch |err| {
+            debug_trace.logf("core", "shell snapshot capture stdout read failed err={s} payload_bytes={d}", .{
+                @errorName(err),
+                payload.items.len,
+            });
+            return .incomplete;
+        };
+        if (read_len == 0) {
+            debug_trace.logf("core", "shell snapshot capture stdout closed before the end marker payload_bytes={d} stderr_bytes={d} elapsed_ms={d}", .{
+                payload.items.len,
+                stderr_bytes,
+                io_mod.milliTimestamp() - started_ms,
+            });
+            return .incomplete;
+        }
+        if (payload.items.len == 0) {
+            debug_trace.logf("core", "shell snapshot capture first stdout bytes={d} elapsed_ms={d}", .{
+                read_len,
+                io_mod.milliTimestamp() - started_ms,
+            });
+        }
         if (payload.items.len + read_len > max_capture_bytes) return .too_large;
         const search_from = payload.items.len -| end_marker.len;
         try payload.appendSlice(alloc, chunk[0..read_len]);

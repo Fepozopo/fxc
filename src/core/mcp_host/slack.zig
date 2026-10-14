@@ -15,7 +15,7 @@ pub const client_id = "12364000946.12017137861236";
 
 /// The user scopes fx's Slack app has, encoded for a query. fx.sh takes
 /// exactly these.
-const scopes_query = "channels:history%20channels:read%20channels:write%20chat:write%20emoji:read%20files:write%20search:read.public%20search:read.users%20users:read";
+const scopes_query = "channels:history%20channels:read%20channels:write%20chat:write%20emoji:read%20files:write%20groups:history%20im:history%20mpim:history%20search:read.public%20search:read.users%20users:read";
 
 /// Whether `url` is Slack's MCP server.
 pub fn isSlack(url: ?[]const u8) bool {
@@ -72,7 +72,7 @@ test "fx.sh's start carries MCP-v2's state, challenge, and client, fx's scopes, 
     const url = (try startUrl(testing.allocator, "https://fx.sh", authorize, 53883)).?;
     defer testing.allocator.free(url);
     try testing.expectEqualStrings("https://fx.sh/api/slack/auth?state=S1&challenge=C1&client_id=12364000946.12017137861236" ++
-        "&scope=channels:history%20channels:read%20channels:write%20chat:write%20emoji:read%20files:write%20search:read.public%20search:read.users%20users:read&port=53883", url);
+        "&scope=channels:history%20channels:read%20channels:write%20chat:write%20emoji:read%20files:write%20groups:history%20im:history%20mpim:history%20search:read.public%20search:read.users%20users:read&port=53883", url);
     try testing.expectEqual(@as(?[]u8, null), try startUrl(testing.allocator, "https://fx.sh", "https://slack.com/oauth?state=S1", 1));
 }
 

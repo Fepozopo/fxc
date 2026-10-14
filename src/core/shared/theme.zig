@@ -822,7 +822,7 @@ pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptio
     }
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidName;
 
-    const home = io_mod.getenv("HOME") orelse return error.ThemeNotFound;
+    const home = io_mod.homeDir() orelse return error.ThemeNotFound;
     const dir_path = try alloc.print("{s}/.fx/themes", .{home});
     defer alloc.free(dir_path);
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{}) catch return error.ThemeNotFound;

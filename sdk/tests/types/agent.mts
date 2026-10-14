@@ -6,6 +6,7 @@ import {
   FxFencedError,
   FxJournalVersionError,
   memory,
+  wakeHandler,
   type Durability,
   type FxAgent,
   type FxAgentEvent,
@@ -88,7 +89,7 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   for await (const event of retried) {
     if (event.type === "tool_start") console.log(event.id, event.name, event.inputTruncated ? event.inputPreview : event.input);
     if (event.type === "tool_end") console.log(event.content, event.isError);
-    if (event.type === "user_message") console.log(event.text);
+    if (event.type === "user_message") console.log(event.text, event.id);
     console.log(event.epoch);
   }
 
@@ -114,6 +115,14 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   known.stream();
 
   await known.steer("Keep the public API backward compatible.");
+  const steered = await known.steer("Prefer small diffs.", { messageId: "m12" });
+  assertType<Equal<typeof steered.messageId, string>>();
+  await known.steer([
+    { type: "text", text: "Match this screenshot." },
+    { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+  ]);
+  // @ts-expect-error a durable steer carries image data as a base64 string
+  known.steer([{ type: "image", data: new Uint8Array(4), mimeType: "image/png" }]);
   await known.cancel();
   const checkpoint = await known.checkpoint();
   assertType<Equal<typeof checkpoint, Uint8Array>>();
@@ -327,6 +336,7 @@ export function events(): void {
       if (event.type === "session.error") console.log(event.sessionId, event.error.message);
       if (event.type === "session.deadline" || event.type === "session.fenced") assertType<Equal<typeof event.epoch, number>>();
       if (event.type === "session.deadline") assertType<Equal<typeof event.cutoffs, number>>();
+      if (event.type === "session.forwarded") assertType<Equal<typeof event.agent, string>>();
       if (event.type === "checkpoint.mismatch") console.log(event.changed.includes("model"), event.current.toolSchemaHash);
       if (event.type === "transport.activity") console.log(event.attempt, event.chunkBytes, event.totalBytes);
       if (event.type === "transport.response") console.log(event.status, event.requestId);
@@ -368,6 +378,13 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export const wake: (request: Request) => Promise<Response> = agent.wakeHandler();
+
+// Several agents: each named, one route for all of them.
+export const support: FxAgent = createFxAgent({ name: "support", instructions: "Answer billing questions." });
+assertType<Equal<typeof support.name, string>>();
+export const wakeAll: (request: Request) => Promise<Response> = wakeHandler();
+// @ts-expect-error a name is text
+createFxAgent({ name: 7 });
 
 // A durable Codex agent: each process asks the host for the session's credentials.
 export const codexAgent: FxAgent = createFxAgent({

@@ -451,19 +451,22 @@ async function loadPersistence(persistence) {
 
 // What a record's events say about turns, in order, for a store that tracks
 // them without reading records: a turn started, ended, or yielded, an input
-// was accepted, or the step the open turn is at, as its tool steps finished
-// and the state of its calls.
+// was accepted or handed back unplaced, or the step the open turn is at, as
+// its tool steps finished and the state of its calls.
 function journalMarks(events) {
   const marks = [];
   for (const event of events) {
     if (event?.type === "turn_progress") {
       if (typeof event.turnId === "string") marks.push({ start: event.turnId });
+      // The inputs its model request carries for the first time.
+      for (const id of Array.isArray(event.inputs) ? event.inputs : []) if (typeof id === "string") marks.push({ placed: id });
       // A progress that carries only what is new counts all the turn's steps.
       const steps = Number.isSafeInteger(event.steps) ? event.steps : event.data?.execution?.tool_steps?.length;
       if (Number.isSafeInteger(steps)) marks.push({ step: `${steps}:${String(event.data?.tool_state ?? "none")}` });
     } else if (event?.type === "turn_committed" || event?.type === "turn_progress_cleared") marks.push({ end: true });
     else if (event?.type === "turn_yielded") marks.push({ yield: true });
     else if (event?.type === "input_accepted" && typeof event.data?.id === "string") marks.push({ accepted: event.data.id });
+    else if (event?.type === "input_withdrawn" && typeof event.data?.id === "string") marks.push({ withdrawn: event.data.id });
   }
   return marks;
 }
@@ -835,6 +838,8 @@ function createRuntime(options) {
   const steering = [];
   let steeringBytes = 0;
   let steeringOpen = false;
+  // A steer that cannot join the running turn waits to run next.
+  let steeringHandoff = false;
   // Raw payloads beside ACP frames: the core copies inbound bytes into its
   // own memory and publishes outbound bytes for the agent to take.
   const inboundAttachments = new Map();
@@ -1109,6 +1114,7 @@ function createRuntime(options) {
   function clearSteering() {
     steering.length = 0;
     steeringBytes = 0;
+    steeringHandoff = false;
   }
 
   function queueSteering(text, id = "") {
@@ -1617,6 +1623,9 @@ function createRuntime(options) {
     fx_host_tool_result_release() { pendingHostToolResult = null; },
     fx_steering_take: steeringTake,
     fx_steering_close() { steeringOpen = false; clearSteering(); },
+    // -1 once the turn takes no more steering, else twice how many steers
+    // wait, plus one when a handoff does.
+    fx_steering_state() { return steeringOpen ? steering.length * 2 + (steeringHandoff ? 1 : 0) : -1; },
     fx_attachment_size: attachmentSize,
     fx_attachment_take: attachmentTake,
     fx_attachment_put: attachmentPut,
@@ -1658,6 +1667,12 @@ function createRuntime(options) {
     openSteering() { clearSteering(); steeringOpen = true; },
     steer: queueSteering,
     withdrawSteering,
+    // Ends the running turn at its next safe point; false when none runs.
+    handOffSteering() {
+      if (!steeringOpen) return false;
+      steeringHandoff = true;
+      return true;
+    },
     closeSteering() { steeringOpen = false; clearSteering(); },
     abortHostEffects,
     abort(error) {
@@ -3011,7 +3026,9 @@ export async function createFxEngine(options = {}) {
         return delta ? { type: "reasoning_delta", delta } : null;
       }
       if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
-        return { type: "user_message", text: update.content.text };
+        // A steer shows where it joined the turn, with the id it was sent with.
+        const id = update._meta?.fx?.steering?.inputId;
+        return { type: "user_message", text: update.content.text, ...(typeof id === "string" ? { id } : {}) };
       }
       if (update.sessionUpdate === "tool_call") {
         toolNames.set(update.toolCallId, update.name || update.toolName || update.title || "tool");
@@ -3050,6 +3067,7 @@ export async function createFxEngine(options = {}) {
         return rawTurn.steer(normalizeSteeringInput(input), id);
       },
       withdraw(id) { return rawTurn.withdraw(id); },
+      [engineInternals]: rawTurn[engineInternals],
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
           for (const call of answered) {
@@ -3158,11 +3176,8 @@ export async function createFxEngine(options = {}) {
           const accepted = () => (journal ? waitForInput(`accepted:${id}`) : Promise.resolve());
           if (typeof runtime.steer === "function") {
             runtime.steer(text, id);
-            void turn.push({
-              sessionUpdate: "user_message_chunk",
-              content: { type: "text", text },
-            });
-            // The web core accepts it when it takes it at the next boundary.
+            // The web core accepts it when it takes it at the next boundary,
+            // and shows where it joined the turn then.
             return accepted().then(() => ({ id }), (error) => (error?.code === "FX_STEER_WITHDRAWN" ? { id, withdrawn: true } : Promise.reject(error)));
           }
           return request("libfx/steer", { sessionId, text, id }).then(accepted).then(() => ({ id }));
@@ -3244,6 +3259,23 @@ export async function createFxEngine(options = {}) {
           if (journal) await waitForInput(`withdrawn:${id}`);
           return "withdrawn";
         });
+      },
+      // For libfx's session worker: a steer that cannot join the turn, such
+      // as one with images, ends the turn at its next safe point, at once
+      // while the model streams a reply, so that steer can run next.
+      [engineInternals]: {
+        endForSteer() {
+          const send = () => {
+            if (finished || cancelled || activeTurn !== turn || closing) return undefined;
+            if (typeof runtime.handOffSteering === "function") {
+              runtime.handOffSteering();
+              return undefined;
+            }
+            return request("libfx/handoff", { sessionId }).then(() => undefined);
+          };
+          const sent = promptStarted && resolvePromptStart ? promptStarted.then((started) => (started === true ? send() : undefined)) : Promise.resolve().then(send);
+          return sent.catch(() => {});
+        },
       },
       cancel(cancelOptions = {}) {
         const reason = cancelOptions?.reason;

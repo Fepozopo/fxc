@@ -628,7 +628,7 @@ fn isLoopbackHttpUrl(url: []const u8, require_origin: bool) bool {
 
 pub fn load(alloc: Allocator) !?Session {
     if (comptime host_target.is_wasm) return loadFromHost(alloc, js_host_auth.oauth_session_store);
-    const home = io_mod.getenv("HOME") orelse {
+    const home = io_mod.homeDir() orelse {
         debug_trace.logf("auth", "session load skipped step=home err=HomeNotSet", .{});
         return null;
     };
@@ -725,7 +725,7 @@ pub fn beginExistingMutation() !?Mutation {
 }
 
 fn beginExistingNativeMutation() !?Mutation {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };
@@ -757,7 +757,7 @@ fn loadKeychainWithoutProfile(alloc: Allocator) !?Session {
 }
 
 fn beginMutation() !Mutation {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };

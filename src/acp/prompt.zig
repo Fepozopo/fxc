@@ -53,13 +53,11 @@ const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const session_runtime = @import("../core/session/session.zig");
-const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
 const subagent_model_contract = @import("../core/subagent/model_contract.zig");
 const gateway_model_catalog = @import("../core/gateway/model_catalog.zig");
-const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
@@ -429,8 +427,6 @@ const AcpContext = struct {
                 .worker_model = session.model,
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
-                .usage = &session.session_rt.usage,
-                .usage_allocator = self.state.alloc,
             });
         }
         var tc: tool_runtime.Context = .{
@@ -987,14 +983,14 @@ pub fn handlePrompt(
     } else if (session.journal) |*journal| {
         // A new prompt instead of a resume ends the open turn as interrupted.
         if (journal.pending_resume) |pending| {
-            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null);
+            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null);
             journal.dropPendingResume(state.alloc);
         }
     } else if (session.writable) |*writable| {
         if (writable.conversation_writer.turn_open) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
-            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null);
+            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null, null);
         }
     }
 
@@ -1017,6 +1013,14 @@ pub fn handlePrompt(
             } });
             try journal.placeFollowUp(state.alloc, input_id);
         }
+    }
+
+    // A v2 prompt opens its turn on disk before the model is asked, so a full
+    // or read-only disk fails the prompt without a model call.
+    if (session.v2) |v2| {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        try v2.beginTurn();
     }
 
     if (comptime !host_target.is_wasm) connectHostChannelServers(session);
@@ -1084,35 +1088,8 @@ pub fn handlePrompt(
         .recovery_source_already_presented = recovery_checkpoint != null,
     };
 
-    session.session_rt.usage.configureCheckpointSink(
-        if (session.writable != null or session.v2 != null)
-            .{
-                .context = @ptrCast(&ctx),
-                .allocator = alloc,
-                .persist = persistUsageCheckpoint,
-            }
-        else
-            null,
-    );
-    if (comptime @import("builtin").target.os.tag != .wasi) {
-        if (state.cfg.provider_set.select(session.provider).deferred_usage != null) {
-            if (session.credential_source == .host_managed) {
-                session.session_rt.usage.replaceHostManagedReconciliationAuthority(
-                    alloc,
-                    session.provider,
-                );
-            } else if (session.credential_source) |source| {
-                session.session_rt.usage.replaceProviderReconciliationCredential(
-                    alloc,
-                    session.provider,
-                    source,
-                    session.account_id,
-                    session.api_key,
-                );
-            }
-        }
-    }
-    defer session.session_rt.usage.configureCheckpointSink(null);
+    // A turn whose completions report no tokens sends no `usage_update`.
+    session.context_used.store(0, .release);
     const deps = agentRuntimeDeps(&ctx);
     const current_prompt_is_root_authority = if (session.writable) |writable|
         writable.external_prompt_origin == .persistent_child and
@@ -1172,6 +1149,8 @@ pub fn handlePrompt(
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
+    // A steer's interrupt the turn finished before reaching is not a cancel.
+    if (state.cfg.minimal_kernel) server.releaseSteeringInterrupt(state);
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
     }
@@ -1892,6 +1871,8 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
+        .confirm_session_writer = confirmSessionWriter,
+        .report_usage = reportUsage,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
         .tool_registry = ctx.toolRegistry(),
@@ -1899,6 +1880,9 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
         .take_steering_boundary = takeSteeringBoundary,
+        // The web core's host keeps its steering queue, so the core asks it
+        // while a reply streams whether a steer should cut it short.
+        .cooperative_transport_pulse = if (comptime host_target.is_wasm) .{ .ctx = @ptrCast(ctx), .run = pulseHostSteering } else null,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
@@ -1955,8 +1939,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .record_tool_call_failed = recordToolCallFailed,
-        .usage = &session.session_rt.usage,
-        .usage_allocator = ctx.state.alloc,
     };
 }
 
@@ -1964,7 +1946,9 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
 /// `session/prompt` with `_meta.fx.steer` during a turn; each delivered message
 /// is replayed as a user message where it joined the turn. A cancelled ACP
 /// turn stops instead of continuing with queued steering, and the steering
-/// prompt responses report what was dropped.
+/// prompt responses report what was dropped. A libfx turn continues past a
+/// cancel only when a steer interrupted its reply; after a user cancel it
+/// takes nothing, and its end hands back what was still queued.
 fn takeSteeringBoundary(
     raw_ctx: *anyopaque,
     arena: Allocator,
@@ -1974,32 +1958,77 @@ fn takeSteeringBoundary(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const close_if_empty = kind == .finalizing;
     if (comptime host_target.is_wasm) {
+        server.noteSteeringBoundary(ctx.state);
+        // The host closes its steering when the user cancels the turn, which
+        // wins over a steer's interrupt. A handoff ends the turn here.
+        const host_steering = js_host_steering.state();
+        if (host_steering == .open and host_steering.open.handoff) {
+            // As on native: a handoff's interrupt is spent and the turn ends.
+            server.noteHostSteeringHandoff(ctx.state);
+            if (kind != .cancelled) return .handoff;
+            _ = server.takeSteeringInterrupt(ctx.state);
+            return .interrupt;
+        }
+        const steered = kind == .cancelled and host_steering != .closed and
+            server.takeSteeringInterrupt(ctx.state) != null;
         const taken = try js_host_steering.takeAll(arena);
         if (taken.len > 0) {
+            // As on native, an interrupt this boundary beat is spent here.
+            if (kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
             try acceptHostSteering(ctx, taken);
             const texts = try arena.alloc([]u8, taken.len);
-            for (taken, texts) |entry, *text| text.* = entry.text;
+            for (taken, texts) |entry, *text| {
+                text.* = entry.text;
+                try publishSteeringReplay(ctx, entry.text, null, entry.id);
+            }
             return .{ .continue_turn = texts };
         }
+        if (steered) return .{ .continue_turn = &.{} };
         if (close_if_empty) js_host_steering.close();
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
     if (kind == .cancelled and !kernel) return .interrupt;
+    if (kind == .cancelled) {
+        // A user cancel ends the turn, and so does a handoff's interrupt.
+        const interrupt = server.takeSteeringInterrupt(ctx.state) orelse return .interrupt;
+        if (interrupt == .handoff) return .interrupt;
+    } else if (kernel and server.steeringHandoffPending(ctx.state)) {
+        // A steer that cannot join the turn runs next: the turn ends here, and
+        // its end hands back the steering it did not take.
+        return .handoff;
+    }
     // ACP keeps accepting steering until the turn has fully returned: a
     // pending subagent can continue a turn past its final boundary, and a
     // steering prompt that arrives after input closes joins the worker from
     // the connection reader, which must never wait on work that needs it.
     const drained = try server.takeSteering(ctx.state, arena, close_if_empty and kernel);
-    if (drained.texts.len == 0) return if (kind == .cancelled) .interrupt else .none;
+    // A steer's interrupt continues the turn even when the steer was
+    // withdrawn meanwhile: the cut-off request goes out again.
+    if (drained.texts.len == 0) return if (kind == .cancelled) .{ .continue_turn = &.{} } else .none;
     try noteJournalPlacement(ctx, drained.input_ids);
-    // libfx replays steering when it is queued; ACP replays it on delivery.
-    if (!kernel) {
-        for (drained.texts, drained.request_ids) |text, request_id| {
-            try publishSteeringReplay(ctx, text, request_id);
-        }
+    // A steer's interrupt that a later boundary beat is spent with its steer.
+    if (kernel and kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
+    // Steering shows where it joined the turn, a libfx steer by its input id.
+    for (drained.texts, drained.request_ids, 0..) |text, request_id, index| {
+        const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
+        try publishSteeringReplay(ctx, text, request_id, input_id);
     }
     return .{ .continue_turn = drained.texts };
+}
+
+/// The web core's cooperative pulse while a model reply streams: steering its
+/// host holds interrupts the reply under the same rule as the native kernel's.
+fn pulseHostSteering(raw_ctx: *anyopaque) anyerror!void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    switch (js_host_steering.state()) {
+        .closed => {},
+        .open => |open| if (open.handoff) {
+            server.noteHostSteeringHandoff(ctx.state);
+        } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
+            debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
+        },
+    }
 }
 
 /// A journaled session's next progress places the inputs a boundary took.
@@ -2029,7 +2058,7 @@ fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !
     }
 }
 
-fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId) !void {
+fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId, input_id: ?[]const u8) !void {
     var message_id_storage: acp_types.MessageIdBuffer = undefined;
     const message_id = acp_types.generateMessageId(&message_id_storage);
     var update: std.Io.Writer.Allocating = .init(ctx.alloc);
@@ -2037,7 +2066,7 @@ fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrp
     try update.writer.writeAll("{\"sessionId\":");
     try jsonrpc.writeJsonStr(ctx.session_id, &update.writer);
     try update.writer.writeAll(",\"update\":");
-    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id);
+    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id, input_id);
     try update.writer.writeByte('}');
     try ctx.state.writer.writeNotification(ctx.alloc, "session/update", update.written());
 }
@@ -2064,43 +2093,31 @@ fn refreshGatewayCredential(
     );
 }
 
-fn persistUsageCheckpoint(
-    raw_ctx: *anyopaque,
-    snapshot: session_usage.Snapshot,
-) !void {
+/// The prompt's session while it is still the active one.
+fn promptSession(ctx: *AcpContext) ?*server.ActiveSessionState {
+    const active = if (ctx.state.active_session) |*session| session else return null;
+    return if (std.mem.eql(u8, active.session_id, ctx.session_id)) active else null;
+}
+
+/// Fails when this process no longer owns the prompt's saved session,
+/// without writing. Sessions v2 hold the session's lock, and an unsaved
+/// session has no writer to lose.
+fn confirmSessionWriter(raw_ctx: *anyopaque) anyerror!void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const active = if (ctx.state.active_session) |*session|
-        session
-    else
-        return error.SessionPersistenceUnavailable;
-    if (!std.mem.eql(u8, active.session_id, ctx.session_id)) {
-        return error.SessionPersistenceUnavailable;
-    }
+    const active = promptSession(ctx) orelse return;
     active.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer active.session_write_mutex.unlock(io_mod.getIo());
-    if (active.v2) |v2| return v2.persistUsage(snapshot);
-    const writable = if (active.writable) |*value|
-        value
-    else
-        return error.SessionPersistenceUnavailable;
-    const store = if (active.store) |*value|
-        value
-    else
-        return error.SessionPersistenceUnavailable;
-    const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
-        ctx.alloc,
-        writable,
-        snapshot,
-    );
-    _ = try writable.appendEvent(
-        ctx.alloc,
-        .{ .usage_checkpointed = .{ .usage = snapshot } },
-        recovery_checkpoint.timestamp_ms,
-    );
-    try store.finishUsageRecoveryCheckpoint(
-        writable.active_id,
-        recovery_checkpoint,
-    );
+    if (active.v2 != null) return;
+    if (active.writable) |*writable| try writable.confirmWriter();
+}
+
+fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const active = promptSession(ctx) orelse return;
+    const input = usage.input_tokens orelse return;
+    const output = usage.output_tokens orelse return;
+    const used = std.math.add(u64, input, output) catch return;
+    active.context_used.store(std.math.cast(usize, used) orelse std.math.maxInt(usize), .release);
 }
 
 fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
@@ -2723,6 +2740,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             session,
             turn,
             ctx.current_prompt_input,
+            ctx.state.alloc,
         );
     }
 }
@@ -2799,6 +2817,21 @@ fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []cons
     if (response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
 }
 
+/// Records the libfx steers the ending turn accepted and never placed, as a
+/// user cancel leaves them, as withdrawn. The model never saw them, so the
+/// host may run them next. They are withdrawn before the turn's end, while
+/// they still belong to it. The caller holds `session_write_mutex`.
+/// `backing` owns the queued steering.
+fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *server.ActiveSessionState, journal: *libfx_journal.Journal) !void {
+    const ids = try session.steering.takeUnplacedInputs(backing, alloc);
+    defer {
+        for (ids) |id| alloc.free(id);
+        if (ids.len > 0) alloc.free(ids);
+    }
+    for (ids) |id| try journal.append(alloc, session.session_id, .{ .input_withdrawn = id });
+    if (ids.len > 0) debug_trace.logf("acp", "handed back unplaced libfx steers count={d}", .{ids.len});
+}
+
 /// Ends a journaled turn in the journal as it ended in the session. One that
 /// failed left no history entry, so its progress is cleared: resuming is for
 /// turns a stopped process left open. Inputs it took and never placed are
@@ -2807,6 +2840,7 @@ fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.A
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return;
+    try handBackUnplacedSteersLocked(alloc, session_alloc, session, journal);
     if (journal.progress_open) {
         debug_trace.logf("session", "event=libfx_journal_turn_closed reason=ended_without_commit", .{});
         try journal.clearProgress(alloc, session.session_id);
@@ -2834,7 +2868,7 @@ fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, sessio
         break :cancelled checkpoint;
     };
     defer cancelled.deinit(session_alloc);
-    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input);
+    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input, session_alloc);
 }
 
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
@@ -2843,18 +2877,26 @@ fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_s
     return null;
 }
 
+/// `hand_back_alloc`, set when the running turn ends, owns its queued
+/// steering, which is handed back first.
 fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
     current_prompt_input: ?*ParsedPromptInput,
+    hand_back_alloc: ?Allocator,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     var prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(alloc, prepared);
-    if (session.journal) |*journal| try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
+    if (session.journal) |*journal| {
+        // The running turn's own end hands back its unplaced steers; ending
+        // an earlier turn for a new prompt does not.
+        if (hand_back_alloc) |backing| try handBackUnplacedSteersLocked(alloc, backing, session, journal);
+        try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
+    }
     if (comptime host_target.is_wasm) {
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
@@ -2957,9 +2999,6 @@ fn commitContextCompaction(
             next.preferences.effort = session.effort;
             next.preferences.fast_mode = session.fast_mode;
             next.preferences.ultrafast_mode = session.ultrafast_mode;
-            const usage = try session.session_rt.usage.snapshot(ctx.alloc);
-            if (next.usage) |*old| old.deinit(ctx.alloc);
-            next.usage = usage;
             const revision = try @import("../core/session/js_host_session_store.zig").commit(ctx.alloc, next, session.wasm_revision);
             if (session.wasm_revision) |old| ctx.alloc.free(old);
             base.deinit(ctx.alloc);
@@ -3081,6 +3120,9 @@ fn clearJournalProgress(raw_ctx: *anyopaque) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+    // The turn ends here, cancelled or stopped: the steers it never placed
+    // are withdrawn while they still belong to it, before the clear ends it.
+    try handBackUnplacedSteersLocked(ctx.alloc, ctx.state.alloc, session, journal);
     try journal.clearProgress(ctx.alloc, session.session_id);
 }
 
@@ -3097,6 +3139,14 @@ fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
         .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
+        // A libfx steer cuts a streaming reply short, as in the fx CLI, but
+        // waits once the model streams a tool call's arguments.
+        .turn_phase_update => |update| if (ctx.state.cfg.minimal_kernel) {
+            server.noteSteeringPhase(ctx.state, update.step_id, switch (update.phase) {
+                .thinking, .generating => .reply,
+                .running, .waiting_for_subagent => .tools,
+            });
+        },
         else => {},
     }
     worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
@@ -3138,6 +3188,8 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
         .provisional => |provisional| {
+            // A tool call the model announced is no reply a steer cuts short.
+            if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
@@ -3150,6 +3202,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             });
         },
         .authoritative_started => |started| {
+            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, started.id.call_id, true);
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
             _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
@@ -3158,7 +3211,10 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
                 .arguments_json = started.arguments_json orelse "{}",
             });
         },
-        .terminal => |terminal| try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result),
+        .terminal => |terminal| {
+            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
+            try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result);
+        },
         .progress, .turn_finished => {},
     }
 }
@@ -3849,12 +3905,8 @@ test "provider terminal status maps only terminal outcomes" {
     try std.testing.expect(providerTerminalStatus(.deferred) == null);
 }
 
-test "ACP usage checkpoints honor the active session write boundary" {
+test "ACP session writer checks honor the active session write boundary" {
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
 
     var active: server.ActiveSessionState = undefined;
     active.v2 = null;
@@ -3871,26 +3923,19 @@ test "ACP usage checkpoints honor the active session write boundary" {
 
     const Worker = struct {
         ctx: *AcpContext,
-        snapshot: session_usage.Snapshot,
         started: std.atomic.Value(bool) = .init(false),
         done: std.atomic.Value(bool) = .init(false),
         failure: ?anyerror = null,
 
         fn run(self: *@This()) void {
             self.started.store(true, .seq_cst);
-            persistUsageCheckpoint(
-                @ptrCast(self.ctx),
-                self.snapshot,
-            ) catch |err| {
+            confirmSessionWriter(@ptrCast(self.ctx)) catch |err| {
                 self.failure = err;
             };
             self.done.store(true, .seq_cst);
         }
     };
-    var worker = Worker{
-        .ctx = &ctx,
-        .snapshot = snapshot,
-    };
+    var worker = Worker{ .ctx = &ctx };
     state.active_session.?.session_write_mutex.lockUncancelable(io_mod.getIo());
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
     while (!worker.started.load(.seq_cst)) std.Thread.yield() catch {};
@@ -3901,146 +3946,7 @@ test "ACP usage checkpoints honor the active session write boundary" {
 
     try std.testing.expect(blocked_at_boundary);
     try std.testing.expect(worker.done.load(.seq_cst));
-    try std.testing.expectEqual(
-        error.SessionPersistenceUnavailable,
-        worker.failure.?,
-    );
-}
-
-test "ACP usage checkpoints maintain the profile recovery marker" {
-    const alloc = std.testing.allocator;
-    const PublicationSink = struct {
-        fn publish(_: *anyopaque, _: session_usage.usage_report.ProfileEvent) !void {}
-    };
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(io_mod.getIo(), "workspace", .default_dir);
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace);
-
-    var store = try session_store.Store.initFromHome(alloc, home, workspace);
-    var store_owned = true;
-    defer if (store_owned) store.deinit(alloc);
-    const history = try alloc.alloc(types.HistoryTurn, 0);
-    var history_owned = true;
-    defer if (history_owned) alloc.free(history);
-    var initial = session_codec.DurableSessionState{
-        .id = try alloc.dupe(u8, "acp-usage-recovery"),
-        .origin_workspace_root = try alloc.dupe(u8, workspace),
-        .workspace_root = try alloc.dupe(u8, workspace),
-        .created_at_ms = 1000,
-        .updated_at_ms = 1000,
-        .conversation_language = session_runtime.ConversationLanguage.default(),
-        .preferences = .{
-            .model = try alloc.dupe(u8, "provider/model"),
-            .effort = types.ReasoningEffort.literal("high"),
-            .fast_mode = false,
-        },
-        .history = history,
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-    history_owned = false;
-    defer initial.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, initial);
-    var writable_owned = true;
-    defer if (writable_owned) writable.deinit(alloc);
-
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    const sequence = try usage.reserveInvocation();
-    try usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    var pending = try usage.snapshot(alloc);
-    defer pending.deinit(alloc);
-
-    var active: server.ActiveSessionState = undefined;
-    active.v2 = null;
-    active.session_id = writable.active_id;
-    active.store = store;
-    active.writable = writable;
-    active.session_write_mutex = .init;
-    var state: server.ServerState = undefined;
-    state.active_session = active;
-    store_owned = false;
-    writable_owned = false;
-    defer {
-        if (state.active_session) |*session| {
-            if (session.writable) |*active_writable| {
-                active_writable.deinit(alloc);
-            }
-            if (session.store) |*active_store| active_store.deinit(alloc);
-            state.active_session = null;
-        }
-    }
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = writable.active_id,
-    };
-
-    try persistUsageCheckpoint(@ptrCast(&ctx), pending);
-    var marked = try store.listUsageRecoverySessions(alloc);
-    defer {
-        for (marked.items) |*entry| entry.deinit(alloc);
-        marked.deinit(alloc);
-    }
-    try std.testing.expectEqual(@as(usize, 1), marked.items.len);
-    try std.testing.expectEqualStrings(writable.active_id, marked.items[0].id);
-    var recovered = try usage_recovery.collectFromHome(alloc, home);
-    defer recovered.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), recovered.pending.len);
-    try std.testing.expectEqualStrings(
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        recovered.pending[0].id,
-    );
-
-    var publication_context: u8 = 0;
-    usage.configurePublicationSink(.{
-        .context = &publication_context,
-        .allocator = alloc,
-        .publish = PublicationSink.publish,
-    });
-    try usage.applyGeneration(alloc, .{
-        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .created_at_ms = 1000,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-    var settled = try usage.snapshot(alloc);
-    defer settled.deinit(alloc);
-    try persistUsageCheckpoint(@ptrCast(&ctx), settled);
-
-    var cleared = try store.listUsageRecoverySessions(alloc);
-    defer {
-        for (cleared.items) |*entry| entry.deinit(alloc);
-        cleared.deinit(alloc);
-    }
-    try std.testing.expectEqual(@as(usize, 0), cleared.items.len);
-    var after_settlement = try usage_recovery.collectFromHome(alloc, home);
-    defer after_settlement.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), after_settlement.facts.len);
-    try std.testing.expectEqual(@as(usize, 0), after_settlement.pending.len);
+    try std.testing.expectEqual(@as(?anyerror, null), worker.failure);
 }
 
 test "parsePromptInput extracts text blocks" {

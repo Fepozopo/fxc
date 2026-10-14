@@ -219,7 +219,7 @@ pub fn resolveWorkspaceOrExternalPath(
         arena,
         workspace_root,
         input_path,
-        io_mod.getenv("HOME"),
+        io_mod.homeDir(),
         .existing,
     );
 }
@@ -231,7 +231,7 @@ pub fn resolve_workspace_or_external_literal_path(
     workspace_root: []const u8,
     path: []const u8,
 ) ![]const u8 {
-    return resolve_workspace_or_external_literal_path_with_home(arena, workspace_root, path, io_mod.getenv("HOME"));
+    return resolve_workspace_or_external_literal_path_with_home(arena, workspace_root, path, io_mod.homeDir());
 }
 
 /// Same literal policy with captured HOME bytes. The caller owns the result.
@@ -253,7 +253,7 @@ pub fn resolveWorkspaceOrExternalCreatePath(
         arena,
         workspace_root,
         input_path,
-        io_mod.getenv("HOME"),
+        io_mod.homeDir(),
         .create,
     );
 }
@@ -396,7 +396,7 @@ fn resolveBoundedFileTargetInput(
             .external_intent = true,
         },
         .home_relative => |relative| blk: {
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const home = io_mod.homeDir() orelse return error.HomeNotSet;
             if (home.len == 0 or !std.Io.Dir.path.isAbsolute(home)) return error.InvalidPath;
             break :blk .{
                 .absolute = try normalizeBaseRelativePathInto(scratch, home, relative),

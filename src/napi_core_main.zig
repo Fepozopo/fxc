@@ -359,6 +359,10 @@ const AttachmentTable = struct {
     }
 };
 
+/// How long `FetchBridge.next` waits for response bytes before it returns
+/// `-3`, the cooperative pulse of the core's stream reader.
+const next_idle_wait: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+
 const FetchBridge = struct {
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
@@ -488,7 +492,14 @@ const FetchBridge = struct {
             self.response.clearRetainingCapacity();
             self.response_offset = 0;
             if (terminal_kind != null) return 0;
-            self.wake.waitUncancelable(io, &self.mutex);
+            // While no bytes arrive, the reader checks its request's cancel
+            // flag and deadline every pulse, so a cancel the core sets, such
+            // as a libfx steer cutting a reply short, does not wait for the
+            // model's next byte.
+            self.wake.waitTimeout(io, &self.mutex, next_idle_wait) catch |err| switch (err) {
+                error.Timeout => return -3,
+                error.Canceled => return -2,
+            };
         }
     }
 

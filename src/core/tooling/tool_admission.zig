@@ -1104,7 +1104,7 @@ fn resolveOrdinaryPermissionOutcome(
             call,
             permission_mode,
         );
-        if (default_outcome.execution_authority != null) return default_outcome;
+        if (default_outcome.execution_authority != null or default_outcome.tool_failure != null) return default_outcome;
     }
     if (toolApprovalPolicy(input, call.name) == .ask_only) {
         return if (permission_mode == .auto)
@@ -2106,9 +2106,20 @@ fn defaultRunCommandPermissionOutcome(
             .decision = .once,
             .execution_authority = .{ .run_command = .{ .direct_only = fingerprint } },
         },
-        .approval_required => .{ .decision = .permission_required },
+        // Review cannot see a repository's git config, and the routine-command
+        // rule would run plain git, so an automatic git command that fx could
+        // not make safe does not run at all.
+        .approval_required => |reason| if (reason == .unsafe_git and permission_mode == .auto)
+            .{ .tool_failure = unsafe_git_hold_output }
+        else
+            .{ .decision = .permission_required },
     };
 }
+
+const unsafe_git_hold_output =
+    "fx did not run this git command. It could not run git here with every program this repository's config " ++
+    "names turned off, and plain git could start them. Inspect files with read_file, glob_files or grep_files, " ++
+    "or ask the user to run git themselves.";
 
 pub fn runCommandContext(
     input: Input,
@@ -5775,6 +5786,53 @@ test "known reversible auto commands bypass the reviewer" {
         command_admission.ShellAuthorizationSource.auto_classifier,
         tty.execution_authority.?.run_command.shell_allowed.source,
     );
+}
+
+test "automatic git that safe git refuses is held instead of running plain git" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The repository config includes a file through a symlink, which fx's
+    // config reader refuses, so safe git cannot prepare and no git starts.
+    try tmp.dir.createDirPath(std.testing.io, "workspace/.git/objects");
+    try tmp.dir.createDirPath(std.testing.io, "workspace/.git/refs");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/.git/HEAD", .data = "ref: refs/heads/main\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fsmonitor.inc", .data = "[core]\n\tfsmonitor = /bin/sh\n" });
+    const include_target = try io_mod.dirRealpathAlloc(arena, tmp.dir, "fsmonitor.inc");
+    try tmp.dir.symLink(std.testing.io, include_target, "workspace/.git/fsmonitor.inc", .{ .is_directory = false });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/.git/config", .data = "[include]\n\tpath = fsmonitor.inc\n" });
+
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
+
+    for ([_][]const u8{ "git status", "git status --short --branch", "git diff" }) |command| {
+        const arguments = try arena.print(
+            "{{\"action\":\"run\",\"command\":{f},\"profile\":\"clean\"}}",
+            .{std.json.fmt(command, .{})},
+        );
+        const call: ToolCall = .{ .id = "refused-git", .name = "shell", .arguments_json = arguments };
+        const held = try requestPermissionOutcome(input, arena, call, .auto, &.{});
+        try std.testing.expect(held.execution_authority == null);
+        try std.testing.expectEqualStrings(unsafe_git_hold_output, held.tool_failure.?);
+
+        // Ask mode keeps the normal approval prompt for the exact command.
+        const asked = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+        try std.testing.expect(asked.tool_failure == null);
+        try std.testing.expectEqual(ToolPermissionDecision.permission_required, asked.decision);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 test "session deny narrows configured command allow" {
