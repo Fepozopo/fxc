@@ -7,6 +7,8 @@
 //
 // A provider spec supplies what differs: which requests it authorizes, how its
 // credentials are checked and refreshed, and which headers carry them.
+//
+// TLA+ model: `tests/tla/sdk/ProviderAuth.tla`.
 
 const refreshSkewMs = 5 * 60 * 1000;
 const maxRememberedCredentials = 256;

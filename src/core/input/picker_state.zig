@@ -91,7 +91,8 @@ pub const InlineSlashQuery = struct {
 /// Paces the frame for a keystroke that started a folder listing. Most folders
 /// list well within one event-loop tick, so that frame waits for the rows and
 /// the keystroke paints together with them instead of over an empty
-/// "indexing files..." list. Times are monotonic milliseconds.
+/// "indexing files..." list. Times are monotonic milliseconds. Modeled in
+/// `tests/tla/indexer/ListingWait.tla`.
 const FileListingWait = struct {
     const hold_ms: i64 = 8;
 

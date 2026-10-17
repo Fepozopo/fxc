@@ -5,6 +5,8 @@
 //! a `Listed` mask over them, so the core never stores the server's strings.
 //! The `classify*` functions turn a server's answer into an event, and the
 //! `write*` functions build the detection messages.
+//!
+//! TLA+ model: `tests/tla/mcp/Era.tla`.
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

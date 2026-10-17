@@ -144,6 +144,32 @@ export interface FxToolContext {
   sessionId: string;
   /** The JSON passed as `context` to the `session()` call whose prompt or steer started the turn. */
   context?: JsonValue;
+  /** Present when hooks are installed. Observe host-owned input waits and child engines. */
+  observation?: FxToolObservation;
+}
+
+export interface FxWaitRequest {
+  kind: "approval" | "question" | "mcp_form" | "mcp_url";
+  externalId?: string | number;
+  server?: string;
+  prompt?: string;
+  schemaJson?: string;
+  questions?: { question: string; options?: { label: string; description?: string }[] }[];
+}
+
+export interface FxWaitResponse<T = unknown> {
+  outcome: "accepted" | "denied" | "cancelled" | "failed" | "timed_out";
+  answers?: string[];
+  value?: T;
+}
+
+export interface FxToolObservation {
+  /** Calls the host effect once and preserves its response/error. Never makes a permission decision. */
+  wait<T>(request: FxWaitRequest, run: () => FxWaitResponse<T> | Promise<FxWaitResponse<T>>): Promise<FxWaitResponse<T>>;
+  /** Used by the MCP adapter to bind a remote call to this tool invocation. */
+  mcp<T>(identity: { server: string | null; tool: string; correlationId?: string | undefined }, run: (request: { correlationId: string | undefined }) => T | Promise<T>): Promise<T>;
+  /** Install these hooks on a host-created child engine to retain the parent tool relationship. */
+  childHooks(): FxHooks;
 }
 
 /** An image in a typed tool result: base64 `data`, or a `sourceRef` with no `data`. */
@@ -294,6 +320,8 @@ export type FxSessionEvent = FxEventBase & (
   | { type: "session.fenced"; sessionId: string; epoch: number }
   /** A message for a session of the agent `agent` reached this one, which sent it on. */
   | { type: "session.forwarded"; sessionId: string; agent: string }
+  /** A queue delivery named an input the session's log does not hold, or none at all, so it ran nothing. */
+  | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" }
   /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
@@ -305,8 +333,107 @@ export type FxAgentEvent = FxEngineEvent | FxSessionEvent;
 // ---------------------------------------------------------------------------
 // Options shared by agents and engines
 
+/** Semantic observation, independent of diagnostics, UI events, permissions, and tracing libraries. */
+export interface FxHooks {
+  /** Parent of a host-created child engine. Normally supplied by `context.observation.childHooks()`. */
+  parent?: { rootSessionId: string; sessionId: string; turnId: string; callId: string };
+  /** Include bounded messages, instructions, tool arguments/results, and schemas. Default false. */
+  captureContent?: boolean;
+  /** Called in event order, but returned promises are not awaited. The host owns buffering and flushing. */
+  onEvent(event: FxHookEvent): void | Promise<void>;
+  /** Receives callback throws and rejected promises. Errors here are contained too. */
+  onError?(error: unknown): void | Promise<void>;
+}
+
+/** An authoritative model call identity, with no provider replay or credentials. */
+export interface FxHookToolCall {
+  callId: string;
+  name: string;
+  provenance: "fx_local" | "provider_executed";
+  /** Present only with content capture. May be a truncated JSON string. */
+  argumentsJson?: string | null;
+}
+
+export interface FxHookMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content?: string | null;
+  toolCallId: string | null;
+  toolName: string | null;
+  toolResultStatus: "success" | "failure" | null;
+  imageCount: number;
+  toolCalls: FxHookToolCall[];
+}
+
+interface FxHookEnvelope {
+  version: 1;
+  sessionId: string;
+  rootSessionId: string;
+  parentSessionId: string | null;
+  sourceSessionId: string | null;
+  workId: string | null;
+  parentTurnId?: string;
+  parentCallId?: string;
+  /** Stable host turn ID; null for session-scoped journal receipts. */
+  turnId: string | null;
+  /** Fresh for each execution/resume, not a trace or durable operation ID. */
+  executionId: string | null;
+  /** One-based within this execution, or 0 outside a step. */
+  stepIndex: number;
+  /** Milliseconds since the epoch, sampled at the semantic boundary. */
+  timestamp: number;
+  contentCaptured: boolean;
+  /** A content budget or collection limit omitted information. */
+  contentTruncated: boolean;
+}
+
+/** Versioned execution facts. The host chooses topology, conventions, redaction, and export. */
+export type FxHookEvent = FxHookEnvelope & (
+  | { type: "turn.start"; data: { resumed: boolean; input?: string | null } }
+  | { type: "turn.end"; data: { outcome: "completed" | "interrupted" | "failed" | "paused" | "yielded" | "cancelled" | "fenced"; error: string | null; handoff?: boolean } }
+  | { type: "step.start" | "step.end"; data: Record<string, never> }
+  | { type: "model.start"; data: {
+    /** Scoped to executionId. Retries have distinct IDs. */
+    modelCallId: number;
+    parentCallId: string | null;
+    purpose: "agent" | "compaction" | "vision" | "title" | "permission_review" | "auxiliary";
+    model: string; toolChoice: string; maxOutputTokens: number | null; messageCount: number;
+    instructions?: FxHookMessage[]; messages?: FxHookMessage[];
+    toolsJson?: string | null;
+    tools: { name: string; description?: string | null; inputSchemaJson?: string | null }[];
+  } }
+  | { type: "model.admitted" | "model.output_start"; data: { modelCallId: number } }
+  | { type: "model.end"; data: {
+    modelCallId: number; error: string | null; cancelled: boolean; output?: string | null;
+    finishReason?: string | null; generationId?: string | null; provider?: string | null;
+    usage?: { inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null; reasoningTokens: number | null };
+    toolCalls?: FxHookToolCall[];
+  } }
+  | { type: "tool.start"; data: { call: FxHookToolCall; rerun: boolean } }
+  | { type: "permission.start"; data: { call: FxHookToolCall } }
+  | { type: "tool.end"; data: {
+    call: FxHookToolCall; output?: string | null; status: "success" | "failure" | "cancelled"; error: string | null;
+    usage?: { inputTokens: number; outputTokens: number; webSearchRequests: number };
+  } }
+  /** Acceptance into conversation memory, not proof of durable storage. */
+  | { type: "tool.result"; data: { call: FxHookToolCall; output?: string | null; status: "success" | "failure" } }
+  /** Permission evaluation can complete without a human prompt. */
+  | { type: "permission.end"; data: { call: FxHookToolCall; decision: "once" | "always" | "deny" | "policy_denied" | "permission_required" | null; error: string | null } }
+  | { type: "wait.start"; data: { requestId: number | string; kind: FxWaitRequest["kind"]; callId: string | null; externalId: string | number | null; server: string | null; prompt?: string | null; schemaJson?: string | null; questionCount: number; questions?: { question: string; submission?: "none" | "input" | "choice"; options: { label: string; description?: string | null }[] }[] } }
+  | { type: "wait.end"; data: { requestId: number | string; outcome: FxWaitResponse["outcome"]; error: string | null; answers?: string[] } }
+  | { type: "mcp.start"; data: { operationId: number | string; callId: string | null; server: string | null; tool: string; transport: string | null } }
+  | { type: "mcp.request"; data: { operationId: number | string; requestId: number | string; requestIdKind: "jsonrpc" | "engine" | "correlation" } }
+  | { type: "mcp.end"; data: { operationId: number | string; status: "success" | "failure" | "cancelled" | "input_required" | "unavailable" | "unknown"; error: string | null } }
+  | { type: "delegation"; data: { callId: string; childSessionId: string; workId: string; operationId: string | null; phase: "dispatched" | "completed" | "yielded" | "replayed" | "failed" | "cancelled" | "feedback_queued" | "feedback_applied" | "feedback_not_applied" } }
+  /** Emitted only after append resolves and its cursor validates. */
+  | { type: "journal.commit"; data: { cursor: string; firstSeq: number | null; lastSeq: number | null; eventCount: number } }
+  | { type: "journal.restore"; data: { cursor: string | null; lastSeq: number; resumable: boolean; openTurnId: string | null; lastTurnId: string | null } }
+  | { type: "journal.error"; data: { error: string; fenced: boolean } }
+);
+
 /** Options `createFxAgent()` and `createFxEngine()` share. */
 export interface FxSharedOptions<Event> {
+  /** Host-owned instrumentation of native and Wasm execution. Disabled by default. */
+  hooks?: FxHooks;
   /** The complete host-owned system context, up to 64 KiB of UTF-8. An array is joined with blank lines. */
   instructions?: string | readonly string[];
   tools?: FxTools;
@@ -627,7 +754,7 @@ export type FxAgentOptions = Omit<FxSharedOptions<FxAgentEvent>, "tools"> & FxMo
 
 /** Options for `agent.session()`. Each applies to the turns this session object starts. */
 export interface FxSessionOptions {
-  /** JSON every tool call of those turns receives as `context`. */
+  /** JSON every tool call of those turns receives as `context`, copied when `session()` is called. */
   context?: JsonValue;
   /** The model for those turns instead of the agent's whole model choice: a model ID, or a model object. */
   model?: string | FxModelOptions;
@@ -647,8 +774,7 @@ export interface FxPromptOptions {
 export interface FxSteerOptions {
   /**
    * The steer's id, so a retried request adds nothing. Follows the session id rule. Reusing a prompt's id rejects
-   * with `FX_MESSAGE_ID_IN_USE`; on a queue that outlives the process, the worker drops the steer and emits a
-   * `session.error` with that code instead.
+   * with `FX_MESSAGE_ID_IN_USE`.
    */
   messageId?: string;
 }

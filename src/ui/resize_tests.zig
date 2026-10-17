@@ -2207,9 +2207,9 @@ test "streamed double backtick span and entities render as plain characters" {
     const row = try findRowContaining(&h, "Use ");
     try expectRowTrimmedEquals(&h, row, "  Use a ` b for <x> & y");
     const code_cell = h.vt.cellAt(row, 7) orelse return error.TestMissingInlineCodeCell;
-    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 245 }));
+    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 255 }));
     const inner_tick = h.vt.cellAt(row, 9) orelse return error.TestMissingInlineCodeCell;
-    try std.testing.expect(inner_tick.style.fg.eql(.{ .indexed = 245 }));
+    try std.testing.expect(inner_tick.style.fg.eql(.{ .indexed = 255 }));
     const prose_cell = h.vt.cellAt(row, 17) orelse return error.TestMissingProseCell;
     try std.testing.expect(prose_cell.style.fg.eql(.default));
     try expectGridNotContains(&h, "``");
@@ -2291,7 +2291,7 @@ test "streamed nested and mixed emphasis pairs resolve on the grid" {
     const a_cell = h.vt.cellAt(under_row, 7) orelse return error.TestMissingCell;
     try std.testing.expect(a_cell.codepoint == 'a' and a_cell.style.flags.italic);
     const tick_cell = h.vt.cellAt(under_row, 10) orelse return error.TestMissingCell;
-    try std.testing.expect(tick_cell.codepoint == '`' and tick_cell.style.fg.eql(.{ .indexed = 245 }));
+    try std.testing.expect(tick_cell.codepoint == '`' and tick_cell.style.fg.eql(.{ .indexed = 255 }));
     const d_cell = h.vt.cellAt(under_row, 13) orelse return error.TestMissingCell;
     try std.testing.expect(d_cell.codepoint == 'd' and d_cell.style.flags.italic);
     const end_cell = h.vt.cellAt(under_row, 15) orelse return error.TestMissingCell;
@@ -2316,8 +2316,8 @@ test "streamed nested and mixed emphasis pairs resolve on the grid" {
 
 test "streamed inline code color survives shrink and grow" {
     const cases = [_]struct { light: bool, fg: u8 }{
-        .{ .light = false, .fg = 245 },
-        .{ .light = true, .fg = 247 },
+        .{ .light = false, .fg = 255 },
+        .{ .light = true, .fg = 235 },
     };
     defer assistant_presentation.setInlineCodeTheme(false);
 
@@ -6324,7 +6324,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 36 · type to filter");
+    try expectGridContains(&h, "Commands 37 · type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -6345,7 +6345,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 36");
+    try expectGridNotContains(&h, "Commands 37");
     try expectGridNotContains(&h, "↑↓ navigate");
 }
 
@@ -7713,7 +7713,7 @@ test "theme reset retints fx entries and replays the retained transcript once" {
     );
     const assistant_id = try h.shell.appendAssistantTurnEntry(alloc);
     const assistant = h.shell.lookupAssistantSegments(assistant_id) orelse unreachable;
-    try assistant.text.appendSlice(alloc, "\x1b[38;5;245mFX THEME INLINE CODE\x1b[39m\n");
+    try assistant.text.appendSlice(alloc, "\x1b[38;5;255mFX THEME INLINE CODE\x1b[39m\n");
 
     try h.renderTranscriptFrame();
     try h.flush();
@@ -7743,7 +7743,7 @@ test "theme reset retints fx entries and replays the retained transcript once" {
         h.shell.entries.items[2].raw_bytes.bytes,
     );
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;247mFX THEME INLINE CODE\x1b[39m\n",
+        "\x1b[38;5;235mFX THEME INLINE CODE\x1b[39m\n",
         h.shell.lookupAssistantSegments(assistant_id).?.text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.shell.transcript.items, "FX THEME HEADER"));

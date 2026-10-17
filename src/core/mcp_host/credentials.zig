@@ -3,6 +3,9 @@
 //! the macOS Keychain, or in a private file under `~/.fx/mcp-credentials/`.
 //! Either way the directory's advisory lock is held while the store is read
 //! and rewritten, so two fx processes don't overwrite each other's entries.
+//!
+//! TLA+ models: `tests/tla/mcp_host/Credentials.tla` and, for logins shared between
+//! processes, `tests/tla/mcp_host/SharedLogins.tla`.
 
 const std = @import("std");
 const builtin = @import("builtin");

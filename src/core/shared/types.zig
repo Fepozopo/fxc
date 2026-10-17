@@ -1507,6 +1507,9 @@ pub const UserTurn = struct {
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
 pub const ProviderReplay = struct {
     pub const max_bytes: usize = 4 * 1024 * 1024;
+    /// Joins distinct provider messages in assistant content. Replayed text
+    /// spans exclude it, so each message returns to its provider unchanged.
+    pub const message_separator = "\n\n";
     source: @import("../config/model_provider.zig").ProviderSelection,
     parts_json: []const u8,
 

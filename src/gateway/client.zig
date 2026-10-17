@@ -1018,6 +1018,8 @@ const ConnectedRequestWatch = struct {
 
 const RequestOpenOperation = struct {
     client: *std.http.Client,
+    /// Set when `client` is the pool's shared client.
+    pool: ?*http_pool.HttpPool,
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
     request_open_override: ?RequestOpenOverride,
@@ -1032,12 +1034,14 @@ const RequestOpenOperation = struct {
                 self.options,
             );
         }
+        if (self.pool) |pool| return pool.openRequest(.POST, self.uri, self.options);
         return self.client.request(.POST, self.uri, self.options);
     }
 };
 
 fn openGatewayRequestBounded(
     client: *std.http.Client,
+    pool: ?*http_pool.HttpPool,
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
     request_open_override: ?RequestOpenOverride,
@@ -1070,6 +1074,7 @@ fn openGatewayRequestBounded(
 
     var operation = RequestOpenOperation{
         .client = client,
+        .pool = pool,
         .uri = uri,
         .options = options,
         .request_open_override = request_open_override,
@@ -1553,7 +1558,7 @@ fn streamGatewayCompletionCoreWithOptions(
 
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
-        var req = openGatewayRequestBounded(client, uri, .{
+        var req = openGatewayRequestBounded(client, request.shared_pool, uri, .{
             .headers = request_headers,
             .extra_headers = extra_headers,
             .keep_alive = request.shared_pool != null,
@@ -2578,7 +2583,9 @@ const GatewayReplayBuilder = struct {
         return null;
     }
 
-    fn observe(self: *GatewayReplayBuilder, root: std.json.Value, content_offset: usize) !void {
+    /// `separated` means a message separator ends at `content_offset`; it
+    /// belongs to no part, so a part's first text may follow it.
+    fn observe(self: *GatewayReplayBuilder, root: std.json.Value, content_offset: usize, separated: bool) !void {
         const event = root.object.get("type").?.string;
         const kind: Kind = if (std.mem.startsWith(u8, event, "reasoning-"))
             .reasoning
@@ -2615,7 +2622,11 @@ const GatewayReplayBuilder = struct {
                 try part.text.appendSlice(self.alloc, delta.string);
             } else {
                 const end = std.math.add(usize, part.offset, part.length) catch return error.ProviderStateTooLarge;
-                if (content_offset != end) return error.InvalidProviderState;
+                const separator_len = types.ProviderReplay.message_separator.len;
+                // A part opened before the separator starts its text after it.
+                if (separated and part.length == 0 and content_offset >= separator_len and content_offset - separator_len == end) {
+                    part.offset = content_offset;
+                } else if (content_offset != end) return error.InvalidProviderState;
                 part.length = std.math.add(usize, part.length, delta.string.len) catch return error.ProviderStateTooLarge;
             }
         }
@@ -2710,6 +2721,54 @@ const GatewayReplayBuilder = struct {
             if (call.provisional_id) |id| std.mem.eql(u8, part.id, id) else false);
     }
 };
+
+/// Finds where one provider message ends and the next begins in the joined
+/// assistant text. Only text parts that the provider marks as message items,
+/// such as OpenAI Responses messages, are separated. Other providers split
+/// one message into blocks, such as cited spans, that must stay joined.
+const TextMessageBoundary = struct {
+    open_is_message: bool = false,
+    open_has_text: bool = false,
+    last_text_was_message: bool = false,
+
+    /// Returns true when a message separator must precede this event's text.
+    fn observe(self: *TextMessageBoundary, event_type: []const u8, root: std.json.Value) bool {
+        if (std.mem.eql(u8, event_type, "text-start")) {
+            self.open_is_message = isProviderMessageItem(root);
+            self.open_has_text = false;
+            return false;
+        }
+        if (!std.mem.eql(u8, event_type, "text-delta") or self.open_has_text) return false;
+        const delta = root.object.get("delta") orelse return false;
+        if (delta != .string or delta.string.len == 0) return false;
+        const separated = self.open_is_message and self.last_text_was_message;
+        self.open_has_text = true;
+        self.last_text_was_message = self.open_is_message;
+        return separated;
+    }
+
+    fn isProviderMessageItem(root: std.json.Value) bool {
+        const metadata = root.object.get("providerMetadata") orelse return false;
+        if (metadata != .object) return false;
+        var providers = metadata.object.iterator();
+        while (providers.next()) |provider| {
+            if (std.mem.eql(u8, provider.key_ptr.*, "gateway")) continue;
+            const options = provider.value_ptr.*;
+            if (options != .object) continue;
+            for ([_][]const u8{ "itemId", "phase" }) |key| {
+                const value = options.object.get(key) orelse continue;
+                if (value == .string and value.string.len > 0) return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// Returns the prefix of `text` that fits within an optional capture limit.
+fn capturedText(text: []const u8, limit: ?usize, captured: usize) []const u8 {
+    const remaining = if (limit) |bytes| bytes -| captured else return text;
+    return text[0..@min(text.len, remaining)];
+}
 
 fn mergeReplayMetadata(alloc: std.mem.Allocator, previous: ?[]const u8, next: std.json.Value) ![]u8 {
     var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -3454,6 +3513,7 @@ fn consumeSseStreamTraced(
     defer content_buf.deinit(alloc);
     var replay = GatewayReplayBuilder{ .alloc = alloc };
     defer replay.deinit();
+    var text_messages: TextMessageBoundary = .{};
     // Reuse event storage instead of pinning old response buffers in the caller's arena.
     var event_arena = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(event_arena);
@@ -3541,7 +3601,13 @@ fn consumeSseStreamTraced(
         if (type_val != .string) continue;
         const event_type = type_val.string;
 
-        if (content_capture_limit == null) try replay.observe(root, content_buf.items.len);
+        const separated = text_messages.observe(event_type, root);
+        if (separated) {
+            const separator = types.ProviderReplay.message_separator;
+            try content_buf.appendSlice(alloc, capturedText(separator, content_capture_limit, content_buf.items.len));
+            on_content_chunk(callback_ctx, separator);
+        }
+        if (content_capture_limit == null) try replay.observe(root, content_buf.items.len, separated);
 
         if (std.mem.eql(u8, event_type, "response-metadata")) {
             if (root.object.get("modelId")) |model_val| {
@@ -3570,11 +3636,7 @@ fn consumeSseStreamTraced(
         } else if (std.mem.eql(u8, event_type, "text-delta")) {
             if (root.object.get("delta")) |delta_val| {
                 if (delta_val == .string and delta_val.string.len > 0) {
-                    const retained = if (content_capture_limit) |limit|
-                        delta_val.string[0..@min(delta_val.string.len, limit -| content_buf.items.len)]
-                    else
-                        delta_val.string;
-                    try content_buf.appendSlice(alloc, retained);
+                    try content_buf.appendSlice(alloc, capturedText(delta_val.string, content_capture_limit, content_buf.items.len));
                     on_content_chunk(callback_ctx, delta_val.string);
                 }
             }
@@ -4584,6 +4646,198 @@ test "Gateway replay rejects late deltas without a segment restart" {
     }
 }
 
+test "Gateway separates provider message items in assistant text" {
+    const alloc = std.testing.allocator;
+    const Message = struct {
+        id: []const u8,
+        /// Null for providers that split one message into unmarked blocks.
+        item: ?struct { phase: ?[]const u8 = null } = .{},
+        fragments: []const []const u8,
+    };
+    const Fixture = struct {
+        const Options = struct { itemId: []const u8, phase: ?[]const u8 };
+        const Metadata = struct { openai: Options };
+
+        fn event(writer: *std.Io.Writer, value: anytype) !void {
+            try writer.writeAll("data: ");
+            try std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, writer);
+            try writer.writeAll("\n\n");
+        }
+
+        fn message(writer: *std.Io.Writer, value: Message) !void {
+            const metadata: ?Metadata = if (value.item) |item| .{ .openai = .{ .itemId = value.id, .phase = item.phase } } else null;
+            try event(writer, .{ .type = "text-start", .id = value.id, .providerMetadata = metadata });
+            for (value.fragments) |fragment| try event(writer, .{ .type = "text-delta", .id = value.id, .delta = fragment });
+            try event(writer, .{ .type = "text-end", .id = value.id });
+        }
+    };
+    const Chunks = struct {
+        text: std.ArrayList(u8) = .empty,
+        separators: usize = 0,
+        failed: bool = false,
+
+        fn record(ctx: *anyopaque, chunk: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, chunk, types.ProviderReplay.message_separator)) self.separators += 1;
+            self.text.appendSlice(std.testing.allocator, chunk) catch {
+                self.failed = true;
+            };
+        }
+    };
+    const captured = [_]Message{
+        .{ .id = "A", .item = .{ .phase = "commentary" }, .fragments = &.{ "Hi! What would ", "you like help with?" } },
+        .{ .id = "B", .item = .{ .phase = "final_answer" }, .fragments = &.{ "Hi! What can ", "I help you with?" } },
+    };
+    const cases = [_]struct { messages: []const Message, expected: []const u8, separators: usize }{
+        .{ .messages = &captured, .expected = "Hi! What would you like help with?\n\nHi! What can I help you with?", .separators = 1 },
+        .{ .messages = &.{
+            .{ .id = "A", .fragments = &.{"First."} },
+            .{ .id = "B", .fragments = &.{"Second."} },
+        }, .expected = "First.\n\nSecond.", .separators = 1 },
+        .{ .messages = &.{
+            .{ .id = "A", .item = .{ .phase = "final_answer" }, .fragments = &.{"One."} },
+            .{ .id = "B", .item = .{ .phase = "final_answer" }, .fragments = &.{"Two."} },
+            .{ .id = "C", .item = .{ .phase = "final_answer" }, .fragments = &.{"Three."} },
+        }, .expected = "One.\n\nTwo.\n\nThree.", .separators = 2 },
+        .{ .messages = &.{
+            .{ .id = "A", .item = .{ .phase = "commentary" }, .fragments = &.{"Checking."} },
+            .{ .id = "E", .item = .{ .phase = "commentary" }, .fragments = &.{} },
+            .{ .id = "B", .item = .{ .phase = "final_answer" }, .fragments = &.{"Done."} },
+        }, .expected = "Checking.\n\nDone.", .separators = 1 },
+        .{ .messages = &.{
+            .{ .id = "0", .item = null, .fragments = &.{"Paris is "} },
+            .{ .id = "1", .item = null, .fragments = &.{"the capital."} },
+        }, .expected = "Paris is the capital.", .separators = 0 },
+        // Both neighbors must be message items before they are separated.
+        .{ .messages = &.{
+            .{ .id = "A", .item = .{ .phase = "final_answer" }, .fragments = &.{"Paris is "} },
+            .{ .id = "1", .item = null, .fragments = &.{"the capital."} },
+        }, .expected = "Paris is the capital.", .separators = 0 },
+        .{ .messages = &.{
+            .{ .id = "0", .item = null, .fragments = &.{"Paris is "} },
+            .{ .id = "B", .item = .{ .phase = "final_answer" }, .fragments = &.{"the capital."} },
+        }, .expected = "Paris is the capital.", .separators = 0 },
+    };
+    for (cases) |case| {
+        var payload: std.Io.Writer.Allocating = .init(alloc);
+        defer payload.deinit();
+        for (case.messages) |message| try Fixture.message(&payload.writer, message);
+        try Fixture.event(&payload.writer, .{ .type = "finish", .finishReason = .{ .unified = "stop" } });
+        var chunks: Chunks = .{};
+        defer chunks.text.deinit(alloc);
+        var reader = std.Io.Reader.fixed(payload.written());
+        var cancelled = std.atomic.Value(bool).init(false);
+        var completion = try consumeSseStream(alloc, &reader, &chunks, Chunks.record, null, &cancelled);
+        defer deinitGatewayCompletion(alloc, &completion);
+        const content = completion.content.?;
+        try std.testing.expectEqualStrings(case.expected, content);
+        try std.testing.expect(!chunks.failed);
+        try std.testing.expectEqualStrings(content, chunks.text.items);
+        try std.testing.expectEqual(case.separators, chunks.separators);
+
+        const replay = completion.provider_state_json orelse {
+            // Unmarked blocks carry no provider state to replay.
+            for (case.messages) |message| try std.testing.expect(message.item == null);
+            continue;
+        };
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, replay, .{});
+        defer parsed.deinit();
+        const parts = parsed.value.array.items;
+        try std.testing.expectEqual(case.messages.len, parts.len);
+        for (case.messages, parts) |message, part| {
+            const text = try std.mem.concat(alloc, u8, message.fragments);
+            defer alloc.free(text);
+            const offset: usize = @intCast(part.object.get("offset").?.integer);
+            const length: usize = @intCast(part.object.get("length").?.integer);
+            try std.testing.expectEqualStrings(text, content[offset..][0..length]);
+            const item = message.item orelse {
+                try std.testing.expect(part.object.get("providerOptions") == null);
+                continue;
+            };
+            const openai = part.object.get("providerOptions").?.object.get("openai").?.object;
+            try std.testing.expectEqualStrings(message.id, openai.get("itemId").?.string);
+            if (item.phase) |phase| {
+                try std.testing.expectEqualStrings(phase, openai.get("phase").?.string);
+            } else {
+                try std.testing.expect(openai.get("phase") == null);
+            }
+        }
+    }
+
+    // A provider-executed tool between messages keeps both messages and the call.
+    {
+        var payload: std.Io.Writer.Allocating = .init(alloc);
+        defer payload.deinit();
+        try Fixture.message(&payload.writer, .{ .id = "A", .item = .{ .phase = "commentary" }, .fragments = &.{"Searching."} });
+        try Fixture.event(&payload.writer, .{ .type = "tool-input-start", .id = "call", .toolName = "exa_search" });
+        try Fixture.event(&payload.writer, .{ .type = "tool-input-delta", .id = "call", .delta = "{\"query\":\"fx\"}" });
+        try Fixture.event(&payload.writer, .{ .type = "tool-input-end", .id = "call" });
+        try Fixture.event(&payload.writer, .{ .type = "tool-call", .toolCallId = "call", .toolName = "exa_search", .input = .{ .query = "fx" }, .providerExecuted = true });
+        try Fixture.event(&payload.writer, .{ .type = "tool-result", .toolCallId = "call", .result = .{ .results = .{} } });
+        try Fixture.message(&payload.writer, .{ .id = "B", .item = .{ .phase = "final_answer" }, .fragments = &.{ "Found ", "it." } });
+        try Fixture.event(&payload.writer, .{ .type = "finish", .finishReason = .{ .unified = "stop" } });
+        var chunks: Chunks = .{};
+        defer chunks.text.deinit(alloc);
+        var reader = std.Io.Reader.fixed(payload.written());
+        var cancelled = std.atomic.Value(bool).init(false);
+        var completion = try consumeSseStream(alloc, &reader, &chunks, Chunks.record, null, &cancelled);
+        defer deinitGatewayCompletion(alloc, &completion);
+        try std.testing.expectEqualStrings("Searching.\n\nFound it.", completion.content.?);
+        try std.testing.expectEqualStrings(completion.content.?, chunks.text.items);
+        try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, completion.provider_state_json.?, .{});
+        defer parsed.deinit();
+        const parts = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 3), parts.len);
+        try std.testing.expectEqual(@as(i64, 0), parts[0].object.get("offset").?.integer);
+        try std.testing.expectEqual(@as(i64, 10), parts[0].object.get("length").?.integer);
+        try std.testing.expectEqualStrings("call", parts[1].object.get("toolCallId").?.string);
+        try std.testing.expectEqual(@as(i64, 12), parts[2].object.get("offset").?.integer);
+        try std.testing.expectEqual(@as(i64, 9), parts[2].object.get("length").?.integer);
+    }
+
+    // Text from a part that never started still follows the separator.
+    {
+        var payload: std.Io.Writer.Allocating = .init(alloc);
+        defer payload.deinit();
+        try Fixture.message(&payload.writer, .{ .id = "A", .item = .{ .phase = "commentary" }, .fragments = &.{"One."} });
+        try Fixture.event(&payload.writer, .{ .type = "text-start", .id = "E", .providerMetadata = Fixture.Metadata{ .openai = .{ .itemId = "E", .phase = "final_answer" } } });
+        try Fixture.event(&payload.writer, .{ .type = "text-delta", .id = "Z", .delta = "Two." });
+        try Fixture.event(&payload.writer, .{ .type = "finish", .finishReason = .{ .unified = "stop" } });
+        var chunks: Chunks = .{};
+        defer chunks.text.deinit(alloc);
+        var reader = std.Io.Reader.fixed(payload.written());
+        var cancelled = std.atomic.Value(bool).init(false);
+        var completion = try consumeSseStream(alloc, &reader, &chunks, Chunks.record, null, &cancelled);
+        defer deinitGatewayCompletion(alloc, &completion);
+        try std.testing.expectEqualStrings("One.\n\nTwo.", completion.content.?);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, completion.provider_state_json.?, .{});
+        defer parsed.deinit();
+        const parts = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 3), parts.len);
+        try std.testing.expectEqual(@as(i64, 6), parts[2].object.get("offset").?.integer);
+        try std.testing.expectEqual(@as(i64, 4), parts[2].object.get("length").?.integer);
+    }
+
+    // A capture limit can end inside the separator; the stream still sees all of it.
+    {
+        var payload: std.Io.Writer.Allocating = .init(alloc);
+        defer payload.deinit();
+        for (captured) |message| try Fixture.message(&payload.writer, message);
+        try Fixture.event(&payload.writer, .{ .type = "finish", .finishReason = .{ .unified = "stop" } });
+        var chunks: Chunks = .{};
+        defer chunks.text.deinit(alloc);
+        var reader = std.Io.Reader.fixed(payload.written());
+        var cancelled = std.atomic.Value(bool).init(false);
+        const first_len = "Hi! What would you like help with?".len;
+        var completion = try consumeGatewaySseStream(alloc, &reader, &chunks, Chunks.record, null, null, &cancelled, first_len + 1);
+        defer deinitGatewayCompletion(alloc, &completion);
+        try std.testing.expectEqualStrings("Hi! What would you like help with?\n", completion.content.?);
+        try std.testing.expectEqualStrings(cases[0].expected, chunks.text.items);
+        try std.testing.expect(completion.provider_state_json == null);
+    }
+}
+
 test "Gateway replay assembly is allocation-safe and rejects incomplete metadata" {
     const Check = struct {
         fn run(alloc: std.mem.Allocator) !void {
@@ -4599,7 +4853,7 @@ test "Gateway replay assembly is allocation-safe and rejects incomplete metadata
             }) |event| {
                 const parsed = try std.json.parseFromSlice(std.json.Value, alloc, event, .{});
                 defer parsed.deinit();
-                try replay.observe(parsed.value, 0);
+                try replay.observe(parsed.value, 0, false);
             }
             const output = (replay.finish("", &.{}) catch |err| switch (err) {
                 error.WriteFailed => return error.OutOfMemory,
@@ -4616,7 +4870,7 @@ test "Gateway replay assembly is allocation-safe and rejects incomplete metadata
     defer replay.deinit();
     const incomplete = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"reasoning-start\",\"id\":\"r\",\"providerMetadata\":{\"anthropic\":{\"signature\":\"partial\"}}}", .{});
     defer incomplete.deinit();
-    try replay.observe(incomplete.value, 0);
+    try replay.observe(incomplete.value, 0, false);
     try std.testing.expectError(error.InvalidProviderState, replay.finish("", &.{}));
     try std.testing.expectError(error.ProviderStateTooLarge, replay.reserve(types.ProviderReplay.max_bytes));
 }
@@ -7283,6 +7537,28 @@ test "shared pool reuses one keep-alive connection across sequential requests" {
     try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
     // Close the pooled connection before the fixture teardown so the serve
     // loop observes EOF and the fixture thread can join.
+    _ = pool.deinit();
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "shared pool requests open with a current certificate clock" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+    // As though the CA bundle loaded long before this request.
+    pool.client.now = std.Io.Timestamp.fromNanoseconds(1);
+    const before = std.Io.Clock.real.now(pool.client.io);
+
+    var result = try pooledLoopbackCall(&pool, harness.url);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    try std.testing.expect(pool.client.now.?.nanoseconds >= before.nanoseconds);
+
+    // Close the pooled connection so the fixture thread can join.
     _ = pool.deinit();
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;

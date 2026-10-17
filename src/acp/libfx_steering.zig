@@ -1,3 +1,6 @@
+//! When a libfx steer interrupts, waits, joins, or hands off a turn. TLA+
+//! model: `tests/tla/sdk/DurableSteer.tla`.
+
 const std = @import("std");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");

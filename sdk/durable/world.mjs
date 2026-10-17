@@ -32,18 +32,23 @@ const durabilityTag = Symbol.for("libfx.durability");
  * - `leaseMs`: how long a lease lasts after it was taken or last renewed,
  *   when liveness is unknown. Default 15000.
  * - `queueDurable`: the queue keeps a message until a delivery acknowledges
- *   it, across crashes. Otherwise `prompt()` stores the prompt first.
+ *   it, across crashes. `prompt()` stores the prompt first either way.
  * - `pollMs`: how often a waiting worker reads the session again.
  * - `maxDurationMs` and `reserveMs`: each delivery stops `reserveMs` before
  *   `maxDurationMs`, or before the World's `getRuntimeDeadline()`.
  * - `gatewayKey()`: the AI Gateway credential when the app passes none.
+ * - `store`: names the store this World keeps sessions in; default its name.
+ *   Queue messages name it, so a route delivers each to the agents on its
+ *   store, and on one store an agent name belongs to one configuration. Give
+ *   each customer of an app a store of its own.
  */
 export function world(source, options = {}) {
   const owned = typeof source === "function";
   if (!owned && !(source && typeof source === "object")) throw new TypeError("world() takes a World or a function that creates one");
   if (!options || typeof options !== "object" || Array.isArray(options)) throw new TypeError("world() options must be an object");
-  const { name = "world", livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, pollMs, leaseMs, maxDurationMs, reserveMs, alive, holderInfo, gatewayKey } = options;
+  const { name = "world", store = name, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, pollMs, leaseMs, maxDurationMs, reserveMs, alive, holderInfo, gatewayKey } = options;
   if (typeof name !== "string" || name.length === 0) throw new TypeError("world() name must be a non-empty string");
+  if (typeof store !== "string" || store.length === 0) throw new TypeError(`${name}() store must be a non-empty string`);
   for (const [key, value] of Object.entries({ livenessKnown, queueLeases, runInRequest, queueDurable })) {
     if (typeof value !== "boolean") throw new TypeError(`${name}() ${key} must be a boolean`);
   }
@@ -63,6 +68,7 @@ export function world(source, options = {}) {
   return {
     [durabilityTag]: true,
     name,
+    store,
     world: owned ? source : () => source,
     owned,
     livenessKnown,

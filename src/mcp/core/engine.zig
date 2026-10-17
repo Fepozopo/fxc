@@ -6,6 +6,8 @@
 //! call waits for it (LazyConnect), at most `max_attempts` times in a row,
 //! and after a failure only once its backoff is over. A step that
 //! also starts the server is traced as a second record. Pure.
+//!
+//! TLA+ model: `tests/tla/mcp/Engine.tla`.
 
 const std = @import("std");
 const request = @import("request.zig");

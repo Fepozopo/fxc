@@ -3,6 +3,9 @@
 //! down, which a walker loads as it enters each directory. Every source is a
 //! bounded regular-file read; one that cannot be read is reported so the
 //! caller can mark its result incomplete, never replaced by running git.
+//!
+//! Which of these sources can change a saved listing is modeled in
+//! `tests/tla/indexer/SnapshotSources.tla`.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");

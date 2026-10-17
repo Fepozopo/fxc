@@ -3,6 +3,8 @@
 //! came to goes to MCP-v2's `finishSignIn`. Anything else, such as a request
 //! for an icon, gets a 404 and the wait goes on. A bridged sign-in (Slack's,
 //! through fx.sh) comes back instead as a form its page posts.
+//!
+//! TLA+ model: `tests/tla/mcp_host/SignIn.tla`.
 
 const std = @import("std");
 const browser_callback = @import("../auth/browser_callback.zig");

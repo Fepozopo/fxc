@@ -41,7 +41,13 @@ export type WorldSource = World | (() => World | Promise<World>);
 export type WorldOptions = {
   /** The durability's name in errors. Default `"world"`. */
   name?: string;
-  /** The queue keeps a message until a delivery acknowledges it, across crashes. When false, `prompt()` stores the prompt first. Default false. */
+  /**
+   * The store this World keeps sessions in. Queue messages name it, so one route hands each delivery to the agents on
+   * its store, and on one store an agent name belongs to one configuration. Give each customer of an app a store of its
+   * own. Default the durability's `name`.
+   */
+  store?: string;
+  /** The queue keeps a message until a delivery acknowledges it, across crashes. `prompt()` stores the prompt first either way. Default false. */
   queueDurable?: boolean;
   /** How often a waiting worker reads the session again. Default 1000. */
   pollMs?: number;

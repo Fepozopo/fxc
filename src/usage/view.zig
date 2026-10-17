@@ -1,5 +1,5 @@
 //! What `/usage` shows for one period, built from a cache entry. Pure;
-//! mirrors `ViewOf` in the LeanUsage TLA+ model: today's numbers count only
+//! mirrors `ViewOf` in `tests/tla/usage/LeanUsage.tla`: today's numbers count only
 //! when they belong to the current UTC day (`TodayIsToday`).
 
 const std = @import("std");

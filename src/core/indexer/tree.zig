@@ -4,7 +4,7 @@
 //! its times are older than the scan's start by the granularity margin, so a
 //! change in the same clock tick as the scan, which a later stamp comparison
 //! could not see, always forces a new scan. This is the reuse certificate the
-//! refresh model (Refresh.tla) requires.
+//! refresh model (`tests/tla/indexer/Refresh.tla`) requires.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");

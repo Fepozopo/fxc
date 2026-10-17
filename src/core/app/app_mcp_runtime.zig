@@ -1717,7 +1717,8 @@ pub const State = struct {
         self.cancelPendingMenuOperation("menu_back");
     }
 
-    /// Loads the host at startup with `load`, which reloads use too.
+    /// Loads the host at startup with `load`, which reloads use too. The host's
+    /// lifecycle is modeled in `tests/tla/mcp_host/HostLifecycle.tla`.
     pub fn loadHost(
         self: *State,
         load: mcp_host.LoadFn,

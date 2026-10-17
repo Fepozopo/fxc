@@ -14,6 +14,10 @@ var fallback_threaded: std.Io.Threaded = .init_single_threaded;
 var global_environ: ?*const std.process.Environ.Map = null;
 var global_environ_block: ?std.process.Environ.Block = null;
 var global_raw_environ: ?RawEnviron = null;
+// Set when another program owns the process environment and may change it,
+// as Node.js does for the N-API addon: the environment is read from libc at
+// each use and no pointer to it is kept.
+var global_libc_environ: bool = false;
 
 pub fn setIo(zio: std.Io) void {
     real_io = process_io_for(builtin.target.os.tag, zio);
@@ -398,25 +402,54 @@ pub fn setEnvironMap(m: *const std.process.Environ.Map) void {
     global_environ = m;
     global_environ_block = null;
     global_raw_environ = null;
+    global_libc_environ = false;
 }
 
 pub fn setEnvironBlock(block: std.process.Environ.Block) void {
     global_environ = null;
     global_environ_block = block;
     global_raw_environ = null;
+    global_libc_environ = false;
 }
 
+/// Installs the environment `main` received. libc never frees that array,
+/// so it stays readable even after the process changes its environment.
 pub fn setRawEnviron(raw: RawEnviron) void {
     global_environ = null;
     global_environ_block = null;
     global_raw_environ = raw;
+    global_libc_environ = false;
+}
+
+/// Reads the environment from libc at each use, for a library loaded into a
+/// process whose host can change the environment at any time. Growing the
+/// environment lets libc move its array and free the old one, so no pointer
+/// to it is kept between uses.
+pub fn setLibcEnviron() void {
+    global_environ = null;
+    global_environ_block = null;
+    global_raw_environ = null;
+    global_libc_environ = true;
 }
 
 pub fn getenv(key: []const u8) ?[]const u8 {
     if (global_environ) |m| return m.get(key);
     if (global_environ_block) |block| return getenvFromBlock(block, key);
     if (global_raw_environ) |raw| return getenvFromLibc(key) orelse getenvFromRaw(raw, key);
+    if (global_libc_environ) {
+        if (getenvFromLibc(key)) |value| return value;
+        // getenvFromLibc copies the key into a 128-byte buffer.
+        if (key.len < 128) return null;
+        return getenvFromRaw(liveLibcEnviron() orelse return null, key);
+    }
     return null;
+}
+
+/// The environment array libc holds now, valid only until the process next
+/// changes its environment.
+fn liveLibcEnviron() ?RawEnviron {
+    if (comptime !builtin.link_libc) return null;
+    return @ptrCast(std.c.environ);
 }
 
 /// The home directory fx keeps its own files under: `HOME` when it is an
@@ -450,17 +483,21 @@ pub fn cloneEnvironMap(
     if (global_environ_block) |block| {
         return std.process.Environ.createMap(.{ .block = block }, alloc);
     }
-    if (global_raw_environ) |raw| {
-        var len: usize = 0;
-        while (raw[len] != null) : (len += 1) {}
-        const entries: []const [*:0]const u8 = @ptrCast(raw[0..len]);
-        var map = std.process.Environ.Map.init(alloc);
-        errdefer map.deinit();
-        try map.putPosixBlock(.{ .slice = entries });
-        return map;
-    }
+    if (global_raw_environ) |raw| return mapFromRaw(alloc, raw);
+    if (global_libc_environ) return mapFromRaw(alloc, liveLibcEnviron() orelse return error.EnvironmentUnavailable);
     if (comptime builtin.is_test) return std.process.Environ.createMap(std.testing.environ, alloc);
     return error.EnvironmentUnavailable;
+}
+
+/// A copy of `raw`, owned by the caller.
+fn mapFromRaw(alloc: std.mem.Allocator, raw: RawEnviron) CloneEnvironMapError!std.process.Environ.Map {
+    var len: usize = 0;
+    while (raw[len] != null) : (len += 1) {}
+    const entries: []const [*:0]const u8 = @ptrCast(raw[0..len]);
+    var map = std.process.Environ.Map.init(alloc);
+    errdefer map.deinit();
+    try map.putPosixBlock(.{ .slice = entries });
+    return map;
 }
 
 fn getenvFromBlock(block: std.process.Environ.Block, key: []const u8) ?[]const u8 {
@@ -698,6 +735,24 @@ pub fn openVerifiedPrivateDirIfPresent(parent: *VerifiedDir, name: []const u8) !
     };
     errdefer dir.close(getIo());
     try verifyPrivateDirectory(dir);
+    return .{ .dir = dir };
+}
+
+/// Opens an existing folder that need not be private: a real folder, never
+/// through a symlink, whatever its mode, as an old release left a profile's
+/// folders readable by others. Null when it is missing.
+pub fn openRealDirIfPresent(parent: *VerifiedDir, name: []const u8) !?VerifiedDir {
+    try validateRelativeLeaf(name);
+    var dir = parent.dir.openDir(getIo(), name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
+        else => return err,
+    };
+    errdefer dir.close(getIo());
+    if ((try dir.stat(getIo())).kind != .directory) return error.DurablePathUnsafe;
     return .{ .dir = dir };
 }
 
@@ -1255,6 +1310,46 @@ test "cloneEnvironMap copies installed raw environment state" {
     try std.testing.expectEqualStrings("/raw/home", cloned.get("HOME").?);
 }
 
+test "libc environment lookups follow a host that grows the environment" {
+    if (comptime !builtin.link_libc) return error.SkipZigTest;
+    const libc = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const previous_map = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    const previous_libc = global_libc_environ;
+    defer {
+        global_environ = previous_map;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+        global_libc_environ = previous_libc;
+    }
+    setLibcEnviron();
+
+    const count = 200;
+    var names: [count][32:0]u8 = undefined;
+    var set: usize = 0;
+    defer for (names[0..set]) |*name| {
+        _ = libc.unsetenv(name);
+    };
+    // Enough new names that libc moves its array, as a host's writes do.
+    while (set < count) : (set += 1) {
+        const written = try std.mem.print(names[set][0..31], "FX_IO_LIVE_ENV_{d}", .{set});
+        names[set][written.len] = 0;
+        try std.testing.expectEqual(@as(c_int, 0), libc.setenv(&names[set], "live", 1));
+    }
+
+    try std.testing.expectEqualStrings("live", getenv("FX_IO_LIVE_ENV_0").?);
+    try std.testing.expectEqualStrings("live", getenv("FX_IO_LIVE_ENV_199").?);
+    try std.testing.expect(getenv("FX_IO_LIVE_ENV_MISSING") == null);
+
+    var cloned = try cloneEnvironMap(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqualStrings("live", cloned.get("FX_IO_LIVE_ENV_150").?);
+}
+
 test "readFileToEnd: file under cap returns full content" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1626,6 +1721,27 @@ test "caller-owned directory rejects unsafe private children" {
         error.DurablePathUnsafe,
         openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "link"),
     );
+}
+
+test "a folder that need not be private opens whatever its mode, but never through a symlink" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var parent: VerifiedDir = .{ .dir = try tmp.dir.openDir(getIo(), ".", .{ .iterate = true, .follow_symlinks = false }) };
+    defer parent.close();
+
+    try tmp.dir.createDir(getIo(), "readable", .fromMode(0o755));
+    try tmp.dir.setFilePermissions(getIo(), "readable", .fromMode(0o755), .{});
+    var readable = (try openRealDirIfPresent(&parent, "readable")).?;
+    readable.close();
+    try std.testing.expect((try openRealDirIfPresent(&parent, "missing")) == null);
+
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "file", .data = "not a directory" });
+    try std.testing.expectError(error.DurablePathUnsafe, openRealDirIfPresent(&parent, "file"));
+    tmp.dir.symLink(getIo(), "readable", "link", .{ .is_directory = true }) catch |err| {
+        if (err == error.AccessDenied) return error.SkipZigTest;
+        return err;
+    };
+    try std.testing.expectError(error.DurablePathUnsafe, openRealDirIfPresent(&parent, "link"));
 }
 
 test "timed advisory lock returns busy after deadline" {

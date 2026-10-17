@@ -14,6 +14,7 @@ const scripts = [
   "test-native-core-exit-code.mjs",
   "test-native-core.mjs",
   "test-native-core-config-isolation.mjs",
+  "test-native-core-env-growth.mjs",
   "test-agent-request-context.mjs",
   "test-agent-transport-retry.mjs",
   "test-agent-codex.mjs",

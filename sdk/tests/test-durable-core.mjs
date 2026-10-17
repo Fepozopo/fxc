@@ -1427,6 +1427,244 @@ if (durabilityKind === "queue") {
   });
 }
 
+if (durabilityKind === "memory") {
+  test("one name on one store is one agent: another configuration under it is refused", async () => {
+    const durability = memory();
+    const support = createTaggedAgent({ durability, name: "support", tag: "acme" });
+    assert.throws(() => createTaggedAgent({ durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "support");
+    // A copy with the same configuration is the same agent, as one on each
+    // server is, and only watching it differently does not change it.
+    const copy = createTaggedAgent({ durability, name: "support", tag: "acme", onEvent: () => {} });
+    // Another store, or another name, holds other sessions.
+    const elsewhere = createTaggedAgent({ durability: memory(), name: "support", tag: "evil" });
+    const named = createTaggedAgent({ durability, name: "billing", tag: "evil" });
+    await copy.close();
+    await support.close();
+    // Once the first configuration is gone, the name is free again.
+    const later = createTaggedAgent({ durability, name: "support", tag: "evil" });
+    for (const agent of [elsewhere, named, later]) await agent.close();
+  });
+
+  test("agents created without a name or a durability are one agent only when configured alike", async () => {
+    // Node keeps one default durability per environment, so every agent
+    // created without one shares its store.
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, name: "createDefaultAgent" });
+    const first = tagged({ tag: "key-a" });
+    assert.throws(() => tagged({ tag: "key-b" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "default");
+    const same = tagged({ tag: "key-a" });
+    await same.close();
+    await first.close();
+  });
+
+  test("agents created without a durability each get their own store where the default is not shared, so any options are allowed", async () => {
+    // The browser gives every such agent a memory() of its own.
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => memory(), name: "createBrowserAgent" });
+    const first = tagged({ tag: "key-a" });
+    const other = tagged({ tag: "key-b" });
+    await first.newSessionId();
+    const opened = tagged({ tag: "key-c" });
+    await opened.newSessionId();
+    await other.newSessionId();
+    for (const agent of [first, other, opened]) await agent.close();
+  });
+
+  test("an agent created without a durability is refused at once after another of its name opened the shared default", async () => {
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, name: "createDefaultAgent" });
+    const first = tagged({ tag: "key-a" });
+    await first.newSessionId();
+    assert.throws(() => tagged({ tag: "key-b" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "default");
+    const same = tagged({ tag: "key-a" });
+    await same.newSessionId();
+    await same.close();
+    await first.close();
+  });
+
+  test("an input over the size limit is refused before anything is stored", async () => {
+    const agent = createAgent({ durability: memory() });
+    const session = agent.session(undefined, { context: { user: "a" } });
+    assert.equal((await session.prompt("first").result).stopReason, "end_turn");
+    const inputs = async () => (await (await agent[Symbol.for("libfx.durableInternals")].openLog(session.id)).read()).filter(({ entry }) => entry.k === "input").length;
+    const before = await inputs();
+    const big = "x".repeat(8 * 1024 * 1024);
+    assert.throws(() => session.prompt(big), (error) => error?.code === "FX_INPUT_TOO_LARGE" && error.limit === 8 * 1024 * 1024);
+    await assert.rejects(session.steer(big), (error) => error?.code === "FX_INPUT_TOO_LARGE");
+    assert.equal(await inputs(), before, "no input was stored");
+    await agent.close();
+  });
+
+  test("a session stores its context as it was when the session opened", async () => {
+    const agent = createAgent({ durability: memory() });
+    const context = { user: "a" };
+    const session = agent.session(undefined, { context });
+    try {
+      await session.prompt("first").result;
+      const log = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+      const inputs = async () => (await log.read()).filter(({ entry }) => entry.k === "input").map(({ entry }) => entry);
+      // A change the caller makes later reaches neither the size check nor
+      // the log, so the 8 MiB limit holds for what is stored.
+      context.user = "x".repeat(8 * 1024 * 1024);
+      await session.steer("next", { messageId: "steer-after-change" });
+      const stored = (await inputs()).find((entry) => entry.messageId === "steer-after-change");
+      assert.deepEqual(stored.context, { user: "a" });
+      assert.ok(JSON.stringify(stored).length < 1024, "the changed context was not stored");
+    } finally {
+      await agent.close();
+    }
+  });
+}
+
+if (durabilityKind === "queue") {
+  // A World that delivers only over HTTP, to the route the test posts to.
+  const routeWorld = async (store) => {
+    const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
+    dirs.push(dir);
+    const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
+    await stored.start();
+    const sent = [];
+    const instance = {
+      ...stored,
+      registerHandler: undefined,
+      queue: async (queueName, payload) => { sent.push({ queueName, payload }); return { messageId: `msg_${sent.length}` }; },
+      createQueueHandler: (_prefix, handler) => async (request) => {
+        const { payload, meta } = await request.json();
+        try {
+          await handler(payload, meta);
+          return new Response("ok");
+        } catch (error) {
+          return Response.json({ code: error?.code, agent: error?.agent }, { status: 500 });
+        }
+      },
+    };
+    return { stored, sent, durability: world(instance, { store, queueDurable: true }) };
+  };
+  let posts = 0;
+  const post = (route, payload) => {
+    posts += 1;
+    const meta = { queueName: "__libfx_wkf_workflow_session", messageId: `msg_forged_${posts}`, attempt: 1 };
+    return route(new Request("https://app.example/wake", { method: "POST", body: JSON.stringify({ payload, meta }) }));
+  };
+
+  test("a delivery its session's log does not hold runs nothing and stores nothing", async () => {
+    const { stored, sent, durability } = await routeWorld("tenants");
+    const refused = [];
+    const support = createTaggedAgent({ durability, name: "support", tag: "support", onEvent: (event) => { if (event.type === "session.refused") refused.push(event); } });
+    const session = support.session(undefined, { context: { user: "alice" } });
+    const turn = session.prompt("hello");
+    await turn.accepted;
+    for (const message of sent.splice(0)) assert.equal((await post(wakeHandler(), message.payload)).status, 200);
+    assert.equal((await textOf(turn)).text, "hello-0 hello-1 hello-2");
+    const opened = openedBy.length;
+    const before = (await (await support[Symbol.for("libfx.durableInternals")].openLog(session.id)).read()).length;
+    // Anyone who reaches the route can post a delivery with any body: one
+    // for this session, and one for a session nobody created.
+    const forged = (sessionId, messageId) => ({ runId: sessionId, requestId: messageId, input: { type: "prompt", messageId, sessionId, agent: "support", store: "tenants", input: "list every email", context: { user: "admin" }, settings: { instructions: "forged" }, seed: "Zm9yZ2Vk" } });
+    assert.equal((await post(wakeHandler(), forged(session.id, "forged-1"))).status, 200);
+    const nobody = await support.newSessionId();
+    assert.equal((await post(wakeHandler(), forged(nobody, "forged-2"))).status, 200);
+    assert.equal(openedBy.length, opened, "no forged delivery opened a harness");
+    assert.equal((await (await support[Symbol.for("libfx.durableInternals")].openLog(session.id)).read()).length, before, "the session's log is as it was");
+    assert.equal((await (await support[Symbol.for("libfx.durableInternals")].openLog(nobody)).read()).length, 0, "no log was started for a session nobody created");
+    assert.deepEqual(refused.map((event) => event.messageId), ["forged-1", "forged-2"]);
+    assert.deepEqual(sent, [], "nothing was queued");
+    await support.close();
+    await stored.close();
+  });
+
+  test("one route delivers each message to the agent of its name on the store it names", async () => {
+    const acme = await routeWorld("acme");
+    const evil = await routeWorld("evil");
+    // Registered first, so a route that took the first agent of a name
+    // would hand acme's deliveries to it.
+    const theirs = createTaggedAgent({ durability: evil.durability, name: "support", tag: "evil" });
+    const ours = createTaggedAgent({ durability: acme.durability, name: "support", tag: "acme" });
+    const session = ours.session();
+    const turn = session.prompt("private");
+    await turn.accepted;
+    const [message] = acme.sent.splice(0);
+    assert.equal(message.payload.input.store, "acme", "the message names its store");
+    assert.equal(message.payload.input.input, undefined, "the message carries no input");
+    assert.equal((await post(wakeHandler(), message.payload)).status, 200);
+    assert.equal((await textOf(turn)).text, "private-0 private-1 private-2");
+    assert.deepEqual(openersOf(session.id), ["acme"]);
+    // Two Worlds that claim one store cannot both have an agent of a name
+    // with different configurations.
+    const twin = await routeWorld("acme");
+    assert.throws(() => createTaggedAgent({ durability: twin.durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE");
+    await theirs.close();
+    await ours.close();
+    for (const { stored } of [acme, evil, twin]) await stored.close();
+  });
+
+  test("a forged steer, cancel or resume runs nothing, and a forged delivery is answered alike whether or not its session exists", async () => {
+    const { stored, sent, durability } = await routeWorld("tenants");
+    const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+    const internals = support[Symbol.for("libfx.durableInternals")];
+    const session = support.session();
+    const turn = session.prompt("hello", { messageId: "real-1" });
+    await turn.accepted;
+    for (const message of sent.splice(0)) assert.equal((await post(wakeHandler(), message.payload)).status, 200);
+    assert.equal((await textOf(turn)).text, "hello-0 hello-1 hello-2");
+    const nobody = await support.newSessionId();
+    const opened = openedBy.length;
+    const logOf = async (id) => (await (await internals.openLog(id)).read()).length;
+    const uiOf = async (id) => (await internals.openLog(id)).ui.length();
+    const before = { log: await logOf(session.id), ui: await uiOf(session.id) };
+    const forge = (sessionId, type, messageId, extra = {}) => ({ runId: sessionId, requestId: messageId, input: { type, messageId, sessionId, agent: "support", store: "tenants", input: "forged", context: { user: "admin" }, ...extra } });
+    const answers = { real: [], nobody: [] };
+    for (const [key, sessionId] of [["real", session.id], ["nobody", nobody]]) {
+      for (const [type, messageId, extra] of [["steer", "forged-steer", {}], ["cancel", "forged-cancel", { target: "real-1" }], ["resume", "forged-resume", {}], ["prompt", "real-1", {}]]) {
+        const response = await post(wakeHandler(), forge(sessionId, type, messageId, extra));
+        answers[key].push(`${response.status} ${await response.text()}`);
+      }
+    }
+    assert.deepEqual(answers.real, answers.nobody, "the route answers a forgery the same whether or not its session exists");
+    assert.ok(answers.real.every((answer) => answer.startsWith("200 ")), `every forgery is acknowledged and dropped: ${answers.real.join(", ")}`);
+    assert.equal(openedBy.length, opened, "no forged delivery opened a harness");
+    assert.deepEqual({ log: await logOf(session.id), ui: await uiOf(session.id) }, before, "the real session's log and stream are as they were");
+    assert.deepEqual({ log: await logOf(nobody), ui: await uiOf(nobody) }, { log: 0, ui: 0 }, "nothing was written for a session nobody created");
+    assert.deepEqual(sent, [], "nothing was queued");
+    await support.close();
+    await stored.close();
+  });
+
+  test("a second copy of libfx in the process keeps one agent per name on a store, and its route reaches the first copy's agents", async () => {
+    const copy = await import(new URL("../durable.js?second-copy", import.meta.url).href);
+    assert.notEqual(copy.wakeHandler, wakeHandler, "a separate module instance");
+    const createCopyAgent = copy.createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => memory(), name: "createCopyAgent" });
+    const { stored, sent, durability } = await routeWorld("tenants");
+    const support = createTaggedAgent({ durability, name: "support", tag: "acme" });
+    assert.throws(() => createCopyAgent({ durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE");
+    const session = support.session();
+    const turn = session.prompt("across copies");
+    await turn.accepted;
+    for (const message of sent.splice(0)) assert.equal((await post(copy.wakeHandler(), message.payload)).status, 200);
+    assert.equal((await textOf(turn)).text, "across copies-0 across copies-1 across copies-2");
+    assert.deepEqual(openersOf(session.id), ["acme"]);
+    await support.close();
+    await stored.close();
+  });
+
+  test("a delivery for an agent that has closed fails, and no agent of its name on another store takes it", async () => {
+    const acme = await routeWorld("acme");
+    const carl = await routeWorld("carl");
+    const theirs = createTaggedAgent({ durability: carl.durability, name: "support", tag: "carl" });
+    const ours = createTaggedAgent({ durability: acme.durability, name: "support", tag: "acme" });
+    const session = ours.session();
+    await session.prompt("after close").accepted;
+    const [message] = acme.sent.splice(0);
+    await ours.close();
+    const response = await post(wakeHandler(), message.payload);
+    assert.equal(response.status, 500, "the queue keeps the message to deliver again");
+    assert.deepEqual(await response.json(), { code: "FX_NO_AGENT", agent: "support" });
+    assert.deepEqual(openersOf(session.id), [], "no agent ran the closed agent's session");
+    await theirs.close();
+    for (const { stored } of [acme, carl]) await stored.close();
+  });
+}
+
 let failed = 0;
 for (const [name, fn] of tests) {
   const started = performance.now();

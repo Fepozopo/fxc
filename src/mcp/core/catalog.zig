@@ -7,6 +7,8 @@
 //! invalidated since its listing started and, on a modern server, if
 //! every page had a positive TTL; the shortest one sets its expiry. A legacy
 //! list stays fresh until an invalidation or a new process.
+//!
+//! TLA+ model: `tests/tla/mcp/Catalog.tla`.
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

@@ -941,7 +941,7 @@ test "crc32c equals std's byte-at-a-time CRC32C at every length and alignment" {
 }
 
 const log_model_tests = struct {
-    //! L1 against `tla/SessionLog.tla`: random schedules of appends, syncs,
+    //! L1 against `tests/tla/session_manager/SessionLog.tla`: random schedules of appends, syncs,
     //! process crashes (including in the middle of a write), machine crashes and
     //! recoveries. After every step the four spec invariants are checked on the
     //! real file, and selected runs write a trace for TLC (`zig build traces`).

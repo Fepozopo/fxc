@@ -2,6 +2,8 @@
 //! tools/call. The host keeps the strings, the requestState and the input
 //! requests; this core only decides.
 //! A requestState is named by the round whose answer brought it.
+//!
+//! TLA+ model: `tests/tla/mcp/Mrtr.tla`.
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

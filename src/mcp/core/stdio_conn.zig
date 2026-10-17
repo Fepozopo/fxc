@@ -6,6 +6,8 @@
 //! Every process gets a new generation. Lines, timers, and exits carry the
 //! generation they belong to, so anything from an earlier process is dropped
 //! (NoStaleDelivery, SignalsOnTime, NoEarlyRestart).
+//!
+//! TLA+ model: `tests/tla/mcp/StdioConn.tla`.
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

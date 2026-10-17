@@ -220,6 +220,7 @@ const PendingLegacyUrl = struct {
 };
 
 pub const ActiveSessionState = struct {
+    observer_hooks: ?@import("libfx_hooks.zig").Config = null,
     session_id: []u8,
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
@@ -877,7 +878,7 @@ fn resolveSubagentAuthority(
 }
 
 /// Joins the child threads before the session they append to can close
-/// (`tla/Wiring.tla` ParentOutlivesChildren).
+/// (`tests/tla/session_manager/Wiring.tla` ParentOutlivesChildren).
 pub fn disableSubagentHost(state: *ServerState) void {
     if (state.subagent_host) |host| {
         host.deinit();
@@ -3185,6 +3186,9 @@ fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messa
     try state.writer.writeResponse(alloc, msg.id, "{}");
 }
 
+/// Handles `session/set_config_option`. The `mode` option is modeled in
+/// `tests/tla/acp/AcpPermissionModes.tla`, and `fast` and `ultrafast` in
+/// `tests/tla/acp/AcpSpeed.tla`.
 fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
@@ -3927,6 +3931,8 @@ fn commitActiveSessionUltrafast(
     session.ultrafast_mode = ultrafast;
 }
 
+/// Handles the older `session/set_mode`, modeled with the `mode` option in
+/// `tests/tla/acp/AcpPermissionModes.tla`.
 fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,

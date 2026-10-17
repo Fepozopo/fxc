@@ -9,6 +9,8 @@
 //! duplicate messages for it are recognized and ignored. Responses without an
 //! id can't be correlated; the I/O layer logs them and the request still
 //! ends through its timeout.
+//!
+//! TLA+ model: `tests/tla/mcp/Request.tla`.
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

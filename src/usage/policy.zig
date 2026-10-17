@@ -1,6 +1,6 @@
 //! When `/usage` fetches, and what one fetch asks for. Pure; mirrors
 //! `FloorClear`, `Open`, `Manual`, `Timer` and `StartFetch` in the
-//! LeanUsage TLA+ model.
+//! LeanUsage TLA+ model (`tests/tla/usage/LeanUsage.tla`).
 
 const std = @import("std");
 const report = @import("report.zig");

@@ -868,6 +868,7 @@ pub fn Runtime(comptime App: type) type {
                 skillsMenuActive(app) or
                 modelMenuActive(app) or
                 sessionMenuActive(app) or
+                forkMenuActive(app) or
                 mcpMenuActive(app) or
                 mcpHostMenuActive(app) or
                 helpMenuActive(app);
@@ -1579,6 +1580,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitSlashPickerSelection(app)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app)) return;
+                        if (try submitForkMenuSelection(app, max_input_len)) return;
                     }
                     if (try completion_rt.submitFilePickerOnEnter(app, max_input_len)) |result| {
                         if (result == .limit_exceeded) {
@@ -1841,6 +1843,30 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Forks before the selected prompt and puts its text in the composer.
+        fn submitForkMenuSelection(app: *App, max_input_len: usize) !bool {
+            if (comptime !@hasDecl(App, "forkBeforeSelectedPrompt")) return false;
+            if (!forkMenuActive(app)) return false;
+            const prompt = app.forkBeforeSelectedPrompt() catch |err| {
+                debug_trace.logf("session", "fork failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .@"error",
+                    .body = "Unable to fork the session.",
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
+            defer app.alloc.free(prompt);
+            if (prompt.len > max_input_len) {
+                debug_trace.logf("input", "fork prompt not restored bytes={d} reason=input_limit", .{prompt.len});
+                return true;
+            }
+            try app.input_runtime.textReplacementState().replace(app.alloc, prompt);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn dismissAuthPickerForComposerEdit(app: *App) bool {
             if (comptime !@hasField(App, "auth")) return false;
             if (!app.auth.pickerView().active) return false;
@@ -1882,6 +1908,11 @@ pub fn Runtime(comptime App: type) type {
         fn sessionMenuActive(app: *App) bool {
             if (comptime !@hasField(App, "session_persistence")) return false;
             return app.session_persistence.session_picker.active;
+        }
+
+        fn forkMenuActive(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            return app.session_persistence.fork_menu.active();
         }
 
         fn helpMenuActive(app: *App) bool {
@@ -2454,7 +2485,7 @@ pub fn Runtime(comptime App: type) type {
         /// borrowing a composer they are already using.
         fn modelPickerShortcutBlocked(app: *App) bool {
             if (settingsMenuActive(app) or helpMenuActive(app) or
-                skillsMenuActive(app) or sessionMenuActive(app) or mcpMenuActive(app) or mcpHostMenuActive(app)) return true;
+                skillsMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or mcpMenuActive(app) or mcpHostMenuActive(app)) return true;
             if (comptime @hasField(App, "auth")) {
                 if (app.auth.pickerView().active) return true;
             }
@@ -2472,7 +2503,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App) bool {
-            return dismissAuthPickerForComposerEdit(app);
+            // The fork menu reads no query from the composer, so an edit closes it.
+            const fork_menu_closed = cancelForkMenu(app);
+            return dismissAuthPickerForComposerEdit(app) or fork_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App) void {
@@ -3174,7 +3207,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -3221,7 +3254,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -3348,6 +3381,13 @@ pub fn Runtime(comptime App: type) type {
             app_session_runtime.Runtime(App).cancelSessionPickerToComposer(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            return true;
+        }
+
+        fn cancelForkMenu(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            if (!forkMenuActive(app)) return false;
+            app.session_persistence.fork_menu.close(app.alloc);
             return true;
         }
     };

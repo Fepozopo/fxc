@@ -48,6 +48,9 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "app_version", app_version);
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     build_options.addOption(WasmSurface, "wasm_surface", .none);
+    // Whether this is a libfx artifact, which leaves out what only the fx
+    // binary uses, such as its E2E test controls.
+    build_options.addOption(bool, "libfx", false);
 
     const exe = b.addExecutable(.{
         .name = "fx",
@@ -328,6 +331,7 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "app_version", app_version);
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
+    wasm_options.addOption(bool, "libfx", true);
 
     const wasm_root = switch (surface) {
         .core => "src/wasm_core_main.zig",
@@ -373,6 +377,7 @@ fn addNapiArtifact(
     napi_options.addOption([]const u8, "app_version", app_version);
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     napi_options.addOption(NapiSurface, "napi_surface", surface);
+    napi_options.addOption(bool, "libfx", true);
 
     const root = switch (surface) {
         .core => "src/napi_core_main.zig",

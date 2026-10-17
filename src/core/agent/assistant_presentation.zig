@@ -798,7 +798,7 @@ test "markdown images preserve code isolation, chunk buffering, and heading unde
 
     try processor.push(alloc, "`![literal](https://example.com/literal.png)`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245m![literal](https://example.com/literal.png)\x1b[39m\n",
+        "\x1b[38;5;255m![literal](https://example.com/literal.png)\x1b[39m\n",
         out.items,
     );
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
@@ -960,7 +960,7 @@ test "rejected angle candidates suppress nested link emission" {
         "<https://escaped.example>\n" ++
         "<a:x> <dev@bad-.example> <https://has space>\n" ++
         "<not-an-autolink https://unterminated.example\n" ++
-        "\x1b[38;5;245m<https://code.example>\x1b[39m\n";
+        "\x1b[38;5;255m<https://code.example>\x1b[39m\n";
 
     try processor.push(alloc, input, &out);
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1002,7 +1002,7 @@ test "standalone URL in code is linked while excluded boundaries stay literal" {
     var expected_buf: [512]u8 = undefined;
     const expected = try std.mem.print(
         &expected_buf,
-        "\x1b[38;5;245m\x1b]8;id=fx-{d};https://code.example\x1b\\https://code.example\x1b]8;;\x1b\\\x1b[39m wordhttps://word.example <<https://angle.example>>\n",
+        "\x1b[38;5;255m\x1b]8;id=fx-{d};https://code.example\x1b\\https://code.example\x1b]8;;\x1b\\\x1b[39m wordhttps://word.example <<https://angle.example>>\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1020,8 +1020,8 @@ test "inline code URLs keep literal bytes and trailing punctuation outside links
     var expected_buf: [1024]u8 = undefined;
     const expected = try std.mem.print(
         &expected_buf,
-        "See \x1b[38;5;245m\x1b]8;id=fx-{d};https://example.com/path_~*\x1b\\https://example.com/path_~*\x1b]8;;\x1b\\.\x1b[39m and " ++
-            "\x1b[38;5;245m\x1b]8;id=fx-{d};https://example.com/a\\_b\x1b\\https://example.com/a\\_b\x1b]8;;\x1b\\\x1b[39m.\n",
+        "See \x1b[38;5;255m\x1b]8;id=fx-{d};https://example.com/path_~*\x1b\\https://example.com/path_~*\x1b]8;;\x1b\\.\x1b[39m and " ++
+            "\x1b[38;5;255m\x1b]8;id=fx-{d};https://example.com/a\\_b\x1b\\https://example.com/a\\_b\x1b]8;;\x1b\\\x1b[39m.\n",
         .{ id_before, id_before +% 1 },
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1048,7 +1048,7 @@ test "inline code URLs preserve literal trailing URI punctuation" {
         var expected_buf: [256]u8 = undefined;
         const expected = try std.mem.print(
             &expected_buf,
-            "Open \x1b[38;5;245m\x1b]8;id=fx-{d};{s}\x1b\\{s}\x1b]8;;\x1b\\\x1b[39m\n",
+            "Open \x1b[38;5;255m\x1b]8;id=fx-{d};{s}\x1b\\{s}\x1b]8;;\x1b\\\x1b[39m\n",
             .{ id_before, url, url },
         );
         try std.testing.expectEqualStrings(expected, out.items);
@@ -1257,7 +1257,7 @@ test "backslash escapes survive heading preprocessing and code spans" {
 
     try processor.push(alloc, "## \\*\\*literal bold\\*\\* and `\\*code\\*`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[1m**literal bold** and \x1b[38;5;245m\\*code\\*\x1b[39m\x1b[22m\n",
+        "\x1b[1m**literal bold** and \x1b[38;5;255m\\*code\\*\x1b[39m\x1b[22m\n",
         out.items,
     );
 }
@@ -1565,7 +1565,7 @@ test "underscore emphasis preserves code literals and keeps unpaired markers lit
     try std.testing.expectEqualStrings(
         "_unclosed\n" ++
             "__unclosed\n" ++
-            "\x1b[38;5;245m_literal_ __literal__\x1b[39m\n",
+            "\x1b[38;5;255m_literal_ __literal__\x1b[39m\n",
         out.items,
     );
 }
@@ -1640,7 +1640,7 @@ test "double backtick code span keeps inner backticks and trims one padding spac
 
     try processor.push(alloc, "use `` a ` b `` and ``x`` here\n", &out);
     try std.testing.expectEqualStrings(
-        "use \x1b[38;5;245ma ` b\x1b[39m and \x1b[38;5;245mx\x1b[39m here\n",
+        "use \x1b[38;5;255ma ` b\x1b[39m and \x1b[38;5;255mx\x1b[39m here\n",
         out.items,
     );
 }
@@ -1654,7 +1654,7 @@ test "code span closes only on a backtick run of the same length" {
 
     try processor.push(alloc, "`a``b` and ``` lonely **bold**\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245ma``b\x1b[39m and ``` lonely \x1b[1mbold\x1b[22m\n",
+        "\x1b[38;5;255ma``b\x1b[39m and ``` lonely \x1b[1mbold\x1b[22m\n",
         out.items,
     );
 }
@@ -1703,7 +1703,7 @@ test "code span content is not entity decoded but prose is" {
 
     try processor.push(alloc, "a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x2192; `&amp;` &unknown; &amp\n", &out);
     try std.testing.expectEqualStrings(
-        "a & b <c> \"d\" 'e' \xe2\x86\x92 \x1b[38;5;245m&amp;\x1b[39m &unknown; &amp\n",
+        "a & b <c> \"d\" 'e' \xe2\x86\x92 \x1b[38;5;255m&amp;\x1b[39m &unknown; &amp\n",
         out.items,
     );
 }
@@ -1717,7 +1717,7 @@ test "heading strips emphasis markers around a multi backtick code span" {
 
     try processor.push(alloc, "## Run ``**raw**`` now\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[1mRun \x1b[38;5;245m**raw**\x1b[39m now\x1b[22m\n",
+        "\x1b[1mRun \x1b[38;5;255m**raw**\x1b[39m now\x1b[22m\n",
         out.items,
     );
 }
@@ -1730,7 +1730,7 @@ test "inline code backticks wrap with ANSI" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "run `zig build` now\n", &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;245mzig build\x1b[39m now\n", out.items);
+    try std.testing.expectEqualStrings("run \x1b[38;5;255mzig build\x1b[39m now\n", out.items);
 }
 
 test "inline code uses the selected light background" {
@@ -1744,7 +1744,7 @@ test "inline code uses the selected light background" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "run `zig build` now\n", &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;247mzig build\x1b[39m now\n", out.items);
+    try std.testing.expectEqualStrings("run \x1b[38;5;235mzig build\x1b[39m now\n", out.items);
 }
 
 test "stray asterisk between spaces stays literal" {
@@ -3290,7 +3290,7 @@ test "line intake buffers partial lines and preserves standalone carriage return
     try processor.push(alloc, "run `zig", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
     try processor.push(alloc, " build` now\n", &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;245mzig build\x1b[39m now\n", out.items);
+    try std.testing.expectEqualStrings("run \x1b[38;5;255mzig build\x1b[39m now\n", out.items);
 
     out.clearRetainingCapacity();
     try processor.push(alloc, "left\rright\n", &out);
@@ -3359,8 +3359,8 @@ test "emphasis pairs by the delimiter stack and unmatched runs stay literal" {
             "\x1b[1mbold\x1b[22m then **open\n" ++
             "\x1b[9mgone\x1b[29m and ~~stays\n" ++
             "a ` b \x1b[1mbold\x1b[22m\n" ++
-            "\x1b[1mbold with \x1b[38;5;245mcode\x1b[39m inside\x1b[22m \x1b[3mit\x1b[23m\n" ++
-            "\x1b[3m\x1b[1mboth\x1b[22m\x1b[23m and \x1b[1m\x1b[38;5;245mcode\x1b[39m\x1b[22m\n" ++
+            "\x1b[1mbold with \x1b[38;5;255mcode\x1b[39m inside\x1b[22m \x1b[3mit\x1b[23m\n" ++
+            "\x1b[3m\x1b[1mboth\x1b[22m\x1b[23m and \x1b[1m\x1b[38;5;255mcode\x1b[39m\x1b[22m\n" ++
             "See \x1b[3mitalic\x1b[23m* plain\n" ++
             "text **** here \x1b[1mbold\x1b[22m and ~~~~ then \x1b[9mgone\x1b[29m and *** end\n" ++
             "\x1b[1ma \x1b[1mb\x1b[22m\x1b[1m c\x1b[22m and \x1b[3mx \x1b[3my\x1b[23m\x1b[3m z\x1b[23m\n" ++
@@ -3379,20 +3379,20 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
     // A backtick inside link text is not a code opener and a star inside a
     // code span is not a closer.
     try processor.push(alloc, "[use `](https://example.com) **bold** `code`\n[use `](https://example.com) *open `code*`\n", &out);
-    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 0).?, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m"));
-    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 1).?, " *open \x1b[38;5;245mcode*\x1b[39m"));
+    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 0).?, " \x1b[1mbold\x1b[22m \x1b[38;5;255mcode\x1b[39m"));
+    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 1).?, " *open \x1b[38;5;255mcode*\x1b[39m"));
 
     // Emphasis around a multi backtick code span still pairs.
     out.clearRetainingCapacity();
     try processor.push(alloc, "See _a ``b`c`` d_ end\n", &out);
-    try std.testing.expectEqualStrings("See \x1b[3ma \x1b[38;5;245mb`c\x1b[39m d\x1b[23m end\n", out.items);
+    try std.testing.expectEqualStrings("See \x1b[3ma \x1b[38;5;255mb`c\x1b[39m d\x1b[23m end\n", out.items);
 
     // URL punctuation is never read as markup, and a delimiter that ends a
     // URL still closes the span around it.
     out.clearRetainingCapacity();
     try processor.push(alloc, "https://example.com/`x*y` **bold** `code`\n", &out);
     try std.testing.expect(std.mem.find(u8, out.items, ";https://example.com/`x*y`\x1b\\") != null);
-    try std.testing.expect(std.mem.endsWith(u8, out.items, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m\n"));
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " \x1b[1mbold\x1b[22m \x1b[38;5;255mcode\x1b[39m\n"));
     // A trailing delimiter is trimmed from the URL and closes the span.
     out.clearRetainingCapacity();
     try processor.push(alloc, "*see https://example.com/a* and `code`\n", &out);
@@ -3400,7 +3400,7 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
     try std.testing.expect(std.mem.endsWith(
         u8,
         out.items,
-        ";https://example.com/a\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/a\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m and \x1b[38;5;245mcode\x1b[39m\n",
+        ";https://example.com/a\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/a\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m and \x1b[38;5;255mcode\x1b[39m\n",
     ));
     // Like a GFM autolink, a URL extends to the next whitespace regardless of
     // active styles, so interior punctuation belongs to the URL and the rest
@@ -3409,7 +3409,7 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
     try processor.push(alloc, "*https://example.com/a*`some code` **bold** `x`\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "*\x1b]8;"));
     try std.testing.expect(std.mem.find(u8, out.items, ";https://example.com/a*`some\x1b\\") != null);
-    try std.testing.expect(std.mem.endsWith(u8, out.items, " code\x1b[38;5;245m**bold**\x1b[39mx`\n"));
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " code\x1b[38;5;255m**bold**\x1b[39mx`\n"));
     out.clearRetainingCapacity();
     try processor.push(alloc, "text **** https://example.com\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "text **** \x1b]8;"));
@@ -3513,7 +3513,7 @@ test "header with inline markdown" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "## Using `fx` in CI\n", &out);
-    try std.testing.expectEqualStrings("\x1b[1mUsing \x1b[38;5;245mfx\x1b[39m in CI\x1b[22m\n", out.items);
+    try std.testing.expectEqualStrings("\x1b[1mUsing \x1b[38;5;255mfx\x1b[39m in CI\x1b[22m\n", out.items);
 }
 
 test "inline code ignores bold markers inside" {
@@ -3524,7 +3524,7 @@ test "inline code ignores bold markers inside" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "use `**literal**` here\n", &out);
-    try std.testing.expectEqualStrings("use \x1b[38;5;245m**literal**\x1b[39m here\n", out.items);
+    try std.testing.expectEqualStrings("use \x1b[38;5;255m**literal**\x1b[39m here\n", out.items);
 }
 
 test "pipe table header separator has junction aligned with column pipes" {
@@ -3734,7 +3734,7 @@ test "header keeps italic and code inline" {
 
     try processor.push(alloc, "# *note* about `fx`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[1m\x1b[4m\x1b[3mnote\x1b[23m about \x1b[38;5;245mfx\x1b[39m\x1b[24m\x1b[22m\n",
+        "\x1b[1m\x1b[4m\x1b[3mnote\x1b[23m about \x1b[38;5;255mfx\x1b[39m\x1b[24m\x1b[22m\n",
         out.items,
     );
 }

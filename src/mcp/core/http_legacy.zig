@@ -5,6 +5,8 @@
 //!
 //! The host keeps the strings: the session id and each stream's last event
 //! id. This core only decides what goes out.
+//!
+//! TLA+ model: `tests/tla/mcp/HttpLegacy.tla`.
 
 const std = @import("std");
 const request = @import("request.zig");

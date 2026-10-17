@@ -2,7 +2,7 @@
 //!
 //! Each traced run writes `zig-out/traces/SPEC--CASE.ndjson`: one JSON line
 //! per spec action, named like the action, with one field per spec variable
-//! (`docs/session-manager/tla/trace/README.md`). Fields that model the disk
+//! (`tests/tla/session_manager/trace/README.md`). Fields that model the disk
 //! are read back from the real files after the step; fields that model
 //! memory come from the code's own state.
 //!

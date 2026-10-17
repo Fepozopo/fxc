@@ -247,6 +247,8 @@ jobs:
       - name: Test libfx Wasm integrations
         run: |
           node --experimental-wasm-jspi sdk/tests/test-host-tools.mjs wasm
+          node --experimental-wasm-jspi sdk/tests/test-hooks.mjs wasm
+          env LIBFX_TEST_HOOKS=1 node --experimental-wasm-jspi sdk/tests/test-agent-steering.mjs wasm
           node --experimental-wasm-jspi sdk/tests/test-host-tool-cancel.mjs wasm
           node --experimental-wasm-jspi sdk/tests/test-mcp-adapter.mjs http wasm
           node --experimental-wasm-jspi sdk/tests/test-skills-adapter.mjs host wasm
@@ -254,6 +256,7 @@ jobs:
       - name: Test durable sessions on Wasm
         run: |
           node --experimental-wasm-jspi sdk/tests/test-durable.mjs memory wasm
+          env LIBFX_TEST_HOOKS=1 node --experimental-wasm-jspi sdk/tests/test-durable.mjs memory wasm
           node --experimental-wasm-jspi sdk/tests/test-durable.mjs local wasm
           node --experimental-wasm-jspi sdk/tests/test-durable-provider-crash.mjs wasm
 
@@ -290,6 +293,8 @@ jobs:
         run: |
           node sdk/tests/test-minimal-api.mjs
           node sdk/tests/test-host-tools.mjs native
+          node sdk/tests/test-hooks.mjs native
+          env LIBFX_TEST_HOOKS=1 node sdk/tests/test-agent-steering.mjs native
           node sdk/tests/test-host-tool-cancel.mjs native
           node sdk/tests/test-mcp-adapter.mjs stdio native
           node sdk/tests/test-skills-adapter.mjs disk native
@@ -299,7 +304,9 @@ jobs:
 
       - name: Test durable sessions on N-API
         run: |
+          node sdk/tests/test-vercel-storage.mjs
           node sdk/tests/test-durable.mjs memory native
+          env LIBFX_TEST_HOOKS=1 node sdk/tests/test-durable.mjs memory native
           node sdk/tests/test-durable.mjs local native
           node sdk/tests/test-durable.mjs world native
           node sdk/tests/test-durable-provider-crash.mjs native
@@ -373,20 +380,22 @@ jobs:
           jar="$RUNNER_TEMP/tla2tools.jar"
           curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
-          TLA2TOOLS_JAR="$jar" sdk/tests/model/check.sh
-          bun sdk/tests/model/drive.mjs send --walks 40
-          bun sdk/tests/model/drive.mjs lookup --walks 40 --seed 7
-          bun sdk/tests/model/drive.mjs send --walks 20 --seed 3 --durability world
-          bun sdk/tests/model/drive.mjs lookup --walks 20 --seed 9 --durability world
-          bun sdk/tests/model/drive.mjs write --walks 20 --seed 4
-          bun sdk/tests/model/drive.mjs cutoff --walks 20 --seed 5
-          bun sdk/tests/model/drive.mjs leased --walks 40 --seed 12
-          bun sdk/tests/model/drive.mjs queue --walks 40 --seed 4
-          bun sdk/tests/model/drive-agents.mjs send --walks 60 --seed 11
-          bun sdk/tests/model/drive-agents.mjs consume --walks 60 --seed 13
-          bun sdk/tests/model/drive-steer.mjs ideal --walks 20 --seed 2
-          bun sdk/tests/model/drive-steer.mjs faults --walks 20 --seed 4
-          bun sdk/tests/model/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
+          TLA2TOOLS_JAR="$jar" tests/tla/sdk/check.sh
+          bun tests/tla/drivers/drive.mjs send --walks 40
+          bun tests/tla/drivers/drive.mjs send --walks 20 --seed 3 --hooks
+          bun tests/tla/drivers/drive.mjs lookup --walks 40 --seed 7
+          bun tests/tla/drivers/drive.mjs send --walks 20 --seed 3 --durability world
+          bun tests/tla/drivers/drive.mjs lookup --walks 20 --seed 9 --durability world
+          bun tests/tla/drivers/drive.mjs write --walks 20 --seed 4
+          bun tests/tla/drivers/drive.mjs cutoff --walks 20 --seed 5
+          bun tests/tla/drivers/drive.mjs leased --walks 40 --seed 12
+          bun tests/tla/drivers/drive.mjs queue --walks 40 --seed 4
+          bun tests/tla/drivers/drive-agents.mjs --walks 60 --seed 11
+          bun tests/tla/drivers/drive-tenants.mjs --walks 60 --seed 11
+          bun tests/tla/drivers/drive-steer.mjs ideal --walks 20 --seed 2
+          bun tests/tla/drivers/drive-steer.mjs faults --walks 20 --seed 4
+          bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
+          bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
 
       - name: Test libfx on a World
         run: |

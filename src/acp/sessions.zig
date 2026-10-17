@@ -5,6 +5,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
+const libfx_hooks = @import("libfx_hooks.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const client_instructions = @import("client_instructions.zig");
@@ -17,7 +18,6 @@ const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
-const session_summary_codec = @import("../core/session/session_summary_codec.zig");
 const session_store_paths = @import("../core/session/session_store_paths.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
@@ -77,6 +77,47 @@ fn requestedLibfxSessionId(alloc: Allocator, params_raw: ?[]const u8) error{ Inv
     }
 }
 
+test "hook configuration OOM is not converted to an ACP parameter error" {
+    const Fixture = struct {
+        fail_index: usize = 0,
+        alloc_index: usize = 0,
+        writes: usize = 0,
+        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const index = self.alloc_index;
+            self.alloc_index += 1;
+            if (index == self.fail_index) return null;
+            return std.testing.allocator.rawAlloc(len, alignment, ret);
+        }
+        fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            std.testing.allocator.rawFree(memory, alignment, ret);
+        }
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+        }
+    };
+    const Handler = *const fn (*server.ServerState, Allocator, *jsonrpc.Message) anyerror!void;
+    const handlers = if (comptime host_target.is_wasm) [_]Handler{ handleNewLibfxSession, handleNewWasmSession, handleLoadWasmSession } else [_]Handler{ handleNewLibfxSession, handleNewSession, handleLoadSession, handleResumeSession };
+    for (handlers) |handler| {
+        var fixture: Fixture = .{};
+        const alloc: Allocator = .{ .ptr = &fixture, .vtable = &.{ .alloc = Fixture.allocate, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = Fixture.free } };
+        if (handler == handleNewLibfxSession) {
+            // That handler parses the optional session ID first, even for {}.
+            // Fail the first hooks allocation, not an allocation in that parse.
+            fixture.fail_index = std.math.maxInt(usize);
+            try std.testing.expect(try requestedLibfxSessionId(alloc, "{}") == null);
+            fixture.fail_index = fixture.alloc_index;
+            fixture.alloc_index = 0;
+        }
+        var state: server.ServerState = undefined;
+        state.writer = jsonrpc.Writer.initCallback(&fixture, Fixture.write);
+        var message: jsonrpc.Message = .{ .params_raw = "{}" };
+        try std.testing.expectError(error.OutOfMemory, handler(&state, alloc, &message));
+        try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+    }
+}
+
 pub fn handleNewLibfxSession(
     state: *server.ServerState,
     alloc: Allocator,
@@ -93,6 +134,10 @@ pub fn handleNewLibfxSession(
     };
     var requested_owned = requested != null;
     defer if (requested_owned) alloc.free(requested.?);
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+    };
     try server.releaseActiveSession(state);
     requested_owned = false;
     const session_id = requested orelse try session_store.generateSessionId(alloc);
@@ -107,6 +152,7 @@ pub fn handleNewLibfxSession(
 
     const start = server.loadStartingMode(state, alloc);
     state.active_session = .{
+        .observer_hooks = observer_hooks,
         .session_id = session_id,
         .model = model,
         .provider = state.provider,
@@ -130,10 +176,14 @@ pub fn handleNewLibfxSession(
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    try writeNewSessionResponse(state, alloc, msg, session_id);
+    try writeNewSessionResponse(state, alloc, msg, session_id, observer_hooks);
 }
 
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+    };
     try server.releaseActiveSession(state);
 
     var durable = try freshAcpState(state, alloc, state.workspace_root);
@@ -187,7 +237,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     model_owned = false;
     session_rt_owned = false;
 
-    try writeNewSessionResponse(state, alloc, msg, session_id);
+    try writeNewSessionResponse(state, alloc, msg, session_id, observer_hooks);
 }
 
 pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionState) !void {
@@ -338,6 +388,10 @@ test "ACP ultrafast WASM saves preserve baselines and failed preference writes r
 }
 
 pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+    };
     // Validate the client system prompt before any session side effect.
     var client_system_prompt = client_instructions.parse(alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -407,6 +461,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             session_mcp_owned = false;
             session_host_owned = false;
             return startV2Session(state, alloc, msg, v2_store, .{
+                .observer_hooks = observer_hooks,
                 .mcp = session_mcp,
                 .mcp_host = session_host,
                 .workspace = if (workspace) |*binding| binding else null,
@@ -496,11 +551,12 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     session_mcp_owned = false;
     session_host_owned = false;
 
-    try writeNewSessionResponse(state, alloc, msg, session_id);
+    try writeNewSessionResponse(state, alloc, msg, session_id, observer_hooks);
 }
 
 /// What `session/new` hands `startV2Session`.
 const V2Start = struct {
+    observer_hooks: ?libfx_hooks.Config = null,
     /// Owned; the session takes it over.
     mcp: ?*mcp_runtime.McpRuntime,
     /// Owned like `mcp`.
@@ -593,7 +649,7 @@ fn startV2Session(
     session_rt_owned = false;
     session_mcp_owned = false;
     session_host_owned = false;
-    try writeNewSessionResponse(state, alloc, msg, session_id);
+    try writeNewSessionResponse(state, alloc, msg, session_id, start.observer_hooks);
 }
 
 fn writeNewSessionResponse(
@@ -601,7 +657,9 @@ fn writeNewSessionResponse(
     alloc: Allocator,
     msg: *jsonrpc.Message,
     session_id: []const u8,
+    observer_hooks: ?libfx_hooks.Config,
 ) !void {
+    state.active_session.?.observer_hooks = observer_hooks;
     try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -640,7 +698,9 @@ fn writeNewSessionResponse(
     try writeJsonStr(state.active_session.?.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
-    try out.writer.writeAll("}}");
+    try out.writer.writeByte('}');
+    if (state.active_session.?.observer_hooks != null) try out.writer.writeAll(",\"_meta\":{\"fx\":{\"hooksVersion\":1}}");
+    try out.writer.writeByte('}');
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 
@@ -648,6 +708,10 @@ fn writeNewSessionResponse(
 }
 
 pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+    };
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = "Missing params",
@@ -667,7 +731,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
         if (sameSessionId(active.session_id, session_id)) {
             for (active.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
             try sendActiveSessionInfoUpdate(state, alloc);
-            return writeLoadSessionResponse(state, alloc, msg, active.model);
+            return writeLoadSessionResponse(state, alloc, msg, active.model, observer_hooks);
         }
     }
 
@@ -730,7 +794,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     session_rt_owned = false;
     for (state.active_session.?.session_rt.agent.history.items) |turn| try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
     try sendActiveSessionInfoUpdate(state, alloc);
-    try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model);
+    try writeLoadSessionResponse(state, alloc, msg, state.active_session.?.model, observer_hooks);
 }
 
 pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -796,6 +860,10 @@ fn handleRestoreSession(
     msg: *jsonrpc.Message,
     kind: RestoreKind,
 ) !void {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+    };
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = "Missing params",
@@ -919,6 +987,7 @@ fn handleRestoreSession(
                 alloc,
                 msg,
                 active.model,
+                observer_hooks,
             );
         }
     }
@@ -942,6 +1011,10 @@ fn handleRestoreSession(
         .message = "Session store not available",
     });
     if (backend == .v2) {
+        // Converting a v1 session can be slow; the client is told why (D61).
+        var notice: ConversionNotice = .{ .state = state, .alloc = alloc, .session_id = session_id };
+        backend.v2.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
+        defer backend.v2.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, backend.v2, .{ .id = session_id }, workspace_root, .acp) catch |err|
             return handleLoadFailure(state, alloc, msg, err);
         v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
@@ -1081,6 +1154,7 @@ fn handleRestoreSession(
         alloc,
         msg,
         state.active_session.?.model,
+        observer_hooks,
     );
 }
 
@@ -1260,7 +1334,9 @@ fn writeLoadSessionResponse(
     alloc: Allocator,
     msg: *jsonrpc.Message,
     model: []const u8,
+    observer_hooks: ?libfx_hooks.Config,
 ) !void {
+    state.active_session.?.observer_hooks = observer_hooks;
     try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1296,7 +1372,9 @@ fn writeLoadSessionResponse(
     try writeJsonStr(state.active_session.?.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
-    try out.writer.writeAll("}}");
+    try out.writer.writeByte('}');
+    if (observer_hooks != null) try out.writer.writeAll(",\"_meta\":{\"fx\":{\"hooksVersion\":1}}");
+    try out.writer.writeByte('}');
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
@@ -1550,6 +1628,20 @@ test "a v2 storage fault reads as its cause, and other errors have no such messa
     try std.testing.expect(v2StorageFaultMessage("Session could not be loaded", error.SessionBusy) == null);
 }
 
+/// A v2 store's notice that converting a v1 session is slow, sent to the
+/// client as the session's agent text, as fx's other notices are.
+const ConversionNotice = struct {
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+
+    fn emit(context: ?*anyopaque, text: []const u8) void {
+        const notice: *ConversionNotice = @ptrCast(@alignCast(context.?));
+        sendAgentHistoryChunk(notice.state, notice.alloc, notice.session_id, text) catch |err|
+            debug_trace.logf("acp", "event=conversion_notice_dropped err={s}", .{@errorName(err)});
+    }
+};
+
 fn handleLoadFailure(
     state: *server.ServerState,
     alloc: Allocator,
@@ -1601,6 +1693,12 @@ fn handleLoadFailure(
         err == error.SessionPathUnsafe or
         err == error.DurablePathUnsafe)
     {
+        // A v1 session that can't be converted says why (D61).
+        if (state.sessions_v2) |*store| if (err == error.InvalidSessionFormat) if (store.conversionProblem()) |problem| {
+            const message = try alloc.print("Session could not be loaded (InvalidSessionFormat): {s}", .{problem});
+            defer alloc.free(message);
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
+        };
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session could not be loaded",
@@ -1658,37 +1756,15 @@ fn listV2Sessions(
     v2_store: *session_adapter.Store,
     params: ListSessionsParams,
 ) !void {
-    var cancel = std.atomic.Value(bool).init(false);
-    var summaries = session_adapter.listSummaries(v2_store, alloc, null, &cancel) catch |err| {
+    // Matched as v1 matches it: exactly, after trailing slashes.
+    const cwd = if (params.cwd) |value| session_store_paths.normalizeWorkspaceRoot(value) else null;
+    var page = session_adapter.listPage(v2_store, alloc, cwd, params.continuation, session_store.session_list_default_limit) catch |err| {
         debug_trace.logf("acp", "session operation=list outcome=failed backend=v2 error={s}", .{@errorName(err)});
         try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
         return;
     };
-    defer {
-        for (summaries.items) |*summary| summary.deinit(alloc);
-        summaries.deinit(alloc);
-    }
-    session_summary_codec.sortSummariesNewestFirst(summaries.items);
-    var page: std.ArrayList(session_store.SessionSummary) = .empty;
     defer page.deinit(alloc);
-    var has_more = false;
-    // Matched as v1 matches it: exactly, after trailing slashes.
-    const cwd = if (params.cwd) |value| session_store_paths.normalizeWorkspaceRoot(value) else null;
-    for (summaries.items) |summary| {
-        if (cwd) |root| {
-            const workspace_root = summary.workspace_root orelse continue;
-            if (!std.mem.eql(u8, workspace_root, root)) continue;
-        }
-        if (params.continuation) |continuation| {
-            if (!session_summary_codec.summaryFollowsContinuation(summary, continuation)) continue;
-        }
-        if (page.items.len == session_store.session_list_default_limit) {
-            has_more = true;
-            break;
-        }
-        try page.append(alloc, summary);
-    }
-    try writeSessionPage(state, alloc, msg, page.items, has_more);
+    try writeSessionPage(state, alloc, msg, page.summaries.items, page.has_more);
 }
 
 fn writeSessionPage(

@@ -5289,6 +5289,8 @@ test "linked metadata outside authority is rejected before descriptor open" {
     try std.testing.expect(!mark.called);
 }
 
+// The FIFO reader stays open until the blocked writer joins, as
+// `tests/tla/session_manager/rollout/pr-1099/PR1099FIFO.tla` models.
 test "linked metadata FIFO is rejected before descriptor open" {
     const MarkOpen = struct {
         called: bool = false,

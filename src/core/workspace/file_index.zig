@@ -4,7 +4,9 @@
 //! prefixes with release stores; readers acquire `ready_count` before scanning.
 //! Replacement generations remain private until the main thread adopts them.
 //! Search uses pre-lowercased paths and a per-path ASCII bitmap to reject
-//! impossible subsequence matches before scoring.
+//! impossible subsequence matches before scoring. Each remaining path is
+//! ranked by its best query placement (`alignBest`), and highlights show that
+//! same placement.
 
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
@@ -611,7 +613,8 @@ pub const FileIndex = struct {
         var query_scratch: QueryScratch = undefined;
         const prepared = prepareQuery(query, &query_scratch) orelse return 0;
         var indices: [max_search_results]u32 = undefined;
-        const result_count = rankTopN(generation, total, prepared, indices[0..@min(out.len, max_search_results)]);
+        var align_scratch: AlignScratch = undefined;
+        const result_count = rankTopN(generation, total, prepared, indices[0..@min(out.len, max_search_results)], &align_scratch);
 
         var path_scratch: FoldedPathScratch = undefined;
         var matched_offsets: [max_path_len]u16 = undefined;
@@ -625,6 +628,7 @@ pub const FileIndex = struct {
                 base_start,
                 prepared.folded,
                 &path_scratch,
+                &align_scratch,
                 &matched_offsets,
                 &span_scratch,
             ) orelse return error.InvalidIndexData;
@@ -1249,13 +1253,14 @@ fn decodeFoldedPath(
 
 const MatchScore = struct {
     exact_fit: bool,
-    basename_fit: bool,
-    boundary_matches: usize,
-    prefix: bool,
-    first_position: usize,
-    longest_run: usize,
-    consecutive_matches: usize,
-    gaps: usize,
+    /// The scored placement ends in the file or folder name rather than in a
+    /// parent folder.
+    name_fit: bool,
+    /// Additive score of the chosen placement, including `name_bonus` when it
+    /// lies inside the name.
+    quality: i32,
+    /// Scalar index of the first matched character, relative to the scored range.
+    first_position: u32,
 };
 
 /// Owns its prepared query without interior pointers. Names are borrowed only
@@ -1280,17 +1285,18 @@ pub const NameQuery = struct {
 
     pub fn score(self: *const NameQuery, name: []const u8) ?Score {
         if (name.len == 0 or name.len > max_path_len) return null;
-        if (self.len == 0) return matchScore(false, false, .{});
+        if (self.len == 0) return .{ .exact_fit = false, .name_fit = false, .quality = 0, .first_position = 0 };
+        var align_scratch: AlignScratch = undefined;
         for (name) |byte| {
             if (byte >= 0x80) {
                 var scratch: FoldedPathScratch = undefined;
-                return scoreFoldedMatch(name, 0, self.scratch.folded[0..self.len], &scratch);
+                return scoreFoldedMatchWith(&align_scratch, name, 0, self.scratch.folded[0..self.len], &scratch, .{});
             }
         }
         if (!self.ascii or alphaMask(name) & self.ascii_mask != self.ascii_mask) return null;
         var lower: [max_path_len]u8 = undefined;
         for (name, lower[0..name.len]) |byte, *folded| folded.* = asciiToLower(byte);
-        return scoreAsciiMatch(name, lower[0..name.len], 0, self.scratch.ascii[0..self.len]);
+        return scoreAsciiMatchWith(&align_scratch, name, lower[0..name.len], 0, self.scratch.ascii[0..self.len], .{});
     }
 
     pub fn better(self: *const NameQuery, left: Score, left_path: []const u8, right: Score, right_path: []const u8) bool {
@@ -1306,22 +1312,14 @@ pub const NameQuery = struct {
     pub fn match_spans(self: *const NameQuery, name: []const u8, out: []MatchSpan) SearchError!usize {
         if (self.len == 0) return 0;
         var scratch: FoldedPathScratch = undefined;
+        var align_scratch: AlignScratch = undefined;
         var offsets: [max_path_len]u16 = undefined;
         var spans: [max_path_len]MatchSpan = undefined;
-        const count = reconstructMatchSpans(name, 0, self.scratch.folded[0..self.len], &scratch, &offsets, &spans) orelse return error.InvalidIndexData;
+        const count = reconstructMatchSpans(name, 0, self.scratch.folded[0..self.len], &scratch, &align_scratch, &offsets, &spans) orelse return error.InvalidIndexData;
         if (count > out.len) return error.NoSpaceLeft;
         @memcpy(out[0..count], spans[0..count]);
         return count;
     }
-};
-
-const SubsequenceFacts = struct {
-    boundary_matches: usize = 0,
-    prefix: bool = false,
-    first_position: usize = 0,
-    longest_run: usize = 0,
-    consecutive_matches: usize = 0,
-    gaps: usize = 0,
 };
 
 const RankedCandidate = struct {
@@ -1329,7 +1327,7 @@ const RankedCandidate = struct {
     index: u32,
 };
 
-fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, out: []u32) usize {
+fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, out: []u32, align_scratch: *AlignScratch) usize {
     const top_cap = @min(out.len, max_search_results);
     if (top_cap == 0) return 0;
 
@@ -1339,22 +1337,53 @@ fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, o
 
     const query_ascii = query.ascii;
     const query_mask = if (query_ascii) |ascii| alphaMask(ascii) else 0;
+    const max_crossing = maxCrossingQuality(u21, query.folded);
+    const max_name = maxNameQuality(query.folded.len);
     var scalar_scratch: FoldedPathScratch = undefined;
 
     var candidate_index: u32 = 0;
     while (candidate_index < total) : (candidate_index += 1) {
         const path_mask = generation.char_masks[candidate_index];
         const base_start = generation.basename_starts[candidate_index] - generation.offsets[candidate_index];
+        // Once the worst kept result has the best score a non-exact match can
+        // reach, only an exact match or a shorter path can still enter, so
+        // longer paths are not scored. Once every kept result is exact, only
+        // exact matches can enter.
+        const length_limit: ?usize = if (filled < top_cap) null else limit: {
+            const worst = ranked[worst_slot];
+            if (worst.score.exact_fit) break :limit 0;
+            if (worst.score.name_fit and worst.score.quality == max_name and worst.score.first_position == 0) {
+                break :limit generation.pathAt(worst.index).len;
+            }
+            break :limit null;
+        };
+        // Skip the placements that can no longer enter the kept results; the
+        // results stay those of scoring every path.
+        const needed: Needed = if (filled < top_cap) .{} else needed: {
+            const worst = ranked[worst_slot].score;
+            break :needed .{
+                // A placement ending in a folder ranks below every name match.
+                .folder = !(worst.exact_fit or worst.name_fit),
+                // A placement starting in a folder scores at most `max_crossing`.
+                .crossing = !(worst.exact_fit or (worst.name_fit and worst.quality > max_crossing)),
+            };
+        };
         const score = if ((path_mask & non_ascii_mask) == 0) ascii_path: {
             const ascii = query_ascii orelse continue;
             if ((path_mask & query_mask) != query_mask) continue;
-            break :ascii_path scoreAsciiMatch(
+            if (length_limit) |limit| {
+                const path_lower = generation.lowerPathAt(candidate_index);
+                if (path_lower.len > limit and !exactFit(u8, path_lower, path_lower[base_start..], ascii)) continue;
+            }
+            break :ascii_path scoreAsciiMatchWith(
+                align_scratch,
                 generation.pathAt(candidate_index),
                 generation.lowerPathAt(candidate_index),
                 base_start,
                 ascii,
+                needed,
             );
-        } else scoreFoldedMatch(generation.pathAt(candidate_index), base_start, query.folded, &scalar_scratch);
+        } else scoreFoldedMatchWith(align_scratch, generation.pathAt(candidate_index), base_start, query.folded, &scalar_scratch, needed);
         const match_score = score orelse continue;
         const candidate: RankedCandidate = .{ .score = match_score, .index = candidate_index };
 
@@ -1373,146 +1402,490 @@ fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, o
     return filled;
 }
 
+// Best-alignment scoring with fzf's v2 path-scheme score. A placement's score
+// is defined by `scoreAlignment`; `alignBest` returns the placement with the
+// highest score and, among those, the earliest first position. The dynamic
+// program is exact because its state carries the run bonus that fzf's
+// consecutive rule depends on, normalized to one of four values.
+const max_align_cells: usize = 4096;
+const run_slot_count: usize = 4;
+const run_slot_bonus = [run_slot_count]i32{ 4, 7, 8, 9 };
+const score_match: i32 = 16;
+const score_gap_start: i32 = -3;
+const score_gap_extension: i32 = -1;
+const bonus_boundary: i32 = score_match / 2;
+const bonus_non_word: i32 = score_match / 2;
+const bonus_camel_123: i32 = bonus_boundary + score_gap_extension;
+const bonus_consecutive: i32 = -(score_gap_start + score_gap_extension);
+const bonus_first_char_multiplier: i32 = 2;
+const bonus_boundary_white: i32 = bonus_boundary;
+const bonus_boundary_delimiter: i32 = bonus_boundary + 1;
+const invalid_score: i32 = std.math.minInt(i32);
+
+/// One search's alignment workspace. Callers create it once and reuse it for
+/// every candidate; nothing in it survives between calls.
+const AlignScratch = struct {
+    scores: [max_align_cells * run_slot_count]i32,
+    starts: [max_align_cells * run_slot_count]u16,
+    pred_entries: [max_align_cells * run_slot_count]u16,
+    pred_slots: [max_align_cells * run_slot_count]u8,
+    /// Text position of each sparse cell, row by row.
+    columns: [max_align_cells]u16,
+    row_offsets: [max_path_len + 1]u16,
+    forward: [max_path_len]u16,
+    backward: [max_path_len]u16,
+    positions: [max_path_len]u16,
+};
+
+const Alignment = struct {
+    quality: i32,
+    first_position: u32,
+};
+
+const CharClass = enum { white, non_word, delimiter, lower, upper, letter, number };
+
+fn charClassOf(byte: u8) CharClass {
+    return switch (byte) {
+        'a'...'z' => .lower,
+        'A'...'Z' => .upper,
+        '0'...'9' => .number,
+        ' ', '\t', '\n', '\r' => .white,
+        '/' => .delimiter,
+        0x80...0xff => .letter,
+        else => .non_word,
+    };
+}
+
+fn bonusFor(prev: CharClass, class: CharClass) i32 {
+    switch (class) {
+        .lower, .upper, .letter, .number => switch (prev) {
+            .white => return bonus_boundary_white,
+            .delimiter => return bonus_boundary_delimiter,
+            .non_word => return bonus_boundary,
+            else => {},
+        },
+        else => {},
+    }
+    if ((prev == .lower and class == .upper) or (prev != .number and class == .number)) return bonus_camel_123;
+    return switch (class) {
+        .non_word, .delimiter => bonus_non_word,
+        .white => bonus_boundary_white,
+        else => 0,
+    };
+}
+
+fn bonusAt(path: []const u8, byte_offsets: ?[]const u16, position: usize) i32 {
+    const byte_index: usize = if (byte_offsets) |offsets| offsets[position] else position;
+    const prev: CharClass = if (byte_index == 0) .delimiter else charClassOf(path[byte_index - 1]);
+    return bonusFor(prev, charClassOf(path[byte_index]));
+}
+
+fn runSlot(run_bonus: i32) usize {
+    return switch (@max(run_bonus, bonus_consecutive)) {
+        4 => 0,
+        7 => 1,
+        8 => 2,
+        9 => 3,
+        else => unreachable,
+    };
+}
+
+fn consecutiveBonus(bonus: i32, run_bonus: i32) struct { bonus: i32, run: i32 } {
+    if (bonus >= bonus_boundary and bonus > run_bonus) return .{ .bonus = bonus, .run = bonus };
+    return .{ .bonus = @max(bonus, @max(run_bonus, bonus_consecutive)), .run = run_bonus };
+}
+
+/// Pure: the score of one fixed placement. This defines the ranking score.
+fn scoreAlignment(path: []const u8, byte_offsets: ?[]const u16, range_start: usize, positions: []const u16) Alignment {
+    var total: i32 = 0;
+    var run: i32 = 0;
+    for (positions, 0..) |position, index| {
+        const bonus = bonusAt(path, byte_offsets, position);
+        if (index == 0) {
+            total = score_match + bonus * bonus_first_char_multiplier;
+            run = bonus;
+            continue;
+        }
+        const previous = positions[index - 1];
+        if (position == previous + 1) {
+            const step = consecutiveBonus(bonus, run);
+            total += score_match + step.bonus;
+            run = step.run;
+        } else {
+            const gap: i32 = @intCast(position - previous - 1);
+            total += score_match + bonus + score_gap_start + (gap - 1) * score_gap_extension;
+            run = bonus;
+        }
+    }
+    return .{ .quality = total, .first_position = @intCast(positions[0] - range_start) };
+}
+
+inline fn betterCandidate(score: i32, start: u16, best_score: i32, best_start: u16) bool {
+    return score > best_score or (score == best_score and start < best_start);
+}
+
+/// Pure: finds the best placement of `query` in `text[range_start..]` whose
+/// last letter lands at or after `end_min`, and writes its text positions to
+/// `scratch.positions[0..query.len]`. When the search would need more than
+/// `max_align_cells` cells, the leftmost greedy such placement is scored
+/// instead.
+fn alignBest(
+    comptime T: type,
+    text: []const T,
+    path: []const u8,
+    byte_offsets: ?[]const u16,
+    range_start: usize,
+    end_min: usize,
+    query: []const T,
+    scratch: *AlignScratch,
+) ?Alignment {
+    const m = query.len;
+    if (m == 0 or range_start > text.len or m > text.len - range_start) return null;
+    std.debug.assert(end_min >= range_start);
+
+    if (m == 1 and text.len - end_min <= max_align_cells) {
+        // The earliest occurrence with the highest bonus, in one scan: the
+        // window fits the cell budget, and no bonus beats the one after `/`.
+        var best_position: ?usize = null;
+        var best_bonus: i32 = 0;
+        var j = end_min;
+        while (j < text.len) : (j += 1) {
+            if (text[j] != query[0]) continue;
+            const bonus = bonusAt(path, byte_offsets, j);
+            if (best_position == null or bonus > best_bonus) {
+                best_position = j;
+                best_bonus = bonus;
+                if (bonus == bonus_boundary_delimiter) break;
+            }
+        }
+        const only = best_position orelse return null;
+        scratch.positions[0] = @intCast(only);
+        return .{ .quality = score_match + best_bonus * bonus_first_char_multiplier, .first_position = @intCast(only - range_start) };
+    }
+
+    var query_index: usize = 0;
+    var position = range_start;
+    while (position < text.len and query_index < m) : (position += 1) {
+        if (text[position] != query[query_index]) continue;
+        scratch.forward[query_index] = @intCast(position);
+        query_index += 1;
+    }
+    if (query_index < m) return null;
+
+    var back_index: usize = m;
+    var back_position: usize = text.len;
+    while (back_index > 0) {
+        back_position -= 1;
+        if (text[back_position] != query[back_index - 1]) continue;
+        back_index -= 1;
+        scratch.backward[back_index] = @intCast(back_position);
+    }
+    if (scratch.backward[m - 1] < end_min) return null;
+    if (scratch.forward[m - 1] < end_min) {
+        // Still after forward[m - 2], which lies before the old forward[m - 1].
+        var last = end_min;
+        while (text[last] != query[m - 1]) last += 1;
+        scratch.forward[m - 1] = @intCast(last);
+    }
+
+    // Both greedy scans agree only when a single placement exists.
+    if (std.mem.eql(u16, scratch.forward[0..m], scratch.backward[0..m])) {
+        @memcpy(scratch.positions[0..m], scratch.forward[0..m]);
+        return scoreAlignment(path, byte_offsets, range_start, scratch.positions[0..m]);
+    }
+
+    // Row r may only place query[r] in forward[r]..backward[r]. The cell budget
+    // is defined on those window widths.
+    var cells: usize = 0;
+    for (scratch.forward[0..m], scratch.backward[0..m]) |first, last| cells += @as(usize, last) - first + 1;
+    if (cells > max_align_cells) {
+        @memcpy(scratch.positions[0..m], scratch.forward[0..m]);
+        return scoreAlignment(path, byte_offsets, range_start, scratch.positions[0..m]);
+    }
+
+    // Sparse rows: one cell per position where query[r] matches inside its window.
+    var entries: usize = 0;
+    for (0..m) |row| {
+        scratch.row_offsets[row] = @intCast(entries);
+        var j: usize = scratch.forward[row];
+        while (j <= scratch.backward[row]) : (j += 1) {
+            if (text[j] != query[row]) continue;
+            scratch.columns[entries] = @intCast(j);
+            entries += 1;
+        }
+    }
+    scratch.row_offsets[m] = @intCast(entries);
+
+    for (0..m) |row| {
+        const row_begin: usize = scratch.row_offsets[row];
+        const row_end: usize = scratch.row_offsets[row + 1];
+        const prev_begin: usize = if (row > 0) scratch.row_offsets[row - 1] else 0;
+        const prev_end: usize = if (row > 0) scratch.row_offsets[row] else 0;
+        var best_gap: i32 = invalid_score;
+        var best_gap_start: u16 = 0;
+        var best_gap_entry: u16 = 0;
+        var best_gap_slot: u8 = 0;
+        var next_gap = prev_begin;
+        var diag = prev_begin;
+
+        for (row_begin..row_end) |entry| {
+            const j: usize = scratch.columns[entry];
+            const cell = entry * run_slot_count;
+            @memset(scratch.scores[cell..][0..run_slot_count], invalid_score);
+            const bonus = bonusAt(path, byte_offsets, j);
+            if (row == 0) {
+                const slot = runSlot(bonus);
+                scratch.scores[cell + slot] = score_match + bonus * bonus_first_char_multiplier;
+                scratch.starts[cell + slot] = @intCast(j);
+                continue;
+            }
+            // Fold in every predecessor at least two positions back.
+            while (next_gap < prev_end and @as(usize, scratch.columns[next_gap]) + 2 <= j) : (next_gap += 1) {
+                const prev_cell = next_gap * run_slot_count;
+                const shift: i32 = scratch.columns[next_gap];
+                for (0..run_slot_count) |slot| {
+                    const value = scratch.scores[prev_cell + slot];
+                    if (value == invalid_score) continue;
+                    const start = scratch.starts[prev_cell + slot];
+                    if (betterCandidate(value + shift, start, best_gap, best_gap_start)) {
+                        best_gap = value + shift;
+                        best_gap_start = start;
+                        best_gap_entry = @intCast(next_gap);
+                        best_gap_slot = @intCast(slot);
+                    }
+                }
+            }
+            while (diag < prev_end and @as(usize, scratch.columns[diag]) + 1 < j) diag += 1;
+            if (diag < prev_end and @as(usize, scratch.columns[diag]) + 1 == j) {
+                const prev_cell = diag * run_slot_count;
+                for (0..run_slot_count) |prev_slot| {
+                    const value = scratch.scores[prev_cell + prev_slot];
+                    if (value == invalid_score) continue;
+                    const step = consecutiveBonus(bonus, run_slot_bonus[prev_slot]);
+                    const slot = runSlot(step.run);
+                    const candidate = value + score_match + step.bonus;
+                    const start = scratch.starts[prev_cell + prev_slot];
+                    if (betterCandidate(candidate, start, scratch.scores[cell + slot], scratch.starts[cell + slot])) {
+                        scratch.scores[cell + slot] = candidate;
+                        scratch.starts[cell + slot] = start;
+                        scratch.pred_entries[cell + slot] = @intCast(diag);
+                        scratch.pred_slots[cell + slot] = @intCast(prev_slot);
+                    }
+                }
+            }
+            if (best_gap != invalid_score) {
+                const slot = runSlot(bonus);
+                const candidate = best_gap - @as(i32, @intCast(j)) - 1 + score_match + bonus;
+                if (betterCandidate(candidate, best_gap_start, scratch.scores[cell + slot], scratch.starts[cell + slot])) {
+                    scratch.scores[cell + slot] = candidate;
+                    scratch.starts[cell + slot] = best_gap_start;
+                    scratch.pred_entries[cell + slot] = best_gap_entry;
+                    scratch.pred_slots[cell + slot] = best_gap_slot;
+                }
+            }
+        }
+    }
+
+    var best_score: i32 = invalid_score;
+    var best_start: u16 = 0;
+    var best_entry: usize = 0;
+    var best_slot: usize = 0;
+    for (scratch.row_offsets[m - 1]..scratch.row_offsets[m]) |entry| {
+        for (0..run_slot_count) |slot| {
+            const value = scratch.scores[entry * run_slot_count + slot];
+            if (value == invalid_score) continue;
+            if (betterCandidate(value, scratch.starts[entry * run_slot_count + slot], best_score, best_start)) {
+                best_score = value;
+                best_start = scratch.starts[entry * run_slot_count + slot];
+                best_entry = entry;
+                best_slot = slot;
+            }
+        }
+    }
+    if (best_score == invalid_score) return null;
+
+    var row = m - 1;
+    var entry = best_entry;
+    var slot = best_slot;
+    while (true) {
+        scratch.positions[row] = scratch.columns[entry];
+        if (row == 0) break;
+        const cell = entry * run_slot_count + slot;
+        entry = scratch.pred_entries[cell];
+        slot = scratch.pred_slots[cell];
+        row -= 1;
+    }
+    std.debug.assert(scratch.positions[0] == best_start);
+    return .{ .quality = best_score, .first_position = @intCast(@as(usize, best_start) - range_start) };
+}
+
+/// Points a placement inside the file or folder name earns over one that
+/// starts in the folder holding the name. A close call favors the name, so
+/// for `abcd`, `src/x/ab-cd.ts` stays above `src/ab/cd.ts`, while a clean
+/// folder-plus-name match such as `vercle` for `vercel-json/clean-urls.mdx`
+/// can still beat letters scattered through a name.
+const name_bonus: i32 = 4;
+
+comptime {
+    // `maxCrossingQuality` assumes no character earns more than this bonus.
+    for ([_]i32{ bonus_boundary, bonus_non_word, bonus_camel_123, bonus_consecutive, bonus_boundary_white }) |bonus| {
+        std.debug.assert(bonus <= bonus_boundary_delimiter);
+    }
+}
+
+/// The highest score of a placement that starts in a parent folder and ends
+/// in the name. Without a `/` in the query such a placement skips the `/`
+/// before the name, which costs at least one gap.
+fn maxCrossingQuality(comptime T: type, query: []const T) i32 {
+    const m: i32 = @intCast(query.len);
+    const ceiling = score_match * m + bonus_boundary_delimiter * (m + 1);
+    return if (std.mem.findScalar(T, query, '/') == null) ceiling + score_gap_start else ceiling;
+}
+
+/// The highest score a non-exact match can reach: the query as a run at the
+/// start of the name, right after its `/`, plus `name_bonus`. Its first
+/// position is 0, because only the first letter of a name follows a `/`.
+fn maxNameQuality(query_len: usize) i32 {
+    const m: i32 = @intCast(query_len);
+    return score_match * m + bonus_boundary_delimiter * (m + 1) + name_bonus;
+}
+
+/// A query that spells the whole path, the name, or the name up to a dot,
+/// such as `main` for `main.zig`, is an exact match.
+fn exactFit(comptime T: type, whole: []const T, name: []const T, query: []const T) bool {
+    return std.mem.eql(T, whole, query) or std.mem.eql(T, name, query) or
+        (name.len > query.len and std.mem.startsWith(T, name, query) and name[query.len] == '.');
+}
+
+/// Which placements a candidate may still need. Ranking turns a kind off only
+/// once it can no longer enter the kept results.
+const Needed = struct {
+    /// Placements that end in a parent folder.
+    folder: bool = true,
+    /// Placements that start in the folder holding the name and end in the name.
+    crossing: bool = true,
+};
+
+const Placement = struct {
+    name_fit: bool,
+    alignment: Alignment,
+    range_start: usize,
+    end_min: usize,
+};
+
+/// Pure: picks the placement that defines a candidate's score. A placement
+/// ending in the file or folder name ranks above one ending in a parent
+/// folder. Among those, the best placement inside the name, plus
+/// `name_bonus`, competes with the best one that starts in the folder that
+/// holds the name, as in `vercle` for `vercel-json/clean-urls.mdx`. Crossing
+/// placements start no higher than that folder, so their search covers only
+/// the folder and the name.
+fn choosePlacement(
+    comptime T: type,
+    text: []const T,
+    path: []const u8,
+    byte_offsets: ?[]const u16,
+    base_start: usize,
+    query: []const T,
+    scratch: *AlignScratch,
+    needed: Needed,
+) ?Placement {
+    var best: ?Placement = null;
+    if (alignBest(T, text, path, byte_offsets, base_start, base_start, query, scratch)) |inside| {
+        best = .{
+            .name_fit = true,
+            .alignment = .{ .quality = inside.quality + name_bonus, .first_position = inside.first_position },
+            .range_start = base_start,
+            .end_min = base_start,
+        };
+    }
+    // Without a placement in the name, a path that does not hold the letters
+    // in order has no other placement either; one scan settles it.
+    if (best == null and query.len > 1 and !isSubsequence(T, text, query)) return null;
+    const crossing_can_win = if (best) |inside| inside.alignment.quality < maxCrossingQuality(T, query) else true;
+    if (needed.crossing and base_start > 0 and query.len > 1 and crossing_can_win) {
+        // text[base_start - 1] is the `/` before the name.
+        const folder_start = if (std.mem.findScalarLast(T, text[0 .. base_start - 1], '/')) |slash| slash + 1 else 0;
+        if (alignBest(T, text, path, byte_offsets, folder_start, base_start, query, scratch)) |crossing| {
+            if (best == null or crossing.quality > best.?.alignment.quality) {
+                best = .{ .name_fit = true, .alignment = crossing, .range_start = folder_start, .end_min = base_start };
+            }
+        }
+    }
+    if (best != null) return best;
+    if (!needed.folder) return null;
+    const anywhere = alignBest(T, text, path, byte_offsets, 0, 0, query, scratch) orelse return null;
+    return .{ .name_fit = false, .alignment = anywhere, .range_start = 0, .end_min = 0 };
+}
+
+fn isSubsequence(comptime T: type, text: []const T, query: []const T) bool {
+    var query_index: usize = 0;
+    for (text) |item| {
+        if (item != query[query_index]) continue;
+        query_index += 1;
+        if (query_index == query.len) return true;
+    }
+    return false;
+}
+
+fn scoreOf(exact_fit: bool, placement: Placement) MatchScore {
+    return .{
+        .exact_fit = exact_fit,
+        .name_fit = placement.name_fit,
+        .quality = placement.alignment.quality,
+        .first_position = placement.alignment.first_position,
+    };
+}
+
 fn scoreAsciiMatch(
     path: []const u8,
     path_lower: []const u8,
     basename_start: u32,
     query: []const u8,
 ) ?MatchScore {
-    if (query.len == 0 or path.len == 0) return null;
-    const base_start: usize = basename_start;
-    const basename = path_lower[base_start..];
-    const exact_fit = std.mem.eql(u8, path_lower, query) or std.mem.eql(u8, basename, query);
-
-    if (scoreAsciiRange(path, path_lower, base_start, query)) |facts| {
-        return matchScore(exact_fit, true, facts);
-    }
-    const facts = scoreAsciiRange(path, path_lower, 0, query) orelse return null;
-    return matchScore(exact_fit, false, facts);
+    var scratch: AlignScratch = undefined;
+    return scoreAsciiMatchWith(&scratch, path, path_lower, basename_start, query, .{});
 }
 
-noinline fn scoreAsciiRange(
+fn scoreAsciiMatchWith(
+    scratch: *AlignScratch,
     path: []const u8,
     path_lower: []const u8,
-    range_start: usize,
+    basename_start: u32,
     query: []const u8,
-) ?SubsequenceFacts {
-    if (query.len > path_lower.len - range_start) return null;
-
-    var facts: SubsequenceFacts = .{};
-    var query_index: usize = 0;
-    var previous_position: usize = 0;
-    var run_length: usize = 0;
-    var position = range_start;
-    while (position < path_lower.len and query_index < query.len) : (position += 1) {
-        if (path_lower[position] != query[query_index]) continue;
-
-        if (query_index == 0) {
-            facts.first_position = position - range_start;
-            facts.prefix = position == range_start;
-            run_length = 1;
-        } else if (position == previous_position + 1) {
-            facts.consecutive_matches += 1;
-            run_length += 1;
-        } else {
-            facts.gaps += position - previous_position - 1;
-            run_length = 1;
-        }
-        facts.longest_run = @max(facts.longest_run, run_length);
-        facts.boundary_matches += @intFromBool(isMatchBoundary(path, position));
-        previous_position = position;
-        query_index += 1;
-    }
-    return if (query_index == query.len) facts else null;
+    needed: Needed,
+) ?MatchScore {
+    if (query.len == 0 or path.len == 0) return null;
+    const base_start: usize = basename_start;
+    const exact_fit = exactFit(u8, path_lower, path_lower[base_start..], query);
+    // An exact match always enters, so it is always scored in full.
+    const placement = choosePlacement(u8, path_lower, path, null, base_start, query, scratch, if (exact_fit) .{} else needed) orelse return null;
+    return scoreOf(exact_fit, placement);
 }
 
-noinline fn scoreFoldedMatch(
+fn scoreFoldedMatchWith(
+    align_scratch: *AlignScratch,
     path: []const u8,
     basename_byte_start: u32,
     query: []const u21,
     scratch: *FoldedPathScratch,
+    needed: Needed,
 ) ?MatchScore {
     if (query.len == 0 or path.len == 0) return null;
     const base_start: usize = basename_byte_start;
     const decoded = decodeFoldedPath(path, base_start, scratch) orelse return null;
     const scalars = scratch.scalars[0..decoded.scalar_count];
-    const basename_scalars = scalars[decoded.basename_scalar_start..];
-    const exact_fit = std.mem.eql(u21, scalars, query) or std.mem.eql(u21, basename_scalars, query);
-
-    if (scoreFoldedRange(path, scalars, scratch.byte_offsets[0 .. decoded.scalar_count + 1], decoded.basename_scalar_start, query)) |facts| {
-        return matchScore(exact_fit, true, facts);
-    }
-    const facts = scoreFoldedRange(path, scalars, scratch.byte_offsets[0 .. decoded.scalar_count + 1], 0, query) orelse return null;
-    return matchScore(exact_fit, false, facts);
-}
-
-fn scoreFoldedRange(
-    path: []const u8,
-    scalars: []const u21,
-    byte_offsets: []const u16,
-    range_start: usize,
-    query: []const u21,
-) ?SubsequenceFacts {
-    if (query.len > scalars.len - range_start) return null;
-
-    var facts: SubsequenceFacts = .{};
-    var query_index: usize = 0;
-    var previous_position: usize = 0;
-    var run_length: usize = 0;
-    var position = range_start;
-    while (position < scalars.len and query_index < query.len) : (position += 1) {
-        if (scalars[position] != query[query_index]) continue;
-
-        if (query_index == 0) {
-            facts.first_position = position - range_start;
-            facts.prefix = position == range_start;
-            run_length = 1;
-        } else if (position == previous_position + 1) {
-            facts.consecutive_matches += 1;
-            run_length += 1;
-        } else {
-            facts.gaps += position - previous_position - 1;
-            run_length = 1;
-        }
-        facts.longest_run = @max(facts.longest_run, run_length);
-        facts.boundary_matches += @intFromBool(isMatchBoundary(path, byte_offsets[position]));
-        previous_position = position;
-        query_index += 1;
-    }
-    return if (query_index == query.len) facts else null;
-}
-
-fn matchScore(exact_fit: bool, basename_fit: bool, facts: SubsequenceFacts) MatchScore {
-    return .{
-        .exact_fit = exact_fit,
-        .basename_fit = basename_fit,
-        .boundary_matches = facts.boundary_matches,
-        .prefix = facts.prefix,
-        .first_position = facts.first_position,
-        .longest_run = facts.longest_run,
-        .consecutive_matches = facts.consecutive_matches,
-        .gaps = facts.gaps,
-    };
-}
-
-fn isMatchBoundary(path: []const u8, byte_index: usize) bool {
-    if (byte_index == 0) return true;
-    const previous = path[byte_index - 1];
-    if (std.Io.Dir.path.isSep(previous) or previous == '-' or previous == '_' or previous == '.' or previous == ' ') return true;
-    if (byte_index >= path.len) return false;
-    const current = path[byte_index];
-    return previous >= 'a' and previous <= 'z' and current >= 'A' and current <= 'Z';
+    const exact_fit = exactFit(u21, scalars, scalars[decoded.basename_scalar_start..], query);
+    const byte_offsets = scratch.byte_offsets[0 .. decoded.scalar_count + 1];
+    const placement = choosePlacement(u21, scalars, path, byte_offsets, decoded.basename_scalar_start, query, align_scratch, if (exact_fit) .{} else needed) orelse return null;
+    return scoreOf(exact_fit, placement);
 }
 
 inline fn scoreBetter(left: MatchScore, right: MatchScore) bool {
     if (left.exact_fit != right.exact_fit) return left.exact_fit;
-    if (left.basename_fit != right.basename_fit) return left.basename_fit;
-    if (left.boundary_matches != right.boundary_matches) return left.boundary_matches > right.boundary_matches;
-    if (left.prefix != right.prefix) return left.prefix;
+    if (left.name_fit != right.name_fit) return left.name_fit;
+    if (left.quality != right.quality) return left.quality > right.quality;
     if (left.first_position != right.first_position) return left.first_position < right.first_position;
-    if (left.longest_run != right.longest_run) return left.longest_run > right.longest_run;
-    if (left.consecutive_matches != right.consecutive_matches) return left.consecutive_matches > right.consecutive_matches;
-    if (left.gaps != right.gaps) return left.gaps < right.gaps;
     return false;
 }
 
@@ -1550,38 +1923,20 @@ fn reconstructMatchSpans(
     basename_byte_start: u32,
     query: []const u21,
     path_scratch: *FoldedPathScratch,
+    align_scratch: *AlignScratch,
     matched_offsets: *[max_path_len]u16,
     span_scratch: *[max_path_len]MatchSpan,
 ) ?usize {
     const decoded = decodeFoldedPath(path, basename_byte_start, path_scratch) orelse return null;
     const scalars = path_scratch.scalars[0..decoded.scalar_count];
     const byte_offsets = path_scratch.byte_offsets[0 .. decoded.scalar_count + 1];
-    const matched_count = collectMatchOffsets(
-        scalars,
-        byte_offsets,
-        decoded.basename_scalar_start,
-        query,
-        matched_offsets,
-    ) orelse collectMatchOffsets(scalars, byte_offsets, 0, query, matched_offsets) orelse return null;
-    return spansFromMatchedOffsets(path, matched_offsets[0..matched_count], span_scratch);
-}
-
-fn collectMatchOffsets(
-    scalars: []const u21,
-    byte_offsets: []const u16,
-    range_start: usize,
-    query: []const u21,
-    out: *[max_path_len]u16,
-) ?usize {
-    if (query.len > scalars.len - range_start) return null;
-    var query_index: usize = 0;
-    var position = range_start;
-    while (position < scalars.len and query_index < query.len) : (position += 1) {
-        if (scalars[position] != query[query_index]) continue;
-        out[query_index] = byte_offsets[position];
-        query_index += 1;
+    const placement = choosePlacement(u21, scalars, path, byte_offsets, decoded.basename_scalar_start, query, align_scratch, .{}) orelse return null;
+    // Rerun the chosen search: a later search in the choice reuses the positions.
+    _ = alignBest(u21, scalars, path, byte_offsets, placement.range_start, placement.end_min, query, align_scratch) orelse return null;
+    for (align_scratch.positions[0..query.len], matched_offsets[0..query.len]) |position, *offset| {
+        offset.* = byte_offsets[position];
     }
-    return if (query_index == query.len) query_index else null;
+    return spansFromMatchedOffsets(path, matched_offsets[0..query.len], span_scratch);
 }
 
 fn spansFromMatchedOffsets(
@@ -2086,43 +2441,6 @@ test "typed search supports abbreviated subsequences and caller-owned spans" {
     try std.testing.expectEqualStrings("fiidx", matched_bytes[0..matched_len]);
 }
 
-test "score comparison resolves each priority before less important signals" {
-    const best: MatchScore = .{
-        .exact_fit = true,
-        .basename_fit = true,
-        .boundary_matches = std.math.maxInt(usize),
-        .prefix = true,
-        .first_position = 0,
-        .longest_run = std.math.maxInt(usize),
-        .consecutive_matches = std.math.maxInt(usize),
-        .gaps = 0,
-    };
-    const worst: MatchScore = .{
-        .exact_fit = false,
-        .basename_fit = false,
-        .boundary_matches = 0,
-        .prefix = false,
-        .first_position = std.math.maxInt(usize),
-        .longest_run = 0,
-        .consecutive_matches = 0,
-        .gaps = std.math.maxInt(usize),
-    };
-    const priorities = [_][]const u8{ "exact_fit", "basename_fit", "boundary_matches", "prefix", "first_position", "longest_run", "consecutive_matches", "gaps" };
-    inline for (priorities, 0..) |field, priority| {
-        var left = worst;
-        var right = best;
-        inline for (priorities[0 .. priority + 1]) |earlier| {
-            @field(left, earlier) = @field(best, earlier);
-        }
-        @field(right, field) = @field(worst, field);
-        try std.testing.expect(scoreBetter(left, right));
-        try std.testing.expect(!scoreBetter(right, left));
-        try std.testing.expect(!scoreBetter(left, left));
-    }
-    try std.testing.expect(!scoreBetter(worst, worst));
-    try std.testing.expect(!scoreBetter(best, best));
-}
-
 test "ranking signals follow the accepted descending influence" {
     const cases = [_]struct {
         name: []const u8,
@@ -2149,10 +2467,10 @@ test "ranking signals follow the accepted descending influence" {
             .expected = "docs/core-guide.txt",
         },
         .{
-            .name = "path segment boundaries",
-            .raw = "misc/scattered/memo.zig\nsrc/core/main.zig\n",
+            .name = "contiguous segment start over spread segment starts",
+            .raw = "src/core/main.zig\nmisc/scattered/memo.zig\n",
             .query = "scm",
-            .expected = "src/core/main.zig",
+            .expected = "misc/scattered/memo.zig",
         },
         .{
             .name = "basename prefix",
@@ -2161,10 +2479,10 @@ test "ranking signals follow the accepted descending influence" {
             .expected = "src/widgetx.zig",
         },
         .{
-            .name = "path prefix",
-            .raw = "x/a/b\na/x/b\n",
+            .name = "adjacent segment starts over a wider gap",
+            .raw = "a/x/b\nx/a/b\n",
             .query = "ab",
-            .expected = "a/x/b",
+            .expected = "x/a/b",
         },
         .{
             .name = "earlier position",
@@ -2208,6 +2526,304 @@ test "ranking is independent of discovery order and resolves ties bytewise" {
         "ta",
         "src/beta.txt",
     );
+}
+
+test "score comparison ranks tiers before alignment quality and position" {
+    const base: MatchScore = .{ .exact_fit = false, .name_fit = false, .quality = 10, .first_position = 5 };
+    var exact = base;
+    exact.exact_fit = true;
+    exact.quality = 0;
+    var name_match = base;
+    name_match.name_fit = true;
+    name_match.quality = 0;
+    var stronger = base;
+    stronger.quality = 11;
+    stronger.first_position = 9;
+    var earlier = base;
+    earlier.first_position = 4;
+    try std.testing.expect(scoreBetter(exact, name_match));
+    try std.testing.expect(scoreBetter(name_match, stronger));
+    try std.testing.expect(scoreBetter(stronger, earlier));
+    try std.testing.expect(scoreBetter(earlier, base));
+    try std.testing.expect(!scoreBetter(base, base));
+}
+
+test "a contiguous name prefix ranks above letters scattered across word breaks" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "spikes/noisy/clusters-a.toml\nspikes/noisy/results/conn-storm-pro-activity.csv\n" ++
+        "spikes/noisy/results/conn-storm-free-activity.csv\nSTATUS.md\ncontracts/fixtures/stats_response.json\n");
+    var search: TestSearchBuffer(8) = .{};
+    const results = try search.run(&index, "stat");
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+    try std.testing.expectEqualStrings("STATUS.md", results[0].path);
+    try std.testing.expectEqualStrings("contracts/fixtures/stats_response.json", results[1].path);
+}
+
+test "a whole word inside a name ranks above scattered letters" {
+    try expectFirstSearchPath("scripts/test-matrix.ts\nsrc/test-stat.zig\n", "stat", "src/test-stat.zig");
+    try expectFirstSearchPath("src/ui/inline_dex_view.zig\nsrc/core/workspace/file_index.zig\n", "index", "src/core/workspace/file_index.zig");
+}
+
+test "a query equal to a file name before an extension is an exact match" {
+    try expectFirstSearchPath("bench/file_index_bench.zig\nsrc/core/workspace/file_index.zig\n", "file_index", "src/core/workspace/file_index.zig");
+}
+
+test "a match across the file's folder and its name ranks above letters scattered through a name" {
+    try expectFirstSearchPath("packages/vercel-error.ts\ndocs/vercel-json/clean-urls.mdx\n", "vercle", "docs/vercel-json/clean-urls.mdx");
+}
+
+test "a name match beats a match of the same shape through the folder" {
+    // Without name_bonus, `ab/cd` scores two points above `ab-cd`.
+    try expectFirstSearchPath("src/ab/cd.ts\nsrc/x/ab-cd.ts\n", "abcd", "src/x/ab-cd.ts");
+}
+
+test "a match that ends in a folder ranks below every name match" {
+    try expectFirstSearchPath("src/components/card.tsx\nsrc/use-comparison.ts\n", "comp", "src/use-comparison.ts");
+}
+
+test "a match may start in the file's own folder but not further up" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "ab/x/cd.ts\nzz/x-a-b-c-d.ts\n");
+    var search: TestSearchBuffer(4) = .{};
+    const results = try search.run(&index, "abcd");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    // `ab/x/cd.ts` scores higher, but only by crossing from its grandparent,
+    // so it ranks as a folder match below a scattered name match.
+    try std.testing.expectEqualStrings("zz/x-a-b-c-d.ts", results[0].path);
+}
+
+test "highlights of a folder-and-name match cover both parts" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "docs/vercel-json/clean-urls.mdx\n");
+    var search: TestSearchBuffer(1) = .{};
+    const results = try search.run(&index, "vercle");
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    const spans = results[0].matched_spans;
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
+    try std.testing.expectEqual(@as(u16, 5), spans[0].byte_start);
+    try std.testing.expectEqual(@as(u16, 8), spans[0].byte_end);
+    try std.testing.expectEqual(@as(u16, 17), spans[1].byte_start);
+    try std.testing.expectEqual(@as(u16, 20), spans[1].byte_end);
+}
+
+test "highlights mark the placement that was scored" {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, "src/test-stat.zig\nSTATUS.md\n");
+    var search: TestSearchBuffer(4) = .{};
+    const results = try search.run(&index, "stat");
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |result| {
+        try std.testing.expectEqual(@as(usize, 1), result.matched_spans.len);
+        const expected_start: u16 = if (std.mem.eql(u8, result.path, "STATUS.md")) 0 else 9;
+        try std.testing.expectEqual(expected_start, result.matched_spans[0].byte_start);
+        try std.testing.expectEqual(expected_start + 4, result.matched_spans[0].byte_end);
+    }
+}
+
+const BruteForce = struct {
+    best: ?Alignment = null,
+    /// Highest score among placements that start before `end_min`.
+    crossing_peak: ?i32 = null,
+};
+
+fn bruteForceAlignment(path: []const u8, lower: []const u8, range_start: usize, end_min: usize, query: []const u8) BruteForce {
+    var positions: [8]u16 = undefined;
+    var result: BruteForce = .{};
+    bruteForceVisit(path, lower, range_start, end_min, query, 0, range_start, &positions, &result);
+    return result;
+}
+
+fn bruteForceVisit(
+    path: []const u8,
+    lower: []const u8,
+    range_start: usize,
+    end_min: usize,
+    query: []const u8,
+    depth: usize,
+    from: usize,
+    positions: *[8]u16,
+    result: *BruteForce,
+) void {
+    if (depth == query.len) {
+        if (positions[query.len - 1] < end_min) return;
+        const alignment = scoreAlignment(path, null, range_start, positions[0..query.len]);
+        if (positions[0] < end_min) result.crossing_peak = @max(result.crossing_peak orelse alignment.quality, alignment.quality);
+        if (result.best) |current| {
+            if (alignment.quality < current.quality or
+                (alignment.quality == current.quality and alignment.first_position >= current.first_position)) return;
+        }
+        result.best = alignment;
+        return;
+    }
+    var position = from;
+    while (position < lower.len) : (position += 1) {
+        if (lower[position] != query[depth]) continue;
+        positions[depth] = @intCast(position);
+        bruteForceVisit(path, lower, range_start, end_min, query, depth + 1, position + 1, positions, result);
+    }
+}
+
+test "best alignment equals a brute-force search over a small alphabet" {
+    const alphabet = "aAb/-1";
+    const query_alphabet = "ab/-1";
+    const scratch = try std.testing.allocator.create(AlignScratch);
+    defer std.testing.allocator.destroy(scratch);
+    var text: [4]u8 = undefined;
+    var lower: [4]u8 = undefined;
+    var query: [3]u8 = undefined;
+    var checked: usize = 0;
+    for (1..text.len + 1) |text_len| {
+        var text_code: usize = 0;
+        while (text_code < std.math.pow(usize, alphabet.len, text_len)) : (text_code += 1) {
+            var code = text_code;
+            for (text[0..text_len], lower[0..text_len]) |*byte, *folded| {
+                byte.* = alphabet[code % alphabet.len];
+                folded.* = asciiToLower(byte.*);
+                code /= alphabet.len;
+            }
+            const basename_start = if (std.mem.findScalarLast(u8, text[0..text_len], '/')) |slash| slash + 1 else 0;
+            const ranges = [_][2]usize{ .{ 0, 0 }, .{ basename_start, basename_start }, .{ 0, basename_start } };
+            for (ranges) |range| {
+                const range_start = range[0];
+                const end_min = range[1];
+                for (1..query.len + 1) |query_len| {
+                    var query_code: usize = 0;
+                    while (query_code < std.math.pow(usize, query_alphabet.len, query_len)) : (query_code += 1) {
+                        var q = query_code;
+                        for (query[0..query_len]) |*byte| {
+                            byte.* = query_alphabet[q % query_alphabet.len];
+                            q /= query_alphabet.len;
+                        }
+                        const brute = bruteForceAlignment(text[0..text_len], lower[0..text_len], range_start, end_min, query[0..query_len]);
+                        // The pruning bound holds for every placement that crosses into the name.
+                        if (brute.crossing_peak) |peak| try std.testing.expect(peak <= maxCrossingQuality(u8, query[0..query_len]));
+                        const expected = brute.best;
+                        const actual = alignBest(u8, lower[0..text_len], text[0..text_len], null, range_start, end_min, query[0..query_len], scratch);
+                        checked += 1;
+                        if (expected == null) {
+                            try std.testing.expect(actual == null);
+                            continue;
+                        }
+                        try std.testing.expectEqual(expected.?.quality, actual.?.quality);
+                        try std.testing.expectEqual(expected.?.first_position, actual.?.first_position);
+                        try std.testing.expect(scratch.positions[query_len - 1] >= end_min);
+                        const placed = scoreAlignment(text[0..text_len], null, range_start, scratch.positions[0..query_len]);
+                        try std.testing.expectEqual(actual.?.quality, placed.quality);
+                        for (scratch.positions[0..query_len], query[0..query_len]) |position, byte| {
+                            try std.testing.expectEqual(byte, lower[position]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(checked > 600_000);
+}
+
+test "alignment scores the greedy placement beyond the cell budget" {
+    const path: [2000]u8 = @splat('a');
+    const query: [100]u8 = @splat('a');
+    const scratch = try std.testing.allocator.create(AlignScratch);
+    defer std.testing.allocator.destroy(scratch);
+    const alignment = alignBest(u8, &path, &path, null, 0, 0, &query, scratch).?;
+    for (scratch.positions[0..query.len], 0..) |position, index| try std.testing.expectEqual(@as(u16, @intCast(index)), position);
+    try std.testing.expectEqual(scoreAlignment(&path, null, 0, scratch.positions[0..query.len]).quality, alignment.quality);
+}
+
+fn expectPrunedRankingMatchesFullScoring(raw: []const u8, query: []const u8) ![]const u8 {
+    const alloc = std.testing.allocator;
+    var index = FileIndex{};
+    defer index.deinit(alloc);
+    try index.buildFromRaw(alloc, raw);
+    var search: TestSearchBuffer(max_search_results) = .{};
+    const results = try search.run(&index, query);
+
+    const Scored = struct { path: []const u8, score: MatchScore };
+    var scored: std.ArrayList(Scored) = .empty;
+    defer scored.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |path| {
+        if (path.len == 0) continue;
+        var lower: [max_path_len]u8 = undefined;
+        for (path, lower[0..path.len]) |byte, *folded| folded.* = asciiToLower(byte);
+        const basename_start: u32 = if (std.mem.findScalarLast(u8, path, '/')) |slash| @intCast(slash + 1) else 0;
+        if (scoreAsciiMatch(path, lower[0..path.len], basename_start, query)) |score| try scored.append(alloc, .{ .path = path, .score = score });
+    }
+    std.mem.sort(Scored, scored.items, {}, struct {
+        fn less(_: void, left: Scored, right: Scored) bool {
+            if (scoreBetter(left.score, right.score)) return true;
+            if (scoreBetter(right.score, left.score)) return false;
+            if (left.path.len != right.path.len) return left.path.len < right.path.len;
+            return std.mem.order(u8, left.path, right.path) == .lt;
+        }
+    }.less);
+    try std.testing.expectEqual(@min(scored.items.len, max_search_results), results.len);
+    for (results, scored.items[0..results.len]) |result, expected| try std.testing.expectEqualStrings(expected.path, result.path);
+    // The first result's path lives in `raw`, which the caller owns.
+    const first = scored.items[0].path;
+    return first;
+}
+
+test "pruned ranking keeps the results of scoring every path" {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    for (0..12) |i| try raw.print(alloc, "src/tools/alpha/tango/x{d}.zig\n", .{i});
+    for (0..80) |i| try raw.print(alloc, "pkg/{d}/st-at{d}.zig\n", .{ i, i });
+    for (0..70) |i| try raw.print(alloc, "src/tools/alpha/tango/y{d}.zig\n", .{i});
+    try raw.appendSlice(alloc, "docs/stat.md\nstat\nsrc/STATUS.md\n");
+    try std.testing.expectEqualStrings("stat", try expectPrunedRankingMatchesFullScoring(raw.items, "stat"));
+}
+
+test "pruned ranking keeps short queries over crowded names" {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    // More than 64 names at the top score for `s` and `st`, at many path
+    // lengths and with equal-length ties, then shorter and exact paths that
+    // arrive after the kept results are full.
+    for (0..90) |i| try raw.print(alloc, "pkg/{d}/st{d}.zig\n", .{ i % 7, i });
+    for (0..40) |i| try raw.print(alloc, "deep/nested/folder/{d}/stage{d}.md\n", .{ i, i });
+    for (0..30) |i| try raw.print(alloc, "a/sx{d}.ts\nb/ts{d}.ts\n", .{ i, i });
+    try raw.appendSlice(alloc, "zz/st.md\nq/s\nst\nx/s.zig\npkg/0/st0.zig\nw/st1.zi\n");
+    _ = try expectPrunedRankingMatchesFullScoring(raw.items, "s");
+    try std.testing.expectEqualStrings("st", try expectPrunedRankingMatchesFullScoring(raw.items, "st"));
+}
+
+test "pruned ranking keeps exact matches once the kept results are all exact" {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    for (0..70) |i| try raw.print(alloc, "service/{d}/main.zig\n", .{i});
+    for (0..30) |i| try raw.print(alloc, "x/mainframe{d}.zig\n", .{i});
+    try raw.appendSlice(alloc, "src/main.zig\nmain.zig\n");
+    try std.testing.expectEqualStrings("main.zig", try expectPrunedRankingMatchesFullScoring(raw.items, "main"));
+}
+
+test "pruned ranking keeps folder-and-name matches" {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    // Name matches of every strength, matches through the own folder, matches
+    // that only end in a folder, and perfect names that end the crossing search.
+    for (0..40) |i| try raw.print(alloc, "pkg/{d}/vercel-error{d}.ts\n", .{ i, i });
+    for (0..30) |i| try raw.print(alloc, "docs/{d}/vercel-json/clean{d}.mdx\n", .{ i, i });
+    for (0..30) |i| try raw.print(alloc, "vercel/cle/x{d}/z.md\n", .{i});
+    for (0..20) |i| try raw.print(alloc, "v/e/r/c/l/e{d}.txt\n", .{i});
+    for (0..70) |i| try raw.print(alloc, "lib/{d}/vercle{d}.ts\n", .{ i, i });
+    try raw.appendSlice(alloc, "apps/vercle.ts\n");
+    try std.testing.expectEqualStrings("apps/vercle.ts", try expectPrunedRankingMatchesFullScoring(raw.items, "vercle"));
+    // Without the perfect names the crossing search is never skipped by rank.
+    const cut = std.mem.find(u8, raw.items, "lib/0/").?;
+    _ = try expectPrunedRankingMatchesFullScoring(raw.items[0..cut], "vercle");
 }
 
 test "file and directory candidates have no ranking priority" {

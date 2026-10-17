@@ -59,6 +59,7 @@ pub const CountResult = struct {
 /// owned by `arena`, which only the calling thread uses. `scratch` must be
 /// thread-safe; it backs the listing and the content scan and is released
 /// before return, so retained memory grows with matches, not scanned bytes.
+/// The parallel search and its merge are modeled in `tests/tla/indexer/GrepCut.tla`.
 pub fn collectDirectoryMatches(
     scratch: Allocator,
     arena: Allocator,

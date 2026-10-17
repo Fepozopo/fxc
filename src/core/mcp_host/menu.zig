@@ -2,6 +2,8 @@
 //! showing servers. A server's actions are choices that run the `/mcp`
 //! verbs, so the menu adds nothing of its own. Pure: the shell's state owns
 //! one, and the footer draws it.
+//!
+//! TLA+ model: `tests/tla/mcp_host/HostLifecycle.tla`.
 
 const std = @import("std");
 const text_utils = @import("../shared/text_utils.zig");

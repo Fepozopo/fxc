@@ -971,7 +971,8 @@ fn writeReplayContent(
             if (offset_value != .integer or length_value != .integer) return error.InvalidProviderState;
             const offset = std.math.cast(usize, offset_value.integer) orelse return error.InvalidProviderState;
             const length = std.math.cast(usize, length_value.integer) orelse return error.InvalidProviderState;
-            if (offset != text_end or offset > content.len or length > content.len - offset) return error.InvalidProviderState;
+            if (offset > content.len or length > content.len - offset) return error.InvalidProviderState;
+            if (offset != text_end and !separatesReplayText(content, text_end, offset)) return error.InvalidProviderState;
             text_end = offset + length;
             try writer.writeAll("{\"type\":\"text\",\"text\":");
             try std.json.Stringify.value(content[offset..text_end], .{}, writer);
@@ -1001,6 +1002,12 @@ fn writeReplayContent(
         wrote_part = true;
     }
     try writer.writeByte(']');
+}
+
+/// Separator-joined messages replay as their own text, without the separator.
+fn separatesReplayText(content: []const u8, text_end: usize, offset: usize) bool {
+    return text_end > 0 and offset > text_end and
+        std.mem.eql(u8, content[text_end..offset], types.ProviderReplay.message_separator);
 }
 
 pub fn formatGatewayRequestShapeSummary(alloc: std.mem.Allocator, payload: []const u8) ![]u8 {
@@ -1449,6 +1456,40 @@ test "Gateway request replays reasoning and call metadata without changing canon
     try std.testing.expectEqualStrings("read_file", parts[2].object.get("toolName").?.string);
     try std.testing.expectEqualStrings("file", parts[2].object.get("input").?.object.get("path").?.string);
     try std.testing.expectEqualStrings("signature", parts[2].object.get("providerOptions").?.object.get("vertex").?.object.get("thoughtSignature").?.string);
+}
+
+test "Gateway request replays separated messages as their own text" {
+    const alloc = std.testing.allocator;
+    const parts_json = "[{\"type\":\"text\",\"offset\":0,\"length\":9,\"providerOptions\":{\"openai\":{\"itemId\":\"A\",\"phase\":\"commentary\"}}}," ++
+        "{\"type\":\"text\",\"offset\":11,\"length\":5,\"providerOptions\":{\"openai\":{\"itemId\":\"B\",\"phase\":\"final_answer\"}}}]";
+    const messages = [_]ChatMessage{.{ .role = .assistant, .content = "Checking.\n\nDone.", .provider_replay = .{
+        .source = .{ .provider = .gateway, .model = "test" },
+        .parts_json = parts_json,
+    } }};
+    const body = try buildGatewayRequestBody(alloc, "[]", &messages);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.object.get("prompt").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings("Checking.", parts[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("commentary", parts[0].object.get("providerOptions").?.object.get("openai").?.object.get("phase").?.string);
+    try std.testing.expectEqualStrings("Done.", parts[1].object.get("text").?.string);
+    try std.testing.expectEqualStrings("final_answer", parts[1].object.get("providerOptions").?.object.get("openai").?.object.get("phase").?.string);
+
+    for ([_]struct { content: []const u8, parts_json: []const u8 }{
+        // Only the exact separator may sit between replayed spans.
+        .{ .content = "Checking.\nDone.", .parts_json = "[{\"type\":\"text\",\"offset\":0,\"length\":9},{\"type\":\"text\",\"offset\":10,\"length\":5}]" },
+        .{ .content = "Checking.xxDone.", .parts_json = "[{\"type\":\"text\",\"offset\":0,\"length\":9},{\"type\":\"text\",\"offset\":11,\"length\":5}]" },
+        // A separator never precedes the first message.
+        .{ .content = "\n\nDone.", .parts_json = "[{\"type\":\"text\",\"offset\":2,\"length\":5}]" },
+    }) |case| {
+        const invalid = [_]ChatMessage{.{ .role = .assistant, .content = case.content, .provider_replay = .{
+            .source = .{ .provider = .gateway, .model = "test" },
+            .parts_json = case.parts_json,
+        } }};
+        try std.testing.expectError(error.InvalidProviderState, buildGatewayRequestBody(alloc, "[]", &invalid));
+    }
 }
 
 test "Gateway automatic caching preserves transient context and grouped tool results" {

@@ -4,6 +4,8 @@
 //!
 //! Each `post` effect is a new attempt: a new request, so a new id.
 //! The request table never reuses ids, so this core holds none.
+//!
+//! TLA+ model: `tests/tla/mcp/HttpModern.tla`.
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

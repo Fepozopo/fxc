@@ -839,8 +839,9 @@ fn ensureThreadedIo() void {
     if (threaded_io_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
         threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{});
         io_mod.setIo(threaded_io.?.io());
-        const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
-        io_mod.setRawEnviron(raw_environ);
+        // Node.js owns the environment and may grow it at any time, which
+        // can move and free libc's array, so it is read at each use.
+        io_mod.setLibcEnviron();
         threaded_io_state.store(2, .release);
         return;
     }

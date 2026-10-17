@@ -4,6 +4,8 @@
 //! drivers and a signature verifier. Every invocation turns those off, while
 //! the user's global and system config stay trusted, so a global Git LFS still
 //! works. When fx cannot establish that, `prepare` refuses and git does not run.
+//!
+//! TLA+ model: `tests/tla/shell_command/GitAdmission.tla`.
 
 const std = @import("std");
 const builtin = @import("builtin");

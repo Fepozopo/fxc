@@ -40,7 +40,7 @@ zig fmt src/           # format all source files
 zig fmt --check src/   # the formatting check CI runs
 ```
 
-The test suites under `tests/` use Bun but are separate from the Zig codebase. See **Testing** below.
+The test suites under `tests/` use Bun but are separate from the Zig codebase. `tests/tla/` holds the TLA+ models. See **Testing** and **TLA+ Models** below.
 
 ## Code Style
 
@@ -250,7 +250,7 @@ fx does not use declarations that Zig 0.17 deprecates. They still compile, so ch
 
 ## Testing (TypeScript)
 
-Two test suites live under `tests/`, both using Bun.
+Two test suites live under `tests/`, both using Bun. `tests/AGENTS.md` says where each kind of test belongs, how to wire a new E2E file into CI, and how code comments cite tests and specs.
 
 Set `FX_SOUND=0` when you run either suite locally, for example `cd tests/e2e && FX_SOUND=0 bun test cli.test.ts`. On macOS, sound playback during a test run can overload the machine and crash it. The variable doesn't cover `notifications.test.ts`, which clears it, or the "TUI user-profile output preserves compact scrollback across slash commands" test in `tui-command-permissions.test.ts`, which sends `/sound on`. Leave those to CI. On Linux, fx rings the terminal bell instead of playing a sound, so they run safely there. The full `bun test` run below includes both, and `bun test tui-*.test.ts` includes the `/sound on` test, so on macOS pass test files by name.
 
@@ -275,6 +275,12 @@ cd tests/e2e && bun test tui-*.test.ts               # just TUI tests (requires 
 ```
 
 TUI tests use tmux to drive the interactive terminal. They require `tmux` to be installed.
+
+## TLA+ Models
+
+Every TLA+ spec, its TLC checker, the Bun drivers that walk real code along a spec, and the session manager's design record live in `tests/tla/`, and nowhere else. `tests/AGENTS.md` describes the layout and how to add a model, and `tests/tla/README.md` lists the commands. Session decision numbers such as `D44` are defined in `tests/tla/session_manager/system-design.md`.
+
+Code comments cite a spec by its repository-relative path and the property it checks, such as `tests/tla/session_manager/Wiring.tla` `ParentOutlivesChildren`, and never cite a file outside the repository. When a change alters behavior that a spec models, update the spec in the same change and run its checker.
 
 ## Pull Request Classification
 
@@ -392,7 +398,7 @@ Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64 PGSO
-release qualification remains authoritative for the 7.800 MiB production
+release qualification remains authoritative for the 7.000 MiB production
 ceiling and performance gates.
 
 ## Documentation

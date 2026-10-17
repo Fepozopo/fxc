@@ -72,6 +72,9 @@ pub const Receipt = struct {
     revision: u64,
     selected: ?usize,
     window_start: usize,
+    /// File rows the frame painted. The render runtime sets it from the
+    /// committed frame.
+    visible_rows: u16 = list_window.default_max_picker_rows,
 };
 
 pub const View = struct {
@@ -100,6 +103,9 @@ pub const State = struct {
     refresh_requested: bool = false,
     trusted: bool = false,
     selection_missing: bool = false,
+    /// File rows the last acknowledged frame painted; navigation scrolls the
+    /// window the user sees.
+    visible_rows: u16 = list_window.default_max_picker_rows,
     prepared: ?Snapshot = null,
     presented: ?Snapshot = null,
 
@@ -239,7 +245,7 @@ pub const State = struct {
             index.* = if (delta < 0) count - 1 else 0;
             window.* = 0;
             self.selection_missing = false;
-        } else list_window.advanceSelection(index, window, count, delta);
+        } else list_window.advanceSelectionWithin(index, window, count, delta, self.visible_rows);
     }
 
     pub fn view(self: *const State, index: usize, window: usize) View {
@@ -285,6 +291,7 @@ pub const State = struct {
         self.selection_missing = self.selection_missing or (receipt.selected == null and value.items().len > 0);
         index.* = receipt.selected orelse 0;
         window.* = receipt.window_start;
+        self.visible_rows = receipt.visible_rows;
         self.trusted = true;
     }
 };
@@ -307,6 +314,39 @@ test "file completion deinit restores every defined field for reuse" {
         try std.testing.expectEqualDeep(field_attrs.defaultValue(field_type).?, @field(state, field_name));
     }
     state.deinit(std.testing.allocator);
+}
+
+test "file picker navigation scrolls within the rows the last frame painted" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    const q = file_picker_path.query_at("@./", 3).?;
+    _ = state.reconcile(q, 1, false);
+    var items: [30]file_index.SearchResult = undefined;
+    var names: [30][16]u8 = undefined;
+    for (&items, &names, 0..) |*item, *name, i| {
+        item.* = .{ .path = try std.mem.print(name, "./{d:0>2}.txt", .{i}), .kind = .file, .matched_spans = &.{} };
+    }
+    state.stage(alloc, .{}, .ready, try Rows.copy(alloc, &items));
+    var index: usize = 0;
+    var window: usize = 0;
+    var receipt = state.view(index, window).receipt.?;
+    receipt.visible_rows = 6;
+    state.acknowledge(alloc, receipt, &index, &window);
+    for (0..7) |_| state.navigate(&index, &window, 1);
+    try std.testing.expectEqual(@as(usize, 2), window);
+    // Moving back up keeps the window until the selection reaches its top.
+    for (0..5) |_| state.navigate(&index, &window, -1);
+    try std.testing.expectEqual(@as(usize, 2), window);
+    state.navigate(&index, &window, -1);
+    try std.testing.expectEqual(@as(usize, 1), window);
+
+    receipt = state.view(index, window).receipt.?;
+    receipt.visible_rows = 10;
+    state.acknowledge(alloc, receipt, &index, &window);
+    for (0..8) |_| state.navigate(&index, &window, 1);
+    try std.testing.expectEqual(@as(usize, 9), index);
+    try std.testing.expectEqual(@as(usize, 1), window);
 }
 
 test "file picker prepared rows cannot replace presented identity before acknowledgement" {

@@ -710,6 +710,8 @@ export const createFxAgent = createDurableAgentFactory({
   name: "createFxAgent",
   label: "fx agent",
   defaultDurability: environmentDurability,
+  // One durability per environment, so agents created without one share it.
+  defaultShared: true,
   harness: fxHarness({
     createEngine: createFxEngine,
     // An explicit key, then the durability's own credential, such as a

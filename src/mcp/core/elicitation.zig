@@ -5,6 +5,8 @@
 //! and elicitationId by slot, and maps the server's cancels and completion
 //! notifications to slots. 2026 rounds are `core/mrtr.zig`'s chains; the host's answers
 //! there go through the same reader. Pure.
+//!
+//! TLA+ model: `tests/tla/mcp/Elicitation.tla`.
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

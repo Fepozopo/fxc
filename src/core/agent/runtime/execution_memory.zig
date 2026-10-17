@@ -307,6 +307,8 @@ fn steeringText(content: []const u8) ?[]const u8 {
     return content[steering_open.len .. content.len - steering_close.len];
 }
 
+/// Which steering and feedback a cancelled turn keeps is modeled in
+/// `tests/tla/session_manager/rollout/pr-1092/PR1092Steering.tla`.
 pub fn buildInterruptedExecutionMemory(
     alloc: Allocator,
     current_turn_messages: []const ChatMessage,

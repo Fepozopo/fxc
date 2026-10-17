@@ -101,6 +101,9 @@ const OwnedInput = struct {
     }
 };
 
+/// Decodes one shell call's arguments. How each argument shape is decoded,
+/// admitted, and shown in history is modeled in
+/// `tests/tla/shell_command/ShellContract.tla`.
 pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,

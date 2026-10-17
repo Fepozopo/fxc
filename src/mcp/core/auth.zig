@@ -9,6 +9,8 @@
 //!
 //! Pure. Tokens, URLs, and strings are the host's: a token is named by its
 //! generation, issuers are numbered from 1, and scopes are bits.
+//!
+//! TLA+ models: `tests/tla/mcp/AuthGate.tla` (`Gate`) and `tests/tla/mcp/AuthFlow.tla` (`Flow`).
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

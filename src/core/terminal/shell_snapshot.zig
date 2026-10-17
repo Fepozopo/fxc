@@ -10,6 +10,8 @@
 //!
 //! Snapshot contents stay in memory. They reach a command only through its
 //! environment and the supervisor's stdin script, and are never logged.
+//!
+//! TLA+ model: `tests/tla/terminal/ShellSnapshot.tla`.
 
 const std = @import("std");
 const builtin = @import("builtin");

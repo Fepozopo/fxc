@@ -2,6 +2,8 @@
 //! The caller owns the listen requests, whose ids come from the request table
 //! as kind `listen` (no timeouts), and the transport: it opens with
 //! `opened` after `canOpen`, and answers `relisten` with `resent`.
+//!
+//! TLA+ model: `tests/tla/mcp/Subscription.tla`.
 
 const std = @import("std");
 const trace = @import("../io/trace.zig");

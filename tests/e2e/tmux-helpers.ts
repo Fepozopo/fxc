@@ -1409,7 +1409,8 @@ export class TmuxSession {
     rmSync(this.exitStatusPath, { force: true });
   }
 
-  private recordedExitStatus(): number | null {
+  /// The fx process's exit status once the pane has ended, or null.
+  recordedExitStatus(): number | null {
     try {
       const value = Number.parseInt(readFileSync(this.exitStatusPath, "utf8").trim(), 10);
       return Number.isSafeInteger(value) && value >= 0 && value <= 255 ? value : null;

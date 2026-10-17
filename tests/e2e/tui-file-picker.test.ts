@@ -480,6 +480,43 @@ describe("@ file picker", () => {
   );
 
   tmuxTest(
+    "shows ten rows when the terminal has room and scrolls the rows it shows",
+    async () => {
+      const current = createFixture("fx-file-picker-rows-");
+      const names = Array.from({ length: 30 }, (_, i) => `item-${String(i).padStart(2, "0")}.txt`);
+      for (const name of names) writeFileSync(join(current.workspace, name), "x");
+      gateway = startFakeGateway([]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: current.workspace, env: mockFxEnvironment(current, gateway),
+        isolated: true, width: 112, height: 40, stderrPath: current.stderrPath,
+      });
+      const active = session;
+      await active.waitForComposer(TIMEOUT);
+      await active.sendLiteral("@item-");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(0, 10).join("|"), TIMEOUT);
+
+      // A short terminal keeps six rows, and navigation scrolls those six:
+      // moving back up leaves the window in place until the selection passes
+      // its top row.
+      await active.resizeWindow(112, 16);
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(0, 6).join("|"), TIMEOUT);
+      for (let i = 0; i < 7; i++) await active.sendKeys("Down");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(2, 8).join("|"), TIMEOUT);
+      for (let i = 0; i < 6; i++) await active.sendKeys("Up");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(1, 7).join("|"), TIMEOUT);
+      await active.sendKeys("Tab");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "@item-01.txt", TIMEOUT);
+      expect(gateway.requests).toHaveLength(0);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
     "paints a folder's rows with the keystroke instead of a loading frame",
     async () => {
       const current = createFixture("fx-file-picker-folder-frame-");

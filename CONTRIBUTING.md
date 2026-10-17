@@ -112,6 +112,16 @@ The script builds a ReleaseSafe binary and needs hyperfine. On macOS, process an
 python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin/fx
 ```
 
+### Check a TLA+ model
+
+`tests/tla/` holds TLA+ models of fx, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer, and libfx. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the libfx model; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
+
+```bash
+tests/tla/session_manager/check.sh SessionLog
+tests/tla/mcp/check.sh --model Engine
+bun test ./tests/tla/drivers/shell_command/
+```
+
 ### Run the model evals
 
 The evals in `tests/evals/` drive the agent through `fx ask --json` against real models and need `AI_GATEWAY_API_KEY`. They make billed model calls and their results vary between runs, so they aren't part of the pull request checks.

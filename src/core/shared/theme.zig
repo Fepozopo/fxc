@@ -99,7 +99,7 @@ pub const fx_dark: Theme = .{
     .permission_auto_style = "\x1b[38;5;252m",
     .user_card_marker_style = "\x1b[38;5;255m",
     .user_card_accent_style = "\x1b[38;5;252m",
-    .inline_code_open = "\x1b[38;5;245m",
+    .inline_code_open = "\x1b[38;5;255m",
     .task_completed_open = "\x1b[38;5;252m",
     .tool_stdout_style = "\x1b[38;5;245m",
     .tool_stderr_style = "\x1b[38;5;252m",
@@ -142,7 +142,7 @@ pub const fx_light: Theme = .{
     .permission_auto_style = "\x1b[38;5;238m",
     .user_card_marker_style = "\x1b[38;5;235m",
     .user_card_accent_style = "\x1b[38;5;238m",
-    .inline_code_open = "\x1b[38;5;247m",
+    .inline_code_open = "\x1b[38;5;235m",
     .link_style = "\x1b[38;5;25m",
     .task_completed_open = "\x1b[38;5;238m",
     .tool_stdout_style = "\x1b[38;5;245m",
@@ -871,7 +871,7 @@ test "builtin themes pin the historical fx palette bytes" {
     try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_dark.statusline_style);
     try std.testing.expectEqualStrings("\x1b[38;5;255m", fx_dark.user_card_marker_style);
     try std.testing.expectEqualStrings("\x1b[38;5;252m", fx_dark.user_card_accent_style);
-    try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_dark.inline_code_open);
+    try std.testing.expectEqualStrings("\x1b[38;5;255m", fx_dark.inline_code_open);
     try std.testing.expectEqualStrings("\x1b[38;5;252m", fx_dark.task_completed_open);
     try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_dark.tool_stdout_style);
     try std.testing.expectEqualStrings("\x1b[38;5;252m", fx_dark.tool_stderr_style);
@@ -884,7 +884,7 @@ test "builtin themes pin the historical fx palette bytes" {
     try std.testing.expectEqualStrings("\x1b[38;5;241m", fx_light.statusline_style);
     try std.testing.expectEqualStrings("\x1b[38;5;235m", fx_light.user_card_marker_style);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.user_card_accent_style);
-    try std.testing.expectEqualStrings("\x1b[38;5;247m", fx_light.inline_code_open);
+    try std.testing.expectEqualStrings("\x1b[38;5;235m", fx_light.inline_code_open);
     try std.testing.expectEqualStrings("\x1b[38;5;238m", fx_light.task_completed_open);
     // Tool text stays the pre-theme gray in both variants (parity guard).
     try std.testing.expectEqualStrings("\x1b[38;5;245m", fx_light.tool_stdout_style);
