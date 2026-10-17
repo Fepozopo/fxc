@@ -48,6 +48,6 @@ pub const Fixture = struct {
     }
 
     pub fn options(f: *const Fixture) Options {
-        return .{ .client_version = "test", .credentials = .{ .home = f.home, .backend = .file } };
+        return .{ .client_version = "test", .credentials = .{ .store = .{ .home = f.home, .backend = .file } } };
     }
 };

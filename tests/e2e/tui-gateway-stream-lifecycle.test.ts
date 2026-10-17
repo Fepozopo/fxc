@@ -3178,7 +3178,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const savedSession = readSavedSession();
 
       expect(pane).toContain(finalText);
-      expect(scrollback).toContain("Failed tool result");
+      expect(scrollback).toContain("Failed more output");
       expect(continuation).toContain(expectedFailure);
       expect(savedSession).toContain('"status":"failure"');
       expect(savedSession).toContain(expectedFailure);
@@ -5184,6 +5184,104 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
+  );
+
+  test(
+    "parallel saved-output reads name the command they read",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-parallel-saved-reads-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      // Large enough that fx saves the command output behind a handle.
+      const lines = Array.from({ length: 4000 }, (_, index) => `SAVED_LINE_${String(index).padStart(5, "0")}`);
+      lines[2500] = "PARALLEL_READ_MATCH";
+      writeFileSync(join(workspace, "source.txt"), `${lines.join("\n")}\n`);
+
+      const readGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as {
+          prompt: Array<{ role: string; content: unknown }>;
+        };
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        ) as Array<Record<string, unknown>>;
+        const output = (callId: string): string | null => {
+          const part = parts.find((candidate) =>
+            candidate.type === "tool-result" && candidate.toolCallId === callId,
+          );
+          return part ? contentText(part.output) : null;
+        };
+        if (output("parallel_read_query") !== null && output("parallel_read_range") !== null) {
+          return fakeGatewayFinalText("PARALLEL_READS_FINISHED");
+        }
+        const source = output("parallel_read_source");
+        if (source === null) {
+          return fakeGatewayToolCall("parallel_read_source", "shell", {
+            request: { action: "run", command: "cat source.txt", profile: "clean", yield_time_ms: 30000 },
+          });
+        }
+        const handle = (JSON.parse(source) as { full_output_handle: string | null }).full_output_handle;
+        if (!handle) return new Response("missing saved output handle", { status: 500 });
+        return fakeGatewaySse([
+          {
+            type: "tool-call",
+            toolCallId: "parallel_read_query",
+            toolName: "read_tool_result",
+            input: { request: { handle, query: "PARALLEL_READ_MATCH" } },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "parallel_read_range",
+            toolName: "read_tool_result",
+            input: { request: { handle, start_byte: 20000, byte_count: 1024 } },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]);
+      }, { classifierDecision: "clear" });
+      gateway = readGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 110,
+        height: 35,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-parallel-saved-reads-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_SOUND: "0",
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: readGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: readGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: readGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "tool",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the fixture, then search and page its saved output.");
+      await session.waitForText("PARALLEL_READS_FINISHED", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+
+      // Both reads ran as one parallel group and still name their source.
+      expect(readFileSync(tracePath, "utf8")).toMatch(/parallel_tool_group_start[^\n]*count=2/);
+      expect(scrollback).toContain("Searched cat source.txt output for \"PARALLEL_READ_MATCH\"");
+      expect(scrollback).toContain("Read more output from cat source.txt");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    },
+    TIMEOUT * 2,
   );
 
   test(

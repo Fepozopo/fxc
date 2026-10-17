@@ -15,6 +15,7 @@ const session_json = @import("../session/session_json.zig");
 const compactor = @import("../compactor/compactor.zig");
 const session_store = @import("../session/session_store.zig");
 const usage = @import("../../usage/usage.zig");
+const local_time = @import("../shared/local_time.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const update_notes = @import("../upgrade/update_notes.zig");
@@ -81,11 +82,9 @@ pub const UsageSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
+        // The period stays in UTC days, the days AI Gateway reports by.
         try out.writer.print("Usage ({s}, UTC) from AI Gateway", .{v.period.label()});
-        if (v.fetched_at_ms) |ms| {
-            const minutes: u64 = @intCast(@mod(@divFloor(ms, std.time.ms_per_min), 24 * 60));
-            try out.writer.print(", updated {d:0>2}:{d:0>2} UTC", .{ minutes / 60, minutes % 60 });
-        }
+        if (v.fetched_at_ms) |ms| try writeLocalClock(&out.writer, ", updated ", ms);
         try out.writer.writeByte('\n');
         switch (s.status) {
             .ready, .fetching => {},
@@ -138,7 +137,7 @@ pub const UsageSnapshot = struct {
             try out.writer.writeAll(" for ");
             try writeTerminalSafe(&out.writer, alloc, name);
         };
-        if (s.fetchedAtMs()) |ms| try writeUtcClock(&out.writer, ", updated ", ms);
+        if (s.fetchedAtMs()) |ms| try writeLocalClock(&out.writer, ", updated ", ms);
         try out.writer.writeByte('\n');
         switch (s.status) {
             .ready => {},
@@ -173,7 +172,7 @@ pub const UsageSnapshot = struct {
                 try out.writer.writeAll("- ");
                 try writeTerminalSafe(&out.writer, alloc, limit.name);
                 try out.writer.print(" ({d}h window): {d:.0}% used", .{ @divFloor(w.window_seconds, 3600), w.used_percent });
-                if (w.resets_at_ms) |at| try writeUtcClock(&out.writer, ", resets ", at);
+                if (w.resets_at_ms) |at| try writeLocalClock(&out.writer, ", resets ", at);
                 try out.writer.writeByte('\n');
             }
         }
@@ -187,7 +186,7 @@ pub const UsageSnapshot = struct {
         defer out.deinit();
 
         try out.writer.writeAll("Grok usage from xAI");
-        if (s.fetchedAtMs()) |ms| try writeUtcClock(&out.writer, ", updated ", ms);
+        if (s.fetchedAtMs()) |ms| try writeLocalClock(&out.writer, ", updated ", ms);
         try out.writer.writeByte('\n');
         switch (s.status) {
             .ready => {},
@@ -211,9 +210,12 @@ pub const UsageSnapshot = struct {
         if (u.used_percent) |used| {
             try out.writer.print("Used          {d:.0}% of the {s} allowance", .{ @floor(used), if (u.period) |p| @tagName(p) else "plan's" });
             if (u.resets_at_ms) |at| {
-                var date_buf: [24]u8 = undefined;
-                try out.writer.print(", resets {s}", .{formatUtcDate(&date_buf, at)});
-                try writeUtcClock(&out.writer, " ", at);
+                try out.writer.writeAll(", resets ");
+                if (local_time.local(at)) |reading| {
+                    var date_buf: [24]u8 = undefined;
+                    try out.writer.print("{s} ", .{formatDate(&date_buf, &reading)});
+                    try writeClock(&out.writer, &reading);
+                } else try out.writer.writeAll("unknown");
             }
             try out.writer.writeByte('\n');
         }
@@ -345,22 +347,23 @@ fn writeOptionalCount(writer: *std.Io.Writer, value: ?u64) !void {
     if (value) |v| try writer.print("{d}", .{v}) else try writer.writeAll("-");
 }
 
-/// `<prefix>08:14 UTC` for a timestamp in milliseconds.
-fn writeUtcClock(writer: *std.Io.Writer, prefix: []const u8, ms: i64) !void {
-    const minutes: u64 = @intCast(@mod(@divFloor(ms, std.time.ms_per_min), 24 * 60));
-    try writer.print("{s}{d:0>2}:{d:0>2} UTC", .{ prefix, minutes / 60, minutes % 60 });
+/// `<prefix>08:14 PDT` for a timestamp in milliseconds, in local time.
+fn writeLocalClock(writer: *std.Io.Writer, prefix: []const u8, ms: i64) !void {
+    try writer.writeAll(prefix);
+    const reading = local_time.local(ms) orelse return writer.writeAll("unknown");
+    try writeClock(writer, &reading);
 }
 
-/// `Oct 11, 2026` for a timestamp in milliseconds, or `Unknown`.
-fn formatUtcDate(buf: *[24]u8, timestamp_ms: i64) []const u8 {
-    if (timestamp_ms < 0) return "Unknown";
-    const seconds: u64 = @intCast(@divFloor(timestamp_ms, std.time.ms_per_s));
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = seconds };
-    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
+/// `08:14 PDT`.
+fn writeClock(writer: *std.Io.Writer, reading: *const local_time.Reading) !void {
+    try writer.print("{d:0>2}:{d:0>2} {s}", .{ reading.hour, reading.minute, reading.zoneName() });
+}
+
+/// `Oct 11, 2026`.
+fn formatDate(buf: *[24]u8, reading: *const local_time.Reading) []const u8 {
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    const month = months[month_day.month.numeric() - 1];
-    return std.mem.print(buf, "{s} {d}, {d}", .{ month, month_day.day_index + 1, year_day.year }) catch "Unknown";
+    const month = months[reading.month.numeric() - 1];
+    return std.mem.print(buf, "{s} {d}, {d}", .{ month, reading.day, reading.year }) catch "Unknown";
 }
 
 /// `Refresh failed: <why>.`, naming the service the numbers come from.
@@ -1269,7 +1272,7 @@ fn writeSessionListDetails(
         try writeTerminalSafe(writer, alloc, label);
     }
     try writer.writeAll(" | updated ");
-    try writeUtcTimestamp(writer, entry.updated_at_ms);
+    try writeLocalTimestamp(writer, entry.updated_at_ms);
     try writer.writeByte('\n');
 }
 
@@ -1309,29 +1312,10 @@ fn sessionLanguageLabel(tag: []const u8) ?[]const u8 {
     return tag;
 }
 
-fn writeUtcTimestamp(writer: *std.Io.Writer, timestamp_ms: i64) !void {
-    const max_supported_timestamp_ms: i64 = 253_402_300_799_999;
-    if (timestamp_ms < 0 or timestamp_ms > max_supported_timestamp_ms) {
-        try writer.writeAll("unknown");
-        return;
-    }
-
-    const epoch_secs: u64 = @intCast(@divTrunc(timestamp_ms, std.time.ms_per_s));
-    const milliseconds: u16 = @intCast(@mod(timestamp_ms, std.time.ms_per_s));
-    const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
-    const day = epoch.getDaySeconds();
-    const year_day = epoch.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-
-    try writer.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC", .{
-        year_day.year,
-        @backingInt(month_day.month),
-        month_day.day_index + 1,
-        day.getHoursIntoDay(),
-        day.getMinutesIntoHour(),
-        day.getSecondsIntoMinute(),
-        milliseconds,
-    });
+/// `2026-10-16 13:31:49.123 PDT` in local time, or `unknown`.
+fn writeLocalTimestamp(writer: *std.Io.Writer, timestamp_ms: i64) !void {
+    const reading = local_time.local(timestamp_ms) orelse return writer.writeAll("unknown");
+    try writer.print("{f}", .{reading});
 }
 
 pub const SessionSummarySnapshot = struct {
@@ -2852,6 +2836,26 @@ test "core session list snapshot text and json stay stable" {
     );
 }
 
+test "core session list text reads updated times in the local zone" {
+    const sessions = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("local"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_700_000_000_123,
+            .conversation_language = types.ConversationLanguage.default(),
+            .history_len = 0,
+        },
+    };
+    local_time.test_zone = .{ .offset_s = 5 * std.time.s_per_hour + 30 * std.time.s_per_min, .name = "IST" };
+    defer local_time.test_zone = .utc;
+    const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[sessions] 1 saved\n - Untitled session\n   id=local | 0 turns | updated 2023-11-15 03:43:20.123 IST\n",
+        text,
+    );
+}
+
 test "core session list text visibly escapes terminal controls in titles" {
     const sessions = [_]session_store.SessionSummary{
         .{
@@ -3652,6 +3656,16 @@ test "usage text and JSON render a Grok plan's allowance and credits" {
         text,
     );
 
+    {
+        // West of UTC, the reset falls on the previous calendar day.
+        local_time.test_zone = .{ .offset_s = -5 * std.time.s_per_hour, .name = "EST" };
+        defer local_time.test_zone = .utc;
+        const local_text = try (UsageSnapshot{ .snapshot = &snapshot }).render(alloc, .text);
+        defer alloc.free(local_text);
+        try std.testing.expect(std.mem.startsWith(u8, local_text, "Grok usage from xAI, updated 03:14 EST\n"));
+        try std.testing.expect(std.mem.find(u8, local_text, ", resets Oct 14, 2026 19:00 EST\n") != null);
+    }
+
     var failed = snapshot;
     failed.status = .{ .failed = .network };
     const failed_text = try (UsageSnapshot{ .snapshot = &failed }).render(alloc, .text);
@@ -3748,6 +3762,17 @@ test "usage text and JSON render a Codex plan's limits" {
         text,
     );
 
+    {
+        local_time.test_zone = .{ .offset_s = 5 * std.time.s_per_hour + 30 * std.time.s_per_min, .name = "IST" };
+        defer local_time.test_zone = .utc;
+        const local_text = try contract.render(alloc, .text);
+        defer alloc.free(local_text);
+        try std.testing.expectEqualStrings(
+            "Codex usage from ChatGPT, updated 13:44 IST\nPlan          plus\nCredits       none\nSpend limit   not reached\n\nLimits\n- codex (5h window): 42% used, resets 15:44 IST\n",
+            local_text,
+        );
+    }
+
     const json = try contract.render(alloc, .json);
     defer alloc.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
@@ -3782,15 +3807,11 @@ pub const SlackSnapshot = struct {
             else
                 "Your fx Slack bot credentials are saved on this computer.\n");
             if (self.expires_at_ms) |expiry| {
-                if (expiry >= 0 and expiry <= 253_402_300_799_999) {
+                if (local_time.local(expiry)) |reading| {
                     var date_buf: [24]u8 = undefined;
-                    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@divFloor(expiry, std.time.ms_per_s)) };
-                    const day = epoch.getDaySeconds();
-                    try out.writer.print("Access expires on {s} at {d:0>2}:{d:0>2} UTC.\n", .{
-                        formatUtcDate(&date_buf, expiry),
-                        day.getHoursIntoDay(),
-                        day.getMinutesIntoHour(),
-                    });
+                    try out.writer.print("Access expires on {s} at ", .{formatDate(&date_buf, &reading)});
+                    try writeClock(&out.writer, &reading);
+                    try out.writer.writeAll(".\n");
                 } else {
                     try out.writer.writeAll("Access expiration time is unavailable.\n");
                 }
@@ -3800,3 +3821,31 @@ pub const SlackSnapshot = struct {
         return out.toOwnedSlice();
     }
 };
+
+test "slack text reads the access expiry in the local zone" {
+    const alloc = std.testing.allocator;
+    var snapshot: SlackSnapshot = .{
+        .action = "status",
+        .installed = true,
+        .app_id = null,
+        .team_id = null,
+        .bot_user_id = null,
+        // 2026-10-15 00:00 UTC.
+        .expires_at_ms = 20741 * std.time.ms_per_day,
+        .refresh_expires_at_ms = null,
+    };
+    const utc_text = try snapshot.render(alloc, .text);
+    defer alloc.free(utc_text);
+    try std.testing.expect(std.mem.find(u8, utc_text, "Access expires on Oct 15, 2026 at 00:00 UTC.\n") != null);
+
+    local_time.test_zone = .{ .offset_s = -7 * std.time.s_per_hour, .name = "PDT" };
+    defer local_time.test_zone = .utc;
+    const local_text = try snapshot.render(alloc, .text);
+    defer alloc.free(local_text);
+    try std.testing.expect(std.mem.find(u8, local_text, "Access expires on Oct 14, 2026 at 17:00 PDT.\n") != null);
+
+    snapshot.expires_at_ms = -1;
+    const unknown_text = try snapshot.render(alloc, .text);
+    defer alloc.free(unknown_text);
+    try std.testing.expect(std.mem.find(u8, unknown_text, "Access expiration time is unavailable.\n") != null);
+}

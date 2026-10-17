@@ -1770,7 +1770,8 @@ pub const State = struct {
         var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const statuses = lease.host.runtime.statuses(a) catch return "";
+        // The status line never shows sign-in state, so it doesn't wait for it.
+        const statuses = lease.host.runtime.statusesNow(a) catch return "";
         sink.mutex.lockUncancelable(io_mod.getIo());
         const news: ?[]const u8 = if (sink.news) |text|
             (if (now_ms - sink.news_at_ms < mcp_menu.news_ms) a.dupe(u8, text) catch null else null)
@@ -2045,7 +2046,10 @@ pub const State = struct {
         try out.appendSlice(a, &verb_completions);
         const lease = self.leaseHost() orelse return out.items;
         defer lease.deinit();
-        const statuses = try lease.host.runtime.statuses(a);
+        // Rebuilt twice a second on the UI thread, so it doesn't wait for
+        // saved credentials: a description says "signed in" from the next
+        // rebuild after they are restored.
+        const statuses = try lease.host.runtime.statusesNow(a);
         for (statuses, lease.host.runtime.servers()) |status, server| {
             if (!mcp_command_provider.isValidServerName(status.name)) continue;
             const description = try mcp_verbs.statusText(a, status);

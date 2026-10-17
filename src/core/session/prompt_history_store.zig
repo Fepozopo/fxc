@@ -598,11 +598,13 @@ fn serializeRecord(
 }
 
 fn parseRecord(alloc: Allocator, line: []const u8) !ParsedRecord {
+    // Strings may point into `line`, which outlives the parse; everything
+    // returned is copied before `parsed` is freed.
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
         line,
-        .{ .allocate = .alloc_always },
+        .{ .allocate = .alloc_if_needed },
     );
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 4) {
@@ -662,6 +664,9 @@ fn processCompleteLine(
     entries: *std.ArrayList(LoadedPromptHistoryEntry),
 ) !void {
     if (line.len + 1 > max_record_bytes) return;
+    // Most lines belong to other workspaces; skip them before the full parse,
+    // which costs far more and runs before the first frame.
+    if (!mayBelongToWorkspace(line, workspace_root)) return;
     var record = parseRecord(alloc, line) catch |err| {
         debug_trace.logf(
             "prompt_history",
@@ -680,6 +685,30 @@ fn processCompleteLine(
         alloc.free(text);
         return err;
     };
+}
+
+/// False only when `line` can't be a record for `workspace_root`: every
+/// `"workspace_root":"` in it has a value with no escape that differs from
+/// it, and a value with no escape decodes to its own bytes. That key can't
+/// occur inside a string, where each quote is escaped. Anything else, such
+/// as an escaped value or a key written with spaces, goes to the full parse,
+/// which decides the line as before.
+fn mayBelongToWorkspace(line: []const u8, workspace_root: []const u8) bool {
+    const key = "\"workspace_root\":\"";
+    var found = false;
+    var i: usize = 0;
+    // Hopping between quotes is a vector scan; a substring search costs
+    // more than the lines it skips.
+    while (std.mem.findScalarPos(u8, line, i, '"')) |quote| {
+        i = quote + 1;
+        if (!std.mem.startsWith(u8, line[quote..], key)) continue;
+        found = true;
+        const start = quote + key.len;
+        const end = std.mem.findAnyPos(u8, line, start, "\"\\") orelse return true;
+        if (line[end] == '\\' or std.mem.eql(u8, line[start..end], workspace_root)) return true;
+        i = end + 1;
+    }
+    return !found;
 }
 
 fn repairIncompleteTail(file: std.Io.File) !void {
@@ -949,6 +978,53 @@ test "reverse load filters workspace bounds results and preserves chronology" {
     defer freeLoadedEntries(alloc, other);
     try std.testing.expectEqual(@as(usize, 1), other.len);
     try std.testing.expectEqualStrings("other", other[0].text);
+}
+
+test "the workspace prefilter skips only lines that can't be the workspace's" {
+    const root = "/tmp/workspace-a";
+    try std.testing.expect(mayBelongToWorkspace("{\"schema_version\":1,\"timestamp_ms\":1,\"workspace_root\":\"/tmp/workspace-a\",\"text\":\"x\"}", root));
+    try std.testing.expect(!mayBelongToWorkspace("{\"schema_version\":1,\"timestamp_ms\":1,\"workspace_root\":\"/tmp/workspace-b\",\"text\":\"x\"}", root));
+    // A prefix of the root, or the root inside a longer path, is another workspace.
+    try std.testing.expect(!mayBelongToWorkspace("{\"workspace_root\":\"/tmp/workspace\",\"text\":\"x\"}", root));
+    try std.testing.expect(!mayBelongToWorkspace("{\"workspace_root\":\"/tmp/workspace-a/sub\",\"text\":\"x\"}", root));
+    // Text that quotes a matching key doesn't count: its quotes are escaped.
+    try std.testing.expect(!mayBelongToWorkspace("{\"workspace_root\":\"/tmp/workspace-b\",\"text\":\"\\\"workspace_root\\\":\\\"/tmp/workspace-a\\\"\"}", root));
+    // Otherwise the full parse decides: an escaped value, a key with spaces,
+    // a second key, a value with no end, or a line with no key at all.
+    try std.testing.expect(mayBelongToWorkspace("{\"workspace_root\":\"\\/tmp\\/workspace-a\"}", root));
+    try std.testing.expect(mayBelongToWorkspace("{\"workspace_root\" : \"/tmp/workspace-b\"}", root));
+    try std.testing.expect(mayBelongToWorkspace("{\"workspace_root\":\"/tmp/workspace-b\",\"workspace_root\":\"/tmp/workspace-a\"}", root));
+    try std.testing.expect(mayBelongToWorkspace("{\"workspace_root\":\"/tmp/workspace-a", root));
+    try std.testing.expect(mayBelongToWorkspace("{malformed}", root));
+}
+
+test "reverse load keeps a record whose workspace is written with escapes or spaces" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    const plain = try fixtureLine(alloc, 1, "/tmp/workspace-a", "plain");
+    defer alloc.free(plain);
+    const escaped = try fixtureLine(alloc, 2, "\\/tmp\\/workspace-a", "escaped");
+    defer alloc.free(escaped);
+    const other = try fixtureLine(alloc, 3, "/tmp/workspace-b", "other");
+    defer alloc.free(other);
+    const bytes = try std.mem.concat(alloc, u8, &.{
+        plain,
+        escaped,
+        "{\"schema_version\":1, \"timestamp_ms\":4, \"workspace_root\" : \"/tmp/workspace-a\", \"text\":\"spaced\"}\n",
+        other,
+    });
+    defer alloc.free(bytes);
+    try writeFixture(home, bytes);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace-a", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try expectTexts(entries, &.{ "plain", "escaped", "spaced" });
 }
 
 test "reverse load scans beyond one mebibyte of newer interleaved workspace records" {

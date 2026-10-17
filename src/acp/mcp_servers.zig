@@ -140,7 +140,7 @@ fn prepareHost(
     defer inherited.deinit();
     const h = mcp_host.Host.create(alloc, io_mod.getIo(), configs, &inherited, .{
         .client_version = build_options.app_version,
-        .credentials = .detect(alloc, home),
+        .credentials = .{ .detect = home },
         .questions = questions,
         .url_completions = url_completions,
     }, builtin_tools.registry) catch |err| switch (err) {

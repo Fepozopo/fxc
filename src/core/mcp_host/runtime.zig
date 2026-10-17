@@ -18,7 +18,6 @@ const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const url_opener = @import("../hosts/url_opener.zig");
-const secret = @import("../auth/secret.zig");
 const config = @import("config.zig");
 const credentials = @import("credentials.zig");
 const loopback = @import("login.zig");
@@ -132,7 +131,11 @@ pub const Notify = struct {
 
 pub const Options = struct {
     client_version: []const u8,
-    credentials: credentials.Store,
+    /// Where sign-in credentials are kept. `.detect` names the home whose
+    /// store the owner thread picks with `credentials.Store.detect`, so
+    /// `start` never waits for the Keychain; the owner replaces it with
+    /// that store before it handles any request.
+    credentials: union(enum) { detect: []const u8, store: credentials.Store },
     notify: ?Notify = null,
     /// The questions fx's UI on this surface can ask, declared to servers so
     /// they only ask those.
@@ -260,6 +263,9 @@ pub const Runtime = struct {
     /// Guarded by `mutex`: the latest statuses, in `snapshot_arena`.
     snapshot: []Status = &.{},
     snapshot_arena: std.heap.ArenaAllocator,
+    /// Set once the owner gave the servers their saved credentials and
+    /// published that, so `statuses` never reports a premature signed_in.
+    credentials_restored: std.Io.Event = .unset,
 
     /// Owner thread only.
     calls: std.AutoHashMapUnmanaged(engine.Handle, *Request) = .empty,
@@ -280,7 +286,8 @@ pub const Runtime = struct {
     /// owner thread. `configs` and `inherited` are read only during the call.
     /// `gpa` must be thread-safe, and `r` must not move until `deinit`: the
     /// engine and login tasks point at it. Nothing connects until a server
-    /// is needed.
+    /// is needed, and saved credentials are read on the owner thread, so
+    /// this never waits for the Keychain.
     pub fn start(
         r: *Runtime,
         gpa: Allocator,
@@ -302,17 +309,15 @@ pub const Runtime = struct {
         errdefer r.arena.deinit();
         errdefer r.snapshot_arena.deinit();
         const arena = r.arena.allocator();
-        r.resolved = try config.resolve(arena, configs, inherited, .{ .context = r, .get = savedCredential });
+        r.resolved = try config.resolve(arena, configs, inherited);
         r.flags = try arena.alloc(Flags, r.resolved.servers.len);
         for (r.flags) |*f| f.* = .{};
-        for (r.resolved.engine, r.resolved.engine_server) |c, i| r.flags[i].signed_in = c.auth.saved != null;
         try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
         }, r.resolved.engine);
         errdefer r.engine.deinit();
-        // The engine has its own copies now.
-        for (r.resolved.engine) |c| if (c.auth.saved) |s| std.crypto.secureZero(u8, @constCast(s));
-        // The rest may point into `configs`, which the caller may free now.
+        // The engine has its own copies now, and these may point into
+        // `configs`, which the caller may free now.
         r.resolved.engine = &.{};
         try r.publish();
         r.thread = try std.Thread.spawn(.{}, run, .{r});
@@ -340,8 +345,19 @@ pub const Runtime = struct {
         r.* = undefined;
     }
 
-    /// Every configured server's status, copied into `alloc`.
+    /// Every configured server's status, copied into `alloc`. Waits for the
+    /// owner to restore saved credentials, so `signed_in` is settled.
     pub fn statuses(r: *Runtime, alloc: Allocator) Allocator.Error![]Status {
+        _ = r.active.fetchAdd(1, .acq_rel);
+        defer _ = r.active.fetchSub(1, .acq_rel);
+        r.credentials_restored.waitUncancelable(r.io);
+        return r.statusesNow(alloc);
+    }
+
+    /// `statuses` without the wait, for the UI thread's periodic refreshes,
+    /// which must not hold up a frame: until the owner restored saved
+    /// credentials, every server reads as not signed in.
+    pub fn statusesNow(r: *Runtime, alloc: Allocator) Allocator.Error![]Status {
         _ = r.active.fetchAdd(1, .acq_rel);
         defer _ = r.active.fetchSub(1, .acq_rel);
         r.mutex.lockUncancelable(r.io);
@@ -514,6 +530,7 @@ pub const Runtime = struct {
     // ---- the owner thread ----
 
     fn run(r: *Runtime) void {
+        r.restoreCredentials();
         while (true) {
             const stopping = r.drain();
             r.flush();
@@ -650,7 +667,7 @@ pub const Runtime = struct {
                 const s = r.resolved.servers[i];
                 if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
                 try r.engine.signOut(s.name);
-                _ = r.options.credentials.remove(r.gpa, s.name, s.url.?) catch |err| {
+                _ = r.options.credentials.store.remove(r.gpa, s.name, s.url.?) catch |err| {
                     debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
                 };
                 r.flags[i] = .{};
@@ -931,11 +948,11 @@ pub const Runtime = struct {
             out.deinit();
         }
         if (try r.engine.saveCredential(s.name, &out.writer)) {
-            r.options.credentials.put(r.gpa, s.name, url, out.written()) catch |err| {
+            r.options.credentials.store.put(r.gpa, s.name, url, out.written()) catch |err| {
                 debug_trace.logf("mcp", "MCP credential not saved server={s} err={s}", .{ s.name, @errorName(err) });
             };
         } else {
-            _ = r.options.credentials.remove(r.gpa, s.name, url) catch |err| {
+            _ = r.options.credentials.store.remove(r.gpa, s.name, url) catch |err| {
                 debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
             };
         }
@@ -1157,17 +1174,32 @@ pub const Runtime = struct {
         return out;
     }
 
-    fn savedCredential(context: *anyopaque, alloc: Allocator, name: []const u8, url: []const u8) Allocator.Error!?[]u8 {
-        const r: *Runtime = @ptrCast(@alignCast(context));
-        const found = r.options.credentials.get(r.gpa, name, url) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                debug_trace.logf("mcp", "MCP credential not loaded server={s} err={s}", .{ name, @errorName(err) });
-                return null;
-            },
-        } orelse return null;
-        defer secret.zeroAndFree(r.gpa, found);
-        return try alloc.dupe(u8, found);
+    /// Before any request: picks the store when `start` left that to the
+    /// owner, reads it once, and gives each HTTP server its saved
+    /// credential, so no server starts without it. A store that can't be
+    /// read leaves every server signed out, as one without credentials.
+    fn restoreCredentials(r: *Runtime) void {
+        defer r.credentials_restored.set(r.io);
+        const store: credentials.Store = switch (r.options.credentials) {
+            .store => |s| s,
+            .detect => |home| .detect(r.gpa, home),
+        };
+        r.options.credentials = .{ .store = store };
+        var saved = store.snapshot(r.gpa) catch |err| {
+            debug_trace.logf("mcp", "MCP credentials not loaded err={s}", .{@errorName(err)});
+            return;
+        };
+        defer saved.deinit(r.gpa);
+        for (r.resolved.engine_server) |i| {
+            const s = r.resolved.servers[i];
+            const credential = saved.get(s.name, s.url orelse continue) orelse continue;
+            r.engine.restoreCredential(s.name, credential) catch |err| {
+                debug_trace.logf("mcp", "MCP credential not loaded server={s} err={s}", .{ s.name, @errorName(err) });
+                continue;
+            };
+            r.flags[i].signed_in = true;
+        }
+        r.publish() catch |err| debug_trace.logf("mcp", "MCP status not published err={s}", .{@errorName(err)});
     }
 
     /// Permission is fx's tool admission, before the call reaches the
@@ -1371,6 +1403,34 @@ test "a cancelled call ends, and stopping ends a call that never answers" {
     stopped = true;
     waiter.join();
     try testing.expectEqual(@as(?Error, error.Stopped), got);
+}
+
+test "saved credentials load on the owner thread, and statuses wait for them" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const store: credentials.Store = .{ .home = f.home, .backend = .file };
+    try store.put(testing.allocator, "web", "https://web.example.invalid/mcp", "{\"access\":\"w1\"}");
+    try store.put(testing.allocator, "moved", "https://old.example.invalid/mcp", "{\"access\":\"m1\"}");
+    const configs = [_]mcp_contract.McpServerConfig{
+        .{ .name = "web", .transport = .http, .url = "https://web.example.invalid/mcp" },
+        // A credential saved for another URL is not this server's.
+        .{ .name = "moved", .transport = .http, .url = "https://new.example.invalid/mcp" },
+        .{ .name = "none", .transport = .http, .url = "https://none.example.invalid/mcp" },
+        .{ .name = "fake", .command = f.server },
+    };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const got = try r.statuses(arena.allocator());
+    try testing.expect(got[0].signed_in);
+    try testing.expect(!got[1].signed_in);
+    try testing.expect(!got[2].signed_in);
+    try testing.expect(!got[3].signed_in);
+    try testing.expectEqual(State.idle, got[0].state);
 }
 
 test "held servers say why, and unknown names and stdio logins are refused" {

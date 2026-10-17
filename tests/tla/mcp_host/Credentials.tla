@@ -16,8 +16,9 @@
 \*     document lacks), and the document and the note are written at once,
 \*     even by `get`. A document with the flag but no note, saved before the
 \*     note existed, gets the note.
-\* Operations: get (config.resolve -> Runtime.savedCredential, for every
-\* HTTP server, whenever a host starts: `fx mcp list`, `fx ask`, the shell),
+\* Operations: get (Store.snapshot from Runtime.restoreCredentials, one read
+\* for every HTTP server, on the owner thread whenever a host starts:
+\* `fx mcp list`, `fx ask`, the shell),
 \* put (a `credential` event after a sign-in or refresh), remove (logout:
 \* runtime.zig `.logout`; verbs.zig remove and logout).
 \*
@@ -100,8 +101,8 @@ ReadEffect ==
     ELSE IF ~marked THEN Mark
     ELSE Same
 
-\* Store.get, from config.resolve when a host starts. An unreadable document
-\* gives no login and stays as it is.
+\* Store.snapshot, from Runtime.restoreCredentials when a host starts. An
+\* unreadable document gives no login and stays as it is.
 Get ==
     /\ ReadEffect
     /\ UNCHANGED <<v1, loggedOut, kept>>

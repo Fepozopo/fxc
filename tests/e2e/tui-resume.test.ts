@@ -1026,7 +1026,8 @@ test.skipIf(!tmuxAvailable())(
         active = await TmuxSession.create({
           cmd: `${FX_BIN} --resume-last`,
           cwd: realpathSync(workspace),
-          env: gatewayEnv(home, resumeGateway),
+          // A fixed zone, so entry headers show this zone's local time on every machine.
+          env: { ...gatewayEnv(home, resumeGateway), TZ: "IST-5:30" },
           stderrPath,
           width: 100,
           height: 32,
@@ -1037,7 +1038,7 @@ test.skipIf(!tmuxAvailable())(
         const full = await active.waitForPane(
           (pane) =>
             pane.includes("full detail · ctrl+o close") &&
-            pane.includes("UTC · Usage") &&
+            pane.includes("IST · Usage") &&
             /\(↑\d+ ↓5\)/.test(pane),
           TIMEOUT,
         );
@@ -1615,7 +1616,8 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath },
+        // A fixed zone, so entry headers show this zone's local time on every machine.
+        env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath, TZ: "IST-5:30" },
         stderrPath,
         width: 100,
         height: 32,
@@ -1652,7 +1654,7 @@ test.skipIf(!tmuxAvailable())(
           // The head of a 100-line output never shares a viewport with its tail.
           expect(before).not.toContain(tailMarker);
         }
-        if (/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC · Tool/.test(before)) sawToolHeader = true;
+        if (/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} IST · Tool/.test(before)) sawToolHeader = true;
         if (before.includes(commandArgumentTail)) sawCommandArgument = true;
         if (sawLineOne && sawToolHeader && sawCommandArgument) break;
         await active.sendKeys("PPage");
@@ -3371,7 +3373,8 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: realpathSync(workspace),
-        env: gatewayEnv(home, gateway),
+        // A fixed zone, so entry headers show this zone's local time on every machine.
+        env: { ...gatewayEnv(home, gateway), TZ: "IST-5:30" },
         stderrPath,
         width: 100,
         height: 40,
@@ -3399,13 +3402,13 @@ test.skipIf(!tmuxAvailable())(
       const grid = fullTranscript.replace(/\n$/, "").split("\n");
       const before = grid.findIndex((line) => line.includes(beforeMarker));
       const toolTimestamp = grid.findIndex(
-        (line, index) => index > before && line.includes("UTC · Tool"),
+        (line, index) => index > before && line.includes("IST · Tool"),
       );
       const header = grid.findIndex((line) => line.includes("1 tool call"));
       const tool = grid.findIndex((line) => line.includes("Ran "));
       const output = grid.findIndex((line) => line.trimStart().startsWith(`│ ${outputMarker}`));
       const afterTimestamp = grid.findIndex(
-        (line, index) => index > output && line.includes("UTC · Response"),
+        (line, index) => index > output && line.includes("IST · Response"),
       );
       const after = grid.findIndex((line) => line.includes(afterMarker));
       if (

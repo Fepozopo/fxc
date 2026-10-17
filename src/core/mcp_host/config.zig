@@ -45,12 +45,6 @@ pub const Server = struct {
     missing: ?[]const u8 = null,
 };
 
-/// Looks up the credential saved for a server; owned by `alloc`.
-pub const Saved = struct {
-    context: *anyopaque,
-    get: *const fn (context: *anyopaque, alloc: Allocator, name: []const u8, url: []const u8) Allocator.Error!?[]u8,
-};
-
 pub const Resolved = struct {
     servers: []Server,
     /// What the engine runs, in order: `engine[i]` is `servers[engine_server[i]]`.
@@ -58,10 +52,6 @@ pub const Resolved = struct {
     engine_server: []usize,
 };
 
-/// Allocates everything with `arena`, which must outlive the engine: the
-/// engine copies each config but keeps pointing at a stdio server's
-/// environment. A saved credential is copied into `arena`; zero it once the
-/// engine has its own copy.
 /// The command and its arguments as one line, quoting what a shell would split.
 fn commandLine(arena: Allocator, command: []const u8, args: []const []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -80,11 +70,14 @@ fn commandLine(arena: Allocator, command: []const u8, args: []const []const u8) 
     return out.items;
 }
 
+/// Allocates everything with `arena`, which must outlive the engine: the
+/// engine copies each config but keeps pointing at a stdio server's
+/// environment. Saved sign-in credentials are not read here: the runtime
+/// hands them to the engine from its own thread.
 pub fn resolve(
     arena: Allocator,
     configs: []const McpServerConfig,
     inherited: *const std.process.Environ.Map,
-    saved: ?Saved,
 ) Allocator.Error!Resolved {
     const servers = try arena.alloc(Server, configs.len);
     var engine: std.ArrayList(mcp.engine.Config) = .empty;
@@ -125,9 +118,6 @@ pub fn resolve(
         // the server's own.
         if (s.bridge and auth.resource == null) if (s.url) |url| {
             auth.resource = try arena.print("{s}/", .{origin(url)});
-        };
-        if (saved) |lookup| if (s.url) |url| {
-            auth.saved = try lookup.get(lookup.context, arena, s.name, url);
         };
         try engine.append(arena, .{ .name = s.name, .transport = transport, .auth = auth });
         try engine_server.append(arena, i);
@@ -227,14 +217,7 @@ test "stdio and HTTP servers become engine configs; the rest are held back with 
         .{ .name = "keyless", .transport = .http, .url = "https://k.example/mcp", .header_env = &missing_header },
         .{ .name = "carried", .transport = .http, .url = "http://acp.invalid/x", .source = .acp, .acp_server_id = @constCast("x") },
     };
-    const Lookup = struct {
-        fn get(_: *anyopaque, alloc: Allocator, name: []const u8, url: []const u8) Allocator.Error!?[]u8 {
-            if (std.mem.eql(u8, name, "linear") and std.mem.eql(u8, url, "https://mcp.linear.app/mcp")) return try alloc.dupe(u8, "{\"access\":\"a\"}");
-            return null;
-        }
-    };
-    var context: u8 = 0;
-    const r = try resolve(arena, &configs, &inherited, .{ .context = &context, .get = Lookup.get });
+    const r = try resolve(arena, &configs, &inherited);
 
     try testing.expectEqual(@as(usize, 3), r.engine.len);
     try testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, r.engine_server);
@@ -250,7 +233,8 @@ test "stdio and HTTP servers become engine configs; the rest are held back with 
     try testing.expectEqualStrings("t1", linear.transport.http.headers[0].value);
     try testing.expectEqualStrings("c1", linear.auth.client_id.?);
     try testing.expectEqualStrings("s1", linear.auth.client_secret.?);
-    try testing.expectEqualStrings("{\"access\":\"a\"}", linear.auth.saved.?);
+    // The runtime's thread hands over saved credentials later.
+    try testing.expect(linear.auth.saved == null);
     try testing.expectEqual(@as(?u16, 33418), r.servers[2].callback_port);
 
     try testing.expectEqual(@as(?Held, .disabled), r.servers[3].held);
@@ -272,7 +256,7 @@ test "Slack signs in as fx's Slack app through the bridge, unless the config nam
         .{ .name = "mine", .transport = .http, .url = "https://mcp.slack.com/mcp", .auth = .{ .client_id = @constCast("my-app") } },
         .{ .name = "linear", .transport = .http, .url = "https://mcp.linear.app/mcp" },
     };
-    const r = try resolve(arena_state.allocator(), &configs, &inherited, null);
+    const r = try resolve(arena_state.allocator(), &configs, &inherited);
     try testing.expectEqualStrings(slack.client_id, r.engine[0].auth.client_id.?);
     try testing.expect(r.servers[0].bridge);
     try testing.expectEqualStrings("https://mcp.slack.com/", r.engine[0].auth.resource.?);
@@ -292,7 +276,7 @@ test "a stdio server starts in the directory its config names" {
         .{ .name = "proj", .command = "node", .args = &.{"s.js"}, .cwd = @constCast("/work/app") },
         .{ .name = "here", .command = "node", .args = &.{"s.js"} },
     };
-    const r = try resolve(arena_state.allocator(), &configs, &inherited, null);
+    const r = try resolve(arena_state.allocator(), &configs, &inherited);
     try testing.expectEqualStrings("/work/app", r.engine[0].transport.stdio.cwd.?);
     try testing.expect(r.engine[1].transport.stdio.cwd == null);
 }
@@ -307,7 +291,7 @@ test "a token from the environment becomes the Authorization header" {
         .{ .name = "plain", .transport = .http, .url = "https://mcp.plain.com/mcp", .bearer_token_env = @constCast("PLAIN_KEY") },
         .{ .name = "unset", .transport = .http, .url = "https://u.example/mcp", .bearer_token_env = @constCast("UNSET_KEY") },
     };
-    const r = try resolve(arena_state.allocator(), &configs, &inherited, null);
+    const r = try resolve(arena_state.allocator(), &configs, &inherited);
     try testing.expectEqual(@as(usize, 1), r.engine.len);
     try testing.expectEqualStrings("Authorization", r.engine[0].transport.http.headers[0].name);
     try testing.expectEqualStrings("Bearer k1", r.engine[0].transport.http.headers[0].value);

@@ -297,6 +297,16 @@ pub const Engine = struct {
         return s.saveCredential(w);
     }
 
+    /// Gives server `name` the credential `saveCredential` wrote, as
+    /// `Config.auth.saved` does, for a host that reads it after `init`.
+    /// `saved` is copied. Call it before anything starts the server: a
+    /// running server keeps the sign-in it has.
+    pub fn restoreCredential(e: *Engine, name: []const u8, saved: []const u8) Error!void {
+        const slot = try e.find(name);
+        std.debug.assert(slot.server == null);
+        slot.config.auth.saved = try slot.arena.allocator().dupe(u8, saved);
+    }
+
     /// Wakes a `next` that waits, from any thread: it returns null early, so
     /// the host can act on what it was woken for.
     pub fn wake(e: *Engine) void {
@@ -635,6 +645,29 @@ test "wake from another thread ends a waiting next early" {
     e.wake();
     try std.testing.expectEqual(@as(?Event, null), try e.next(10_000));
     try std.testing.expect(e.now() - started < 5_000);
+}
+
+test "a credential restored after init is the one the server starts with" {
+    const Fake = struct {
+        fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
+            return true;
+        }
+        fn log(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    };
+    var context: u8 = 0;
+    var e: Engine = undefined;
+    const servers = [_]Config{.{ .name = "web", .transport = .{ .http = .{ .url = "https://web.example.invalid/mcp" } } }};
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &context, .allow = Fake.allow, .log = Fake.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    }, &servers);
+    defer e.deinit();
+
+    var saved = "{\"access\":\"w1\"}".*;
+    try e.restoreCredential("web", &saved);
+    // The engine keeps its own copy.
+    @memset(&saved, 0);
+    try std.testing.expectEqualStrings("{\"access\":\"w1\"}", e.slots.items[0].config.auth.saved.?);
+    try std.testing.expectError(error.UnknownServer, e.restoreCredential("nope", "{}"));
 }
 
 test "a stdio server's directory is part of its config, so a new one restarts it" {

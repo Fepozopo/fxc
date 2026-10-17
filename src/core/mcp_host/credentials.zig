@@ -39,15 +39,13 @@ pub const Store = struct {
         return .{ .home = home, .backend = if (keychain) .keychain else .file };
     }
 
-    /// The credential saved for `name` at `url`, or null. The caller owns it
-    /// and frees it with `secret.zeroAndFree`.
-    pub fn get(s: Store, alloc: Allocator, name: []const u8, url: []const u8) !?[]u8 {
+    /// Every saved credential from one read of the store, so a host with
+    /// many servers reads the Keychain once, not once per server. The
+    /// caller frees it with `Snapshot.deinit`.
+    pub fn snapshot(s: Store, alloc: Allocator) !Snapshot {
         var locked = try s.lock();
         defer locked.release();
-        var doc = try s.read(alloc, &locked.dir);
-        defer doc.deinit(alloc);
-        const i = doc.find(name, url) orelse return null;
-        return try alloc.dupe(u8, doc.entries.items[i].credential);
+        return .{ .doc = try s.read(alloc, &locked.dir) };
     }
 
     /// Saves `credential` for `name` at `url`, replacing any earlier one.
@@ -159,6 +157,24 @@ pub const Store = struct {
             .keychain => try native_keychain.storeMcpHostCredentials(out.written()),
             .file => try io_mod.durableReplaceVerified(alloc, dir, file_name, out.written()),
         }
+    }
+};
+
+/// The saved credentials as one read of the store found them.
+pub const Snapshot = struct {
+    doc: Doc,
+
+    /// The credential saved for `name` at `url`, or null. Borrowed from the
+    /// snapshot until `deinit`.
+    pub fn get(s: *const Snapshot, name: []const u8, url: []const u8) ?[]const u8 {
+        const i = s.doc.find(name, url) orelse return null;
+        return s.doc.entries.items[i].credential;
+    }
+
+    /// Zeroes the credentials and frees them.
+    pub fn deinit(s: *Snapshot, alloc: Allocator) void {
+        s.doc.deinit(alloc);
+        s.* = undefined;
     }
 };
 
@@ -278,6 +294,33 @@ fn testHome(tmp: *testing.TmpDir) ![]u8 {
     return io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
 }
 
+/// The credential saved for `name` at `url` from a fresh read, or null.
+/// The caller frees it with `secret.zeroAndFree`.
+fn savedFor(store: Store, name: []const u8, url: []const u8) !?[]u8 {
+    var saved = try store.snapshot(testing.allocator);
+    defer saved.deinit(testing.allocator);
+    const credential = saved.get(name, url) orelse return null;
+    return try testing.allocator.dupe(u8, credential);
+}
+
+test "one snapshot holds every server's credential" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    const store: Store = .{ .home = home, .backend = .file };
+    try store.put(testing.allocator, "linear", "https://mcp.linear.app/mcp", "{\"access\":\"l1\"}");
+    try store.put(testing.allocator, "plain", "https://mcp.plain.com/mcp", "{\"access\":\"p1\"}");
+
+    var saved = try store.snapshot(testing.allocator);
+    defer saved.deinit(testing.allocator);
+    try testing.expectEqualStrings("{\"access\":\"l1\"}", saved.get("linear", "https://mcp.linear.app/mcp").?);
+    try testing.expectEqualStrings("{\"access\":\"p1\"}", saved.get("plain", "https://mcp.plain.com/mcp").?);
+    // A credential is kept per name and URL.
+    try testing.expectEqual(@as(?[]const u8, null), saved.get("plain", "https://mcp.linear.app/mcp"));
+    try testing.expectEqual(@as(?[]const u8, null), saved.get("slack", "https://mcp.slack.com/mcp"));
+}
+
 test "a credential is kept per server name and URL, replaced, and removed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -285,21 +328,21 @@ test "a credential is kept per server name and URL, replaced, and removed" {
     defer testing.allocator.free(home);
     const store: Store = .{ .home = home, .backend = .file };
 
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
+    try testing.expectEqual(@as(?[]u8, null), try savedFor(store, "linear", "https://mcp.linear.app/mcp"));
     try store.put(testing.allocator, "linear", "https://mcp.linear.app/mcp", "{\"access\":\"a1\"}");
     try store.put(testing.allocator, "linear", "https://other.example/mcp", "{\"access\":\"b1\"}");
     try store.put(testing.allocator, "linear", "https://mcp.linear.app/mcp", "{\"access\":\"a2\"}");
 
-    const first = (try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp")).?;
+    const first = (try savedFor(store, "linear", "https://mcp.linear.app/mcp")).?;
     defer secret.zeroAndFree(testing.allocator, first);
     try testing.expectEqualStrings("{\"access\":\"a2\"}", first);
-    const other = (try store.get(testing.allocator, "linear", "https://other.example/mcp")).?;
+    const other = (try savedFor(store, "linear", "https://other.example/mcp")).?;
     defer secret.zeroAndFree(testing.allocator, other);
     try testing.expectEqualStrings("{\"access\":\"b1\"}", other);
 
     try testing.expect(try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
     try testing.expect(!try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
+    try testing.expectEqual(@as(?[]u8, null), try savedFor(store, "linear", "https://mcp.linear.app/mcp"));
 }
 
 test "v1's logins are taken over once, and a sign-out isn't undone" {
@@ -325,16 +368,16 @@ test "v1's logins are taken over once, and a sign-out isn't undone" {
             "{\"server_identity\":\"bound\",\"token_type\":\"DPoP\"," ++ entry ++ "}]}");
     }
     const store: Store = .{ .home = home, .backend = .file };
-    const got = (try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp")).?;
+    const got = (try savedFor(store, "linear", "https://mcp.linear.app/mcp")).?;
     defer secret.zeroAndFree(testing.allocator, got);
     try testing.expectEqualStrings(
         \\{"access":"v1-access","refresh":"v1-refresh","expires_at_ms":null,"token_endpoint":"https://linear.app/oauth/token","revocation_endpoint":null,"resource":"https://mcp.linear.app/mcp","client_id":"c1","client_secret":null,"method":"none"}
     , got);
     // A token bound to a key isn't one MCP-v2 can send.
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "bound", "https://mcp.linear.app/mcp"));
+    try testing.expectEqual(@as(?[]u8, null), try savedFor(store, "bound", "https://mcp.linear.app/mcp"));
     // Signed out, it stays signed out: v1's copy isn't taken again.
     try testing.expect(try store.remove(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "linear", "https://mcp.linear.app/mcp"));
+    try testing.expectEqual(@as(?[]u8, null), try savedFor(store, "linear", "https://mcp.linear.app/mcp"));
 }
 
 test "the credential file is private, and an unreadable one is replaced on the next save" {
@@ -350,9 +393,9 @@ test "the credential file is private, and an unreadable one is replaced on the n
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
 
     try tmp.dir.writeFile(testing.io, .{ .sub_path = path, .data = "not json" });
-    try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, "plain", "https://mcp.plain.com/mcp"));
+    try testing.expectEqual(@as(?[]u8, null), try savedFor(store, "plain", "https://mcp.plain.com/mcp"));
     try store.put(testing.allocator, "plain", "https://mcp.plain.com/mcp", "{\"access\":\"p2\"}");
-    const saved = (try store.get(testing.allocator, "plain", "https://mcp.plain.com/mcp")).?;
+    const saved = (try savedFor(store, "plain", "https://mcp.plain.com/mcp")).?;
     defer secret.zeroAndFree(testing.allocator, saved);
     try testing.expectEqualStrings("{\"access\":\"p2\"}", saved);
 }
