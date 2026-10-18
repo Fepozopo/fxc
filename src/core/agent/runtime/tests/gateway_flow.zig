@@ -148,6 +148,131 @@ fn expectRouteStatus(
     try std.testing.expectEqualStrings(expected_label, status.label(&label_buf));
 }
 
+/// Checks the exact user-visible cache notice count captured by the host fake.
+fn expectCacheMissNotices(hooks: *const FakeAgentRuntimeDeps, expected: usize) !void {
+    var actual: usize = 0;
+    for (hooks.system_notices.items) |notice| {
+        if (std.mem.eql(u8, notice, "Cache miss.")) actual += 1;
+    }
+    try std.testing.expectEqual(expected, actual);
+}
+
+test "OpenAI cache miss notices require a later successful request and explicit zero" {
+    const cases = [_]struct {
+        name: []const u8,
+        provider: model_provider.ProviderId = .gateway,
+        model: []const u8 = "openai/gpt-5",
+        later: bool = true,
+        cached: ?u64 = 0,
+        cancelled: bool = false,
+        status: std.http.Status = .ok,
+        expected: usize = 0,
+    }{
+        .{ .name = "first Gateway OpenAI request", .later = false },
+        .{ .name = "later Gateway OpenAI miss", .expected = 1 },
+        .{ .name = "later Gateway OpenAI hit", .cached = 8 },
+        .{ .name = "unknown Gateway OpenAI cache", .cached = null },
+        .{ .name = "first Codex request", .provider = .codex, .model = "gpt-5-codex", .later = false },
+        .{ .name = "later Codex miss", .provider = .codex, .model = "gpt-5-codex", .expected = 1 },
+        .{ .name = "later Codex hit", .provider = .codex, .model = "gpt-5-codex", .cached = 8 },
+        .{ .name = "unknown Codex cache", .provider = .codex, .model = "gpt-5-codex", .cached = null },
+        .{ .name = "non-OpenAI Gateway model", .model = "anthropic/claude-opus-4.6" },
+        .{ .name = "non-OpenAI subscription", .provider = .grok, .model = "grok-4" },
+        .{ .name = "OpenAI-like model namespace", .model = "openai-compatible/model" },
+        .{ .name = "cancelled Gateway response", .cancelled = true },
+        .{ .name = "HTTP failure", .status = .forbidden },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("previous prompt") },
+        .assistant = @constCast("previous answer"),
+    } }};
+    for (cases) |case| {
+        errdefer std.debug.print("cache notice case: {s}; expected notices: {d}\n", .{ case.name, case.expected });
+        const alloc = std.testing.allocator;
+        const completions = [_]FakeCompletion{.{
+            .content = "answer",
+            .usage = .{ .input_tokens = 0, .cache_read_tokens = case.cached },
+            .cancel_after_chunks = case.cancelled,
+            .status = case.status,
+        }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.provider = case.provider;
+        job.model = @constCast(case.model);
+        job.history = if (case.later) @constCast(&history) else &.{};
+        job.credential_source = switch (case.provider) {
+            .codex => .chatgpt_subscription,
+            .grok => .grok_subscription,
+            else => .ai_gateway_api_key,
+        };
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try expectCacheMissNotices(&hooks, case.expected);
+        if (case.expected == 1) {
+            try std.testing.expectEqualStrings("Cache miss.", hooks.system_notices.items[0]);
+        }
+    }
+}
+
+test "OpenAI cache miss notices recognize resumed job history on a fresh Agent" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "answer", .usage = .{ .cache_read_tokens = 0 } }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var deps = hooks.deps();
+    deps.agent_stream_provider = gateway.provider();
+    var agent: @import("../agent.zig").Agent = .{};
+    defer agent.deinit(alloc);
+    var fixture = PromptFixture{};
+    const config = fixture.config();
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("previous prompt") },
+        .assistant = @constCast("previous answer"),
+    } }};
+    var job = fixture.job();
+    job.model = @constCast("openai/gpt-5");
+    job.history = @constCast(&history);
+    // Match the CLI's contract: saved history is on the job, not the Agent.
+    try runtime_orchestrator.processAgentPrompt(&agent, &deps, null, test_support.testLifecycleContext(
+        lifecycle_hooks.RuntimeView.empty(),
+        alloc,
+        config.workspace_root,
+    ), config, job);
+    try expectCacheMissNotices(&hooks, 1);
+}
+
+test "OpenAI cache miss notices include later model requests within the first turn" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { first: ?u64, second: ?u64, expected: usize }{
+        .{ .first = 0, .second = 0, .expected = 1 },
+        .{ .first = 8, .second = 0, .expected = 1 },
+        .{ .first = 0, .second = 8, .expected = 0 },
+        .{ .first = 0, .second = null, .expected = 0 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("first-turn cache usage: first={any} second={any}; expected notices={d}\n", .{ case.first, case.second, case.expected });
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = &.{toolCall("read", "read_file", "{\"path\":\"a.txt\"}")}, .usage = .{ .cache_read_tokens = case.first } },
+            .{ .content = "answer", .usage = .{ .cache_read_tokens = case.second } },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast("openai/gpt-5");
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try std.testing.expectEqual(@as(usize, 2), gateway.admitted_requests);
+        try expectCacheMissNotices(&hooks, case.expected);
+    }
+}
+
 test "processQueuedPrompt projects lifecycle session identity to the provider" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "ok" }};

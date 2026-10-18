@@ -3361,6 +3361,8 @@ fn parseSseFinishReason(root: std.json.Value) SseFinishParseError!types.Provider
         error.UnknownProviderFinishReason;
 }
 
+/// Projects the Gateway's normalized finish usage into optional token counts.
+/// Missing or malformed details remain unknown; totals never imply cache use.
 fn parseSseUsage(root: std.json.Value) types.Usage {
     if (root != .object) return .{};
     const usage_value = root.object.get("usage") orelse return .{};
@@ -3368,6 +3370,7 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     return .{
         .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        .cache_read_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheRead"),
         .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
 }
@@ -4233,6 +4236,37 @@ test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
     );
     defer deinitGatewayCompletion(std.testing.allocator, &malformed_completion);
     try std.testing.expectEqual(@as(?u64, null), malformed_completion.usage.reasoning_tokens);
+}
+
+test "consumeSseStream preserves explicit cache reads without inferring missing detail" {
+    const cases = [_]struct { usage: []const u8, expected: ?u64 }{
+        .{ .usage = "{\"inputTokens\":{\"total\":10,\"cacheRead\":0}}", .expected = 0 },
+        .{ .usage = "{\"inputTokens\":{\"total\":10,\"cacheRead\":7}}", .expected = 7 },
+        .{ .usage = "{\"inputTokens\":{\"total\":0}}", .expected = null },
+        .{ .usage = "{}", .expected = null },
+        .{ .usage = "null", .expected = null },
+        .{ .usage = "{\"inputTokens\":null}", .expected = null },
+        .{ .usage = "{\"inputTokens\":{\"cacheRead\":null}}", .expected = null },
+        .{ .usage = "{\"inputTokens\":{\"cacheRead\":-1}}", .expected = null },
+        .{ .usage = "{\"inputTokens\":{\"cacheRead\":\"0\"}}", .expected = null },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("Gateway cache usage input: {s}; expected: {any}\n", .{ case.usage, case.expected });
+        const payload = try std.testing.allocator.print(
+            "data: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"stop\"}},\"usage\":{s}}}\n\n",
+            .{case.usage},
+        );
+        defer std.testing.allocator.free(payload);
+        var reader = std.Io.Reader.fixed(payload);
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        const Noop = struct {
+            /// Ignores text because this fixture contains only a finish event.
+            fn chunk(_: *anyopaque, _: []const u8) void {}
+        };
+        var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        try std.testing.expectEqual(case.expected, completion.usage.cache_read_tokens);
+    }
 }
 
 test "consumeSseStream ignores malformed finish usage totals" {

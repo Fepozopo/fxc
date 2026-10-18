@@ -3,6 +3,7 @@ const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
+const model_provider = @import("../../config/model_provider.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const token_estimate = @import("../../shared/token_estimate.zig");
@@ -561,6 +562,32 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
     const sink = stream_ctx.semantic_presentation orelse return error.MissingThematicRuleSink;
     try sink.thematic_rule(sink.ctx);
     stream_ctx.recordSemanticBoundary();
+}
+
+/// Emits a cache-miss system notice for a successful, non-first OpenAI request.
+/// `selection` identifies the request, not an OpenAI-compatible wire protocol.
+/// Only an explicit zero in per-response usage is evidence of a miss.
+/// Returns any error from the host's notice sink; all input data is borrowed.
+pub fn emitOpenAICacheMissNotice(
+    hooks: *const AgentRuntimeDeps,
+    selection: model_provider.ProviderSelection,
+    completion: types.ModelCompletion,
+    first_request: bool,
+) !void {
+    if (first_request or completion.usage.cache_read_tokens == null or
+        completion.usage.cache_read_tokens.? != 0) return;
+    const is_openai = switch (selection.provider) {
+        .codex => true,
+        .gateway => std.mem.startsWith(u8, selection.model, "openai/"),
+        // A compatible protocol or a configured provider name does not prove
+        // that OpenAI served the request.
+        .grok, .configured => false,
+    };
+    if (!is_openai) return;
+    switch (types.classifyProviderCompletion(completion)) {
+        .completed, .length_limited => try hooks.push_system_notice(hooks.ctx, "Cache miss."),
+        .interrupted, .provider_failure, .invalid_completion => {},
+    }
 }
 
 pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
@@ -2221,6 +2248,30 @@ test "normalizeAssistantTextForDisplay removes leading blanks markdown emphasis 
 
 test {
     _ = @import("tool_presentation.zig");
+}
+
+test "OpenAI cache miss notice excludes unsuccessful finishes and compatible providers" {
+    const cases = [_]struct {
+        provider: model_provider.ProviderId = .codex,
+        finish: ?types.ProviderFinishReason = .stop,
+    }{
+        .{ .finish = null },
+        .{ .finish = .provider_error },
+        .{ .finish = .content_filter },
+        .{ .finish = .tool_calls }, // No tool calls makes this completion invalid.
+        .{ .provider = model_provider.parse("compatible").? },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("cache notice provider={s} finish={any}; expected no notice\n", .{ case.provider.label(), case.finish });
+        var capture = NoticeCapture{};
+        defer capture.deinit(std.testing.allocator);
+        const hooks = capture.hooks();
+        try emitOpenAICacheMissNotice(&hooks, .{ .provider = case.provider, .model = "openai/gpt-5" }, .{
+            .finish_reason = case.finish,
+            .usage = .{ .cache_read_tokens = 0 },
+        }, false);
+        try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
+    }
 }
 
 test "emitProviderLengthNotice emits exact length notice" {

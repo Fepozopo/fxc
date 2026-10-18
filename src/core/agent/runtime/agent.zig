@@ -14,6 +14,9 @@ pub const Agent = struct {
     history: std.ArrayList(types.HistoryTurn) = .empty,
     turn_usage: types.Usage = .{},
     fresh: bool = true,
+    /// Whether a main-conversation request has been admitted. Restored history
+    /// establishes prior requests; clearing the conversation resets this flag.
+    model_request_started: bool = false,
     /// Last exact provider input-token usage paired with the measured request
     /// it came from. Carried across turns so the first request of a new turn
     /// calibrates from real usage instead of the raw serialization estimate.
@@ -46,7 +49,7 @@ pub const Agent = struct {
 
     /// Restores `bytes` into this fresh agent. Returns what the checkpoint
     /// recorded about the agent that saved it, owned by `alloc`
-    /// (`Meta.free`).
+    /// (`Meta.free`). Nonempty restored history establishes prior requests.
     pub fn restoreCheckpoint(
         self: *Agent,
         alloc: Allocator,
@@ -63,6 +66,7 @@ pub const Agent = struct {
         for (previous.items) |turn| types.freeHistoryTurn(alloc, turn);
         previous.deinit(alloc);
         self.turn_usage = decoded.usage;
+        self.model_request_started = self.history.items.len > 0;
         self.fresh = false;
         const meta = decoded.meta;
         decoded.meta = .{};
@@ -77,6 +81,8 @@ pub const Agent = struct {
         addOptional(&self.turn_usage.reasoning_tokens, usage.reasoning_tokens);
     }
 
+    /// Appends an `alloc`-owned copy of `turn` and marks prior conversation
+    /// activity. Returns allocation errors without changing the history.
     pub fn appendHistoryEntry(
         self: *Agent,
         alloc: Allocator,
@@ -85,12 +91,15 @@ pub const Agent = struct {
         const copy = try types.dupeHistoryTurn(alloc, turn);
         errdefer types.freeHistoryTurn(alloc, copy);
         try self.history.append(alloc, copy);
+        self.model_request_started = true;
         self.fresh = false;
     }
 
+    /// Frees conversation history using `alloc` and resets request tracking.
     pub fn clearHistory(self: *Agent, alloc: Allocator) void {
         for (self.history.items) |turn| types.freeHistoryTurn(alloc, turn);
         self.history.clearRetainingCapacity();
+        self.model_request_started = false;
         // Cleared history no longer resembles the calibrated request.
         self.request_token_calibration = null;
         self.request_byte_limit = null;
@@ -151,6 +160,8 @@ pub const Agent = struct {
         return copy;
     }
 
+    /// Replaces history with copies owned by `alloc`, restoring prior-request
+    /// tracking from its presence. Allocation failure leaves the agent unchanged.
     pub fn restoreHistory(
         self: *Agent,
         alloc: Allocator,
@@ -168,6 +179,7 @@ pub const Agent = struct {
 
         var previous = self.history;
         self.history = replacement;
+        self.model_request_started = replacement.items.len > 0;
         for (previous.items) |turn| types.freeHistoryTurn(alloc, turn);
         previous.deinit(alloc);
         // Replaced history no longer resembles the calibrated request.
@@ -265,6 +277,33 @@ test "Agent request size limit only lowers, follows the model, and dies with cle
     agent.lowerRequestByteLimit("other/model", 7000);
     try agent.restoreHistory(alloc, &.{});
     try std.testing.expectEqual(@as(?usize, null), agent.requestByteLimit("other/model"));
+}
+
+test "Agent request tracking survives turns and restores and resets with conversation history" {
+    const alloc = std.testing.allocator;
+    var agent: Agent = .{};
+    defer agent.deinit(alloc);
+    try std.testing.expect(!agent.model_request_started);
+    agent.model_request_started = true;
+    agent.startTurn();
+    try std.testing.expect(agent.model_request_started);
+    agent.clearHistory(alloc);
+    try std.testing.expect(!agent.model_request_started);
+
+    try agent.restoreHistory(alloc, &.{.{ .assistant = .{
+        .user = .{ .text = @constCast("prompt") },
+        .assistant = @constCast("answer"),
+    } }});
+    try std.testing.expect(agent.model_request_started);
+    const bytes = try agent.checkpoint(alloc, .{});
+    defer alloc.free(bytes);
+    var restored: Agent = .{};
+    defer restored.deinit(alloc);
+    const meta = try restored.restoreCheckpoint(alloc, bytes);
+    defer meta.free(alloc);
+    try std.testing.expect(restored.model_request_started);
+    try agent.restoreHistory(alloc, &.{});
+    try std.testing.expect(!agent.model_request_started);
 }
 
 test "Agent startTurn consumes freshness and resets usage" {

@@ -5121,11 +5121,16 @@ fn pushAutoRetryStatus(
     return deadline;
 }
 
+/// Publishes request admission and tracks its position in the conversation.
 const ProviderAdmission = struct {
     deps: *const AgentRuntimeDeps,
     stream: *runtime_assistant_stream.StreamChunkContext,
     pending_status: *?types.RouteRecoveryStatus,
+    agent: *runtime_agent.Agent,
+    first_request: bool = true,
 
+    /// Marks a request started only after admission effects succeed. Auth
+    /// replays reuse this context and therefore get their own request position.
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         runtime_assistant_stream.publishTurnPhase(self.stream, .thinking);
@@ -5133,6 +5138,8 @@ const ProviderAdmission = struct {
             try pushRouteRecoveryStatus(self.deps, status);
             self.pending_status.* = null;
         }
+        self.first_request = !self.agent.model_request_started;
+        self.agent.model_request_started = true;
     }
 };
 
@@ -5411,6 +5418,9 @@ fn traceRouteFailure(
     );
 }
 
+/// Processes `job` through the supplied host services and conversation owner.
+/// Job history also establishes prior requests for hosts that provide history
+/// without restoring it into `agent`. Returns processing or finalization errors.
 pub fn processAgentPrompt(
     agent: *runtime_agent.Agent,
     deps: *const AgentRuntimeDeps,
@@ -5435,6 +5445,9 @@ pub fn processAgentPrompt(
     {
         effective_lifecycle.scope.subagent_id = effective_config.subagent_id;
     }
+    // CLI hosts may supply saved history only on the job, while long-lived
+    // hosts restore the Agent itself. Both represent the same conversation.
+    agent.model_request_started = agent.model_request_started or job.history.len > 0;
     agent.startTurn();
     var finalization = TurnFinalizationGuard.init(
         deps,
@@ -6811,6 +6824,10 @@ test "compaction activity transaction settles only after publication and preserv
     }
 }
 
+/// Runs the queued conversation's model/tool steps using the supplied host
+/// services, prompt context, and turn-scoped storage. Updates `agent` request
+/// tracking at admission and publishes notices only for successful responses.
+/// Borrowed state pointers receive the settled turn state, including on error.
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -7678,6 +7695,7 @@ fn processQueuedPromptLoop(
                 .deps = deps,
                 .stream = &stream_ctx,
                 .pending_status = &pending_auto_retry_status,
+                .agent = agent,
             };
             var model_request = agent_stream_provider.ModelRequest{
                 .observer = deps.observer,
@@ -8695,6 +8713,14 @@ fn processQueuedPromptLoop(
             }
 
             try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+            if (streamSucceeded(stream_result) and !config.cancel_flag.load(.seq_cst)) {
+                try runtime_assistant_stream.emitOpenAICacheMissNotice(
+                    deps,
+                    .{ .provider = job.provider, .model = gateway_model },
+                    attempt_completion,
+                    provider_admission.first_request,
+                );
+            }
 
             const partial_assistant = if (attempt_disposition == .completed)
                 stream_ctx.accepted_source_or(attempt_completion.content orelse "")

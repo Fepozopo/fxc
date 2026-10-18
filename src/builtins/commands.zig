@@ -62,6 +62,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
             "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
             "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.",
+            "After the first conversation request, successful Codex and Gateway openai/ requests show `Cache miss.` only when usage explicitly reports zero cached input tokens. Missing cache details produce no notice.",
             "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },

@@ -2678,6 +2678,27 @@ test "Responses tools serialize typed static and dynamic functions once" {
     try std.testing.expect(std.mem.find(u8, out.written(), "\"name\":\"mcp_search\"") != null);
 }
 
+test "Responses cache usage distinguishes zero positive absent and malformed metadata" {
+    const cases = [_]struct { response: []const u8, expected: ?u64 }{
+        .{ .response = "{\"usage\":{\"input_tokens_details\":{\"cached_tokens\":0}}}", .expected = 0 },
+        .{ .response = "{\"usage\":{\"input_tokens_details\":{\"cached_tokens\":5}}}", .expected = 5 },
+        .{ .response = "{}", .expected = null },
+        .{ .response = "{\"usage\":null}", .expected = null },
+        .{ .response = "{\"usage\":{\"input_tokens\":0}}", .expected = null },
+        .{ .response = "{\"usage\":{\"input_tokens_details\":{}}}", .expected = null },
+        .{ .response = "{\"usage\":{\"input_tokens_details\":null}}", .expected = null },
+        .{ .response = "{\"usage\":{\"input_tokens_details\":{\"cached_tokens\":null}}}", .expected = null },
+        .{ .response = "{\"usage\":{\"input_tokens_details\":{\"cached_tokens\":-1}}}", .expected = null },
+        .{ .response = "{\"usage\":{\"input_tokens_details\":{\"cached_tokens\":\"0\"}}}", .expected = null },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("Responses cache usage input: {s}; expected: {any}\n", .{ case.response, case.expected });
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.response, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, parseUsage(parsed.value.object).cache_read_tokens);
+    }
+}
+
 test "Responses usage projection retains optional cached and reasoning detail" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,

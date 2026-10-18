@@ -1601,6 +1601,8 @@ test "provider replay projection preserves matching origin and excludes other ro
     }.check, .{});
 }
 
+/// Per-response token counts reported by a provider. Null means unknown,
+/// including cache details; a reported zero is distinct from absent metadata.
 pub const Usage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
