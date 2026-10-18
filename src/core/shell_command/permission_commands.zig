@@ -40,8 +40,8 @@ pub const Iterator = struct {
             }
             switch (byte) {
                 // Do not mistake redirects, substitutions, comments, or groups
-                // for a flat list. The existing static allow grammar also
-                // excludes double quotes and escapes, so keep that boundary.
+                // for a flat list. Double quotes and escapes use whole-command
+                // checks rather than this scanner's single-quoted list subset.
                 '"', '\\', '$', '`', '(', ')', '{', '}', '<', '>', '#', '\r' => return error.UnsupportedSyntax,
                 '&', '|', ';', '\n' => {
                     const end = self.index;

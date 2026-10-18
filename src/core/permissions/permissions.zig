@@ -1698,6 +1698,10 @@ fn containsWildcard(pattern: []const u8) bool {
         std.mem.findScalar(u8, pattern, '?') != null;
 }
 
+/// Returns whether command uses only literal words, without expansion or escapes.
+/// Single quotes preserve all non-line-breaking text; double quotes additionally
+/// reject expansion markers and backslashes. Only rule patterns allow unquoted
+/// wildcards, as selected by allow_wildcards.
 fn isStaticCommand(command: []const u8, allow_wildcards: bool) bool {
     if (command.len == 0) return false;
     if (firstWordIsAssignment(command)) return false;
@@ -1714,10 +1718,13 @@ fn isStaticCommand(command: []const u8, allow_wildcards: bool) bool {
             continue;
         }
 
-        if (char == '\'') {
+        if (char == '\'' or char == '"') {
             const literal_start = index + 1;
-            const literal_end = std.mem.findScalarPos(u8, command, literal_start, '\'') orelse return false;
+            const literal_end = std.mem.findScalarPos(u8, command, literal_start, char) orelse return false;
             const literal = command[literal_start..literal_end];
+            // Double quotes still permit shell expansion. Reject escapes too so
+            // an escaped quote cannot hide where the literal actually ends.
+            if (char == '"' and std.mem.findAny(u8, literal, "$`\\") != null) return false;
             if (!std.unicode.utf8ValidateSlice(literal)) return false;
             if (std.mem.findScalar(u8, literal, 0) != null or
                 std.mem.findScalar(u8, literal, '\r') != null or
@@ -1756,24 +1763,30 @@ fn isStaticUnquotedByte(char: u8) bool {
     };
 }
 
+/// Matches validated static shell text byte-for-byte, except for unquoted rule
+/// wildcards. Quote delimiters remain significant and quoted wildcards are literal.
 fn staticCommandWildcardMatch(pattern: []const u8, candidate: []const u8) bool {
     var pattern_index: usize = 0;
     var candidate_index: usize = 0;
-    var in_single_quote = false;
+    var quote: ?u8 = null;
     var star_index: ?usize = null;
     var star_candidate_index: usize = 0;
 
     while (candidate_index < candidate.len) {
         if (pattern_index < pattern.len) {
             const char = pattern[pattern_index];
-            if (!in_single_quote and char == '*') {
+            if (quote == null and char == '*') {
                 star_index = pattern_index;
                 pattern_index += 1;
                 star_candidate_index = candidate_index;
                 continue;
             }
-            if ((!in_single_quote and char == '?') or char == candidate[candidate_index]) {
-                if (char == '\'') in_single_quote = !in_single_quote;
+            if ((quote == null and char == '?') or char == candidate[candidate_index]) {
+                if (quote) |delimiter| {
+                    if (char == delimiter) quote = null;
+                } else if (char == '\'' or char == '"') {
+                    quote = char;
+                }
                 pattern_index += 1;
                 candidate_index += 1;
                 continue;
@@ -1784,10 +1797,11 @@ fn staticCommandWildcardMatch(pattern: []const u8, candidate: []const u8) bool {
         star_candidate_index += 1;
         candidate_index = star_candidate_index;
         pattern_index = star + 1;
-        in_single_quote = false;
+        // A wildcard is recorded only outside quotes, so retry in that state.
+        quote = null;
     }
 
-    while (pattern_index < pattern.len and !in_single_quote and pattern[pattern_index] == '*') : (pattern_index += 1) {}
+    while (pattern_index < pattern.len and quote == null and pattern[pattern_index] == '*') : (pattern_index += 1) {}
     return pattern_index == pattern.len;
 }
 
@@ -2483,6 +2497,70 @@ test "configured wildcard command allows only static command grammar" {
     try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
 }
 
+test "configured wildcard command rules accept only literal double quotes" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("*"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+    const cases = [_]struct { name: []const u8, command: []const u8, expected: RuleDecision }{
+        .{ .name = "reported regex", .command = "rg -n \"usage|token.*update|turn_summary|token_progress|input_tokens\" src/ui/render.zig src/ui/render_engine src/core/session/session_event.zig src/core/session/session_log.zig", .expected = .allow },
+        .{ .name = "empty literal", .command = "printf \"\"", .expected = .allow },
+        .{ .name = "quoted shell operators", .command = "printf \"&& || ; | |& & < > ( ) { } # ~ [ab] * ?\"", .expected = .allow },
+        .{ .name = "single quote inside double quotes", .command = "printf \"it's literal\"", .expected = .allow },
+        .{ .name = "double quotes inside single quotes", .command = "printf '\"$HOME `pwd`\"'", .expected = .allow },
+        .{ .name = "adjacent quote styles", .command = "printf pre\"a|b\"'c|d'post", .expected = .allow },
+        .{ .name = "unicode literal", .command = "printf \"Grüße\"", .expected = .allow },
+        .{ .name = "variable expansion", .command = "printf \"$HOME\"", .expected = .ask },
+        .{ .name = "parameter expansion", .command = "printf \"${HOME}\"", .expected = .ask },
+        .{ .name = "command substitution", .command = "printf \"$(pwd)\"", .expected = .ask },
+        .{ .name = "backtick substitution", .command = "printf \"`pwd`\"", .expected = .ask },
+        .{ .name = "arithmetic expansion", .command = "printf \"$((1+1))\"", .expected = .ask },
+        .{ .name = "single quotes do not suppress double quoted expansion", .command = "printf \"'$HOME'\"", .expected = .ask },
+        .{ .name = "escape", .command = "printf \"a\\b\"", .expected = .ask },
+        .{ .name = "escaped closing quote", .command = "printf \"safe\\\"; touch marker\"", .expected = .ask },
+        .{ .name = "unterminated literal", .command = "printf \"unfinished", .expected = .ask },
+        .{ .name = "quoted newline", .command = "printf \"a\nb\"", .expected = .ask },
+        .{ .name = "quoted carriage return", .command = "printf \"a\rb\"", .expected = .ask },
+        .{ .name = "quoted NUL", .command = "printf \"a\x00b\"", .expected = .ask },
+        .{ .name = "invalid quoted UTF-8", .command = "printf \"\xff\"", .expected = .ask },
+        .{ .name = "expansion after literal", .command = "printf \"safe\"$HOME", .expected = .ask },
+        .{ .name = "redirection after literal", .command = "printf \"safe\" > out", .expected = .ask },
+    };
+    for (cases) |case| {
+        const actual = ruleDecisionForPermissionPattern(rules, "bash", case.command, .ask);
+        std.testing.expectEqual(case.expected, actual) catch |err| {
+            std.debug.print("{s}: command={s}, expected={s}, actual={s}\n", .{ case.name, case.command, @tagName(case.expected), @tagName(actual) });
+            return err;
+        };
+    }
+}
+
+test "configured wildcard command rules keep quoted wildcards literal" {
+    const cases = [_]struct { pattern: []const u8, command: []const u8, expected: RuleDecision }{
+        .{ .pattern = "printf \"*\"", .command = "printf \"safe\"", .expected = .ask },
+        .{ .pattern = "printf \"*\"", .command = "printf \"*\"", .expected = .allow },
+        .{ .pattern = "printf \"?\" *", .command = "printf \"x\" tail", .expected = .ask },
+        .{ .pattern = "printf \"?\" *", .command = "printf \"?\" tail", .expected = .allow },
+        .{ .pattern = "printf * \"a*b?\"", .command = "printf first second \"axbq\"", .expected = .ask },
+        .{ .pattern = "printf * \"a*b?\"", .command = "printf first second \"a*b?\"", .expected = .allow },
+        .{ .pattern = "printf * \"it's *\"", .command = "printf first second \"it's *\"", .expected = .allow },
+        .{ .pattern = "printf * '\"*\"'", .command = "printf first second '\"*\"'", .expected = .allow },
+        .{ .pattern = "printf \"a*b\"*", .command = "printf \"a*b\"tail", .expected = .allow },
+        .{ .pattern = "printf \"a*b\"*", .command = "printf \"axxb\"tail", .expected = .ask },
+        .{ .pattern = "printf \"$HOME\" *", .command = "printf \"$HOME\" tail", .expected = .ask },
+    };
+    for (cases) |case| {
+        var rules_buf = [_]types.PermissionRule{
+            .{ .permission = @constCast("bash"), .pattern = @constCast(case.pattern), .action = .allow },
+        };
+        const actual = ruleDecisionForPermissionPattern(.{ .rules = &rules_buf }, "bash", case.command, .ask);
+        std.testing.expectEqual(case.expected, actual) catch |err| {
+            std.debug.print("pattern={s}, command={s}, expected={s}, actual={s}\n", .{ case.pattern, case.command, @tagName(case.expected), @tagName(actual) });
+            return err;
+        };
+    }
+}
+
 test "configured compound commands apply the strictest decision for every supported operator" {
     var rules_buf = [_]types.PermissionRule{
         .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .allow },
@@ -2662,12 +2740,12 @@ test "configured command rules require exact matching outside static grammar" {
     try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(exact_rules, "bash", "printf \"$(date)\"", .none));
     try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(exact_rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
 
-    var dynamic_pattern_rules_buf = [_]types.PermissionRule{
+    var quoted_pattern_rules_buf = [_]types.PermissionRule{
         .{ .permission = @constCast("bash"), .pattern = @constCast("printf \"*\""), .action = .allow },
     };
     try std.testing.expectEqual(
         RuleDecision.none,
-        ruleDecisionForPermissionPattern(.{ .rules = &dynamic_pattern_rules_buf }, "bash", "printf \"safe\"", .none),
+        ruleDecisionForPermissionPattern(.{ .rules = &quoted_pattern_rules_buf }, "bash", "printf \"safe\"", .none),
     );
 }
 
@@ -2689,6 +2767,7 @@ test "static command grammar is an explicit allowlist" {
         "printf ''",
         "tool foo/bar:baz,+qux=value%@host",
         "printf 'Grüße'",
+        "echo \"literal\"",
     }) |command| {
         try std.testing.expect(isStaticCommand(command, false));
     }
@@ -2699,7 +2778,6 @@ test "static command grammar is an explicit allowlist" {
         "trailing ",
         "FOO=bar command",
         "FOO='bar' command",
-        "echo \"dynamic\"",
         "echo $HOME",
         "echo `pwd`",
         "echo ~",

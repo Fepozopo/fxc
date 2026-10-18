@@ -245,6 +245,43 @@ describe("generic permission typed errors", () => {
     }
   }, TIMEOUT);
 
+  test("configured bash wildcard approves a double-quoted regex in ask mode", async () => {
+    const root = createIsolatedRoot("fx-quoted-command-permissions-");
+    const literal = "usage|token.*update|turn_summary|token_progress|input_tokens";
+    const toolCallId = "quoted_literal_command";
+    // The local gateway emits the exact shell call, avoiding model-dependent quoting.
+    const gateway = startFakeGateway([
+      fakeShellRun(toolCallId, `printf "%s" "${literal}"`, { timeout_ms: 600_000 }),
+      fakeGatewayFinalText("literal command observed"),
+    ]);
+    try {
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({ permission_mode: "ask", permission: { bash: { "*": "allow" } } }),
+      );
+      const result = await runFx(["ask", "--json", "--quiet", "--no-save", "Run the literal command."], {
+        cwd: root.workspace,
+        env: { ...permissionEnv(root.home, gateway), FX_SOUND: "0" },
+        timeoutMs: TIMEOUT,
+      });
+      const json = parseFxJson(result);
+      expect(json.exit_code).toBe(0);
+      expect(result.stderr).not.toContain("permission required");
+      expect(json.tool_calls).toContainEqual(expect.objectContaining({ name: "shell", status: "success" }));
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      const continuation = JSON.parse(gateway.requests[1]!.body) as {
+        prompt: Array<{ content: Array<{ type: string; toolCallId?: string; output?: { value?: string } }> }>;
+      };
+      const resultPart = continuation.prompt.flatMap((message) => message.content)
+        .find((part) => part.type === "tool-result" && part.toolCallId === toolCallId);
+      expect(resultPart?.output?.value).toContain(literal);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   test(
     "returns typed JSON for denied terminal",
     async () => {
