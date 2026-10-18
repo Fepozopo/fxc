@@ -1,4 +1,6 @@
+//! Configured permission rules, exact session grants, and file-target policy.
 const std = @import("std");
+const permission_commands = @import("../shell_command/permission_commands.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
@@ -1120,6 +1122,9 @@ pub fn displayTargetForPolicy(alloc: std.mem.Allocator, workspace_root: []const 
     };
 }
 
+/// Resolves a tool's target using alloc, then evaluates configured rules.
+/// Supported shell lists combine per-command decisions; denies and asks take
+/// precedence over allows. Temporary target memory is freed before returning.
 pub fn ruleDecisionFor(alloc: std.mem.Allocator, rules: types.PermissionRuleSet, workspace_root: []const u8, tool_name: []const u8, target_path: []const u8, target_kind: PermissionTargetKind) !RuleDecision {
     const permission = permissionNameForTool(tool_name);
     const pattern = try patternForRuleMatch(alloc, workspace_root, tool_name, target_path, target_kind);
@@ -1128,6 +1133,8 @@ pub fn ruleDecisionFor(alloc: std.mem.Allocator, rules: types.PermissionRuleSet,
     return evaluateRulesetForTool(rules.rules, permission, tool_name, pattern) orelse .none;
 }
 
+/// Evaluates an already-resolved permission pattern, returning fallback if no
+/// rule resolves it. Shell lists require every command to be authorized.
 pub fn ruleDecisionForPermissionPattern(rules: types.PermissionRuleSet, permission: []const u8, pattern: []const u8, fallback: RuleDecision) RuleDecision {
     return evaluateRuleset(rules.rules, permission, pattern) orelse fallback;
 }
@@ -1556,11 +1563,21 @@ fn evaluateRuleset(rules: []const types.PermissionRule, permission: []const u8, 
     return evaluateRulesetForTool(rules, permission, null, pattern);
 }
 
+/// Evaluates rules for a permission and optional concrete tool alias. Shell
+/// lists use the strictest command decision; other targets retain last-match rules.
 fn evaluateRulesetForTool(rules: []const types.PermissionRule, permission: []const u8, tool_name: ?[]const u8, pattern: []const u8) ?RuleDecision {
     if (std.mem.eql(u8, permission, web_fetch_permission)) {
         return evaluateWebFetchRuleset(rules, pattern);
     }
+    if (std.mem.eql(u8, permission, "bash")) {
+        return evaluateCommandRuleset(rules, permission, tool_name, pattern);
+    }
+    return evaluateAtomicRuleset(rules, permission, tool_name, pattern);
+}
 
+/// Matches one target without splitting shell lists, preserving rule order.
+/// Null means no configured rule matched this target.
+fn evaluateAtomicRuleset(rules: []const types.PermissionRule, permission: []const u8, tool_name: ?[]const u8, pattern: []const u8) ?RuleDecision {
     var matched: ?RuleDecision = null;
     for (rules) |rule| {
         if (!ruleMatchesPermission(rule.permission, permission, tool_name)) continue;
@@ -1573,6 +1590,52 @@ fn evaluateRulesetForTool(rules: []const types.PermissionRule, permission: []con
         matched = action;
     }
     return matched;
+}
+
+/// Scans an entire supported shell list before authorizing it. Unsupported
+/// grammar retains whole-command matching, including explicit exact approvals.
+/// Within a list, last-match precedence applies separately to each command.
+fn evaluateCommandRuleset(rules: []const types.PermissionRule, permission: []const u8, tool_name: ?[]const u8, command: []const u8) ?RuleDecision {
+    const whole = evaluateAtomicRuleset(rules, permission, tool_name, command);
+    var iterator = permission_commands.Iterator.init(command) catch return whole;
+    var combined: ?RuleDecision = .allow;
+    var command_count: usize = 0;
+    while (iterator.next() catch return whole) |part| {
+        combined = strictestCommandDecision(combined, evaluateAtomicRuleset(rules, permission, tool_name, part));
+        command_count += 1;
+    }
+    if (!iterator.has_operators or command_count == 0) return whole;
+
+    // Whole-list approvals cannot override a command's deny or ask. Preserve
+    // restrictive rules explicitly written for a list, but do not let ordinary
+    // wildcards span operators and undo the per-command overrides.
+    for (rules) |rule| {
+        if (!ruleMatchesPermission(rule.permission, permission, tool_name)) continue;
+        if (!ruleTargetsWholeCommand(rule, command)) continue;
+        if (whole == .allow and combined == null) return .allow;
+        return strictestCommandDecision(combined, whole);
+    }
+    return combined;
+}
+
+/// Recognizes exact whole-command rules and matching restrictive patterns that
+/// explicitly contain list operators. A plain `git *` rule targets each command,
+/// whereas `git * && *` deliberately targets the list itself.
+fn ruleTargetsWholeCommand(rule: types.PermissionRule, command: []const u8) bool {
+    if (std.mem.eql(u8, rule.pattern, command)) return true;
+    if (rule.action == .allow or !permissionPatternMatchesTarget(rule.pattern, command)) return false;
+    var iterator = permission_commands.Iterator.init(rule.pattern) catch return false;
+    while (iterator.next() catch return false) |_| {}
+    return iterator.has_operators;
+}
+
+/// Combines two command decisions. Deny wins over ask, unresolved wins over
+/// allow, and an unresolved part cannot hide an explicit ask or deny.
+fn strictestCommandDecision(a: ?RuleDecision, b: ?RuleDecision) ?RuleDecision {
+    if (a == .deny or b == .deny) return .deny;
+    if (a == .ask or b == .ask) return .ask;
+    if (a == null or b == null) return null;
+    return .allow;
 }
 
 fn evaluateWebFetchRuleset(rules: []const types.PermissionRule, pattern: []const u8) ?RuleDecision {
@@ -2420,6 +2483,176 @@ test "configured wildcard command allows only static command grammar" {
     try std.testing.expectEqual(RuleDecision.none, ruleDecisionForPermissionPattern(rules, "bash", "printf \"$(touch /tmp/fx-marker)\"", .none));
 }
 
+test "configured compound commands apply the strictest decision for every supported operator" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("*"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git add *"), .action = .deny },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git commit *"), .action = .deny },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git push *"), .action = .deny },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("rm *"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+    const cases = [_]struct { first: []const u8, second: []const u8, expected: RuleDecision }{
+        .{ .first = "printf one", .second = "printf two", .expected = .allow },
+        .{ .first = "printf one", .second = "rm file", .expected = .ask },
+        .{ .first = "rm file", .second = "printf two", .expected = .ask },
+        .{ .first = "printf one", .second = "git add file", .expected = .deny },
+        .{ .first = "git commit file", .second = "printf two", .expected = .deny },
+        .{ .first = "rm file", .second = "git push origin main", .expected = .deny },
+        .{ .first = "git push origin main", .second = "rm file", .expected = .deny },
+    };
+    for ([_][]const u8{ "&&", "||", ";", "\n", "|", "|&", "&" }) |operator| {
+        for (cases) |case| {
+            const command = try std.testing.allocator.print("{s} {s} {s}", .{ case.first, operator, case.second });
+            defer std.testing.allocator.free(command);
+            const actual = ruleDecisionForPermissionPattern(rules, "bash", command, .none);
+            std.testing.expectEqual(case.expected, actual) catch |err| {
+                std.debug.print("command={s}, expected={s}, actual={s}\n", .{ command, @tagName(case.expected), @tagName(actual) });
+                return err;
+            };
+        }
+    }
+}
+
+test "configured compound commands preserve per-command overrides and unresolved operands" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git *"), .action = .ask },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git status"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git diff"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git push *"), .action = .deny },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git status && git push origin main"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git status && git diff"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git status ; git diff"), .action = .ask },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git status | git diff"), .action = .deny },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git status && git fetch origin"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("unknown && another"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+    const cases = [_]struct { command: []const u8, expected: RuleDecision }{
+        .{ .command = "git status || git diff", .expected = .allow },
+        .{ .command = "git status && git diff", .expected = .allow },
+        .{ .command = "git status ; git diff", .expected = .ask },
+        .{ .command = "git status | git diff", .expected = .deny },
+        .{ .command = "git status && unknown", .expected = .none },
+        .{ .command = "unknown && git status", .expected = .none },
+        .{ .command = "git fetch origin && unknown", .expected = .ask },
+        .{ .command = "unknown && git push origin main", .expected = .deny },
+        .{ .command = "git status && git push origin main", .expected = .deny },
+        .{ .command = "git status && git fetch origin", .expected = .ask },
+        .{ .command = "unknown && another", .expected = .allow },
+        .{ .command = "git status && git diff && git push origin main", .expected = .deny },
+    };
+    for (cases) |case| {
+        const actual = ruleDecisionForPermissionPattern(rules, "bash", case.command, .none);
+        std.testing.expectEqual(case.expected, actual) catch |err| {
+            std.debug.print("command={s}, expected={s}, actual={s}\n", .{ case.command, @tagName(case.expected), @tagName(actual) });
+            return err;
+        };
+    }
+}
+
+test "configured compound commands retain restrictive whole-list wildcard rules" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("*"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf * && git *"), .action = .deny },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("printf * | *"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+    try std.testing.expectEqual(RuleDecision.deny, ruleDecisionForPermissionPattern(rules, "bash", "printf safe && git status", .none));
+    try std.testing.expectEqual(RuleDecision.ask, ruleDecisionForPermissionPattern(rules, "bash", "printf safe | cat", .none));
+    try std.testing.expectEqual(RuleDecision.allow, ruleDecisionForPermissionPattern(rules, "bash", "printf safe || git status", .none));
+}
+
+test "configured compound commands respect literal operators and valid list endings" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("*"), .action = .allow },
+        .{ .permission = @constCast("bash"), .pattern = @constCast("git push *"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+    for ([_][]const u8{
+        "printf '&& || ; | |& &' && printf two",
+        "printf 'git push origin main' | cat",
+        "printf '$(git push origin main)' && printf two",
+        "printf '' && printf two",
+        "printf one&&printf two",
+        "printf one;printf two",
+        "printf one;",
+        "printf one &",
+        "printf one\n\n",
+        "printf one &&\n\n printf two",
+        "printf one |\n cat",
+        "\n printf one\n printf two\n",
+    }) |command| {
+        const actual = ruleDecisionForPermissionPattern(rules, "bash", command, .none);
+        std.testing.expectEqual(RuleDecision.allow, actual) catch |err| {
+            std.debug.print("command={s}, expected=allow, actual={s}\n", .{ command, @tagName(actual) });
+            return err;
+        };
+    }
+}
+
+test "configured compound commands never wildcard-allow unsupported or malformed shell syntax" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("*"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+    for ([_][]const u8{
+        "",
+        " ",
+        "\n",
+        "&& printf one",
+        "printf one &&",
+        "printf one ||\n",
+        "printf one |",
+        "printf one |&",
+        "printf one && ; printf two",
+        "printf one ;; printf two",
+        "printf one ;& printf two",
+        "printf one ;;& printf two",
+        "printf one & & printf two",
+        "printf one && printf 'unfinished",
+        "printf one && (printf two)",
+        "{ printf one; printf two; }",
+        "printf $(printf one) && printf two",
+        "printf `printf one` && printf two",
+        "printf one && cat <(printf two)",
+        "printf one && printf two > out",
+        "printf one 2>&1 | cat",
+        "printf one &>out",
+        "printf one &>>out",
+        "printf one >|out",
+        "printf one >>out",
+        "printf one <in",
+        "printf one <>file",
+        "printf one <<<word",
+        "printf one <<EOF\nprintf two\nEOF",
+        "printf one && printf \"$(printf two)\"",
+        "printf one && printf $HOME",
+        "printf one && FOO=bar printf two",
+        "printf one && printf *",
+        "printf one && printf ~",
+        "printf one && printf [ab]",
+        "printf one && printf two # comment\nprintf three",
+        "if true; then printf one; fi",
+        "for x in one; do printf one; done",
+        "while true; do printf one; done",
+        "case one in one) printf one;; esac",
+        "printf one && time printf two",
+        "printf one && ! printf two",
+        "printf one && printf \\; printf two",
+        "printf one && printf two\x00",
+        "printf one && printf \xff",
+        "printf one && printf two\r\nprintf three",
+    }) |command| {
+        const actual = ruleDecisionForPermissionPattern(rules, "bash", command, .none);
+        std.testing.expectEqual(RuleDecision.none, actual) catch |err| {
+            std.debug.print("command={s}, expected=none, actual={s}\n", .{ command, @tagName(actual) });
+            return err;
+        };
+    }
+}
+
 test "configured command rules require exact matching outside static grammar" {
     var exact_rules_buf = [_]types.PermissionRule{
         .{ .permission = @constCast("bash"), .pattern = @constCast("printf \"$(date)\""), .action = .allow },
@@ -2666,19 +2899,21 @@ test "configured command rules match explicit environments by command" {
     };
     const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
 
-    const identity = try command_environment.permissionCommandIdentity(
-        alloc,
-        .{ .clean = "/bin/zsh" },
-        "zig build test",
-    );
-    defer alloc.free(identity);
-    const target = try alloc.print("/tmp/workspace::{s}", .{identity});
-    defer alloc.free(target);
+    for ([_][]const u8{ "zig build test", "zig build test && zig fmt src/" }) |command| {
+        const identity = try command_environment.permissionCommandIdentity(
+            alloc,
+            .{ .clean = "/bin/zsh" },
+            command,
+        );
+        defer alloc.free(identity);
+        const target = try alloc.print("/tmp/workspace::{s}", .{identity});
+        defer alloc.free(target);
 
-    try std.testing.expectEqual(
-        RuleDecision.allow,
-        try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
-    );
+        try std.testing.expectEqual(
+            RuleDecision.allow,
+            try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
+        );
+    }
 }
 
 test "directory tree permission patterns match directory and descendants only" {

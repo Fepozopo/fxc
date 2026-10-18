@@ -1,3 +1,4 @@
+/** Exercises permission outcomes through the built CLI and isolated local gateways. */
 import { describe, expect, test } from "bun:test";
 import {
   existsSync,
@@ -35,6 +36,14 @@ type PermissionEcho = {
   message: string;
   reason: string;
   denied: boolean;
+};
+
+/** Command input and expected permission and filesystem outcomes for one scenario. */
+type CompoundPermissionCase = {
+  name: string;
+  command: string;
+  reason: "policy_denied" | "permission_required" | null;
+  created: string[];
 };
 
 function createIsolatedRoot(prefix: string) {
@@ -162,6 +171,80 @@ async function runTtyPromptPermissionsCase(
 }
 
 describe("generic permission typed errors", () => {
+  // This file remains in the PGSO training corpus: checking configured shell
+  // rules is a common admission path, even when a particular outcome is denial.
+  const compoundPermissionCases: CompoundPermissionCase[] = [
+    { name: "allowed list", command: "touch first && touch second", reason: null, created: ["first", "second"] },
+    { name: "shell short-circuiting", command: "false && touch first || touch second", reason: null, created: ["second"] },
+    { name: "semicolon list", command: "touch first; touch second", reason: null, created: ["first", "second"] },
+    { name: "newline list", command: "touch first\ntouch second", reason: null, created: ["first", "second"] },
+    { name: "pipeline", command: "true | touch second", reason: null, created: ["second"] },
+    { name: "stderr pipeline", command: "true |& touch second", reason: null, created: ["second"] },
+    { name: "background list", command: "true & touch second", reason: null, created: ["second"] },
+    { name: "denied later command", command: "touch first && git add protected", reason: "policy_denied", created: [] },
+    { name: "approval-required later command", command: "touch first && rm protected", reason: "permission_required", created: [] },
+    { name: "unsupported redirection", command: "touch first && printf one > second", reason: "permission_required", created: [] },
+  ];
+  test.each(compoundPermissionCases)("compound shell permissions: $name", async ({ command, reason, created }: CompoundPermissionCase) => {
+    const root = createIsolatedRoot("fx-compound-permissions-");
+    const toolCallId = "compound_command";
+    const gateway = startFakeGateway([
+      fakeShellRun(toolCallId, command, { timeout_ms: 600_000 }),
+      fakeGatewayFinalText("compound permission observed"),
+    ]);
+    try {
+      writeFileSync(join(root.workspace, "protected"), "keep");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          permission_mode: "ask",
+          permission: {
+            "*": "allow",
+            delete_file: { "*": "ask" },
+            bash: {
+              "*": "allow",
+              "git add *": "deny",
+              "git commit *": "deny",
+              "git push *": "deny",
+              "rm *": "ask",
+            },
+          },
+        }),
+      );
+      const result = await runFx(["ask", "--json", "--quiet", "--no-save", "Run the compound command."], {
+        cwd: root.workspace,
+        env: permissionEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      });
+      const requiresApproval = reason === "permission_required";
+      expect(result.code, `${command}: exit status`).toBe(requiresApproval ? 1 : 0);
+      const json = JSON.parse(result.stdout.trim()) as FxJson & { error?: string };
+      if (requiresApproval) {
+        expect(json.error).toBe("NonInteractivePermissionRequired");
+        expect(result.stderr).toContain("reason=noninteractive_permission_prompt_unavailable");
+      } else {
+        expect(result.stderr).not.toContain("permission required");
+      }
+      expect(json.tool_calls).toContainEqual(expect.objectContaining({
+        name: "shell",
+        status: reason === null ? "success" : "error",
+      }));
+      for (const name of ["first", "second"]) {
+        expect(existsSync(join(root.workspace, name)), `${command}: ${name}`).toBe(created.includes(name));
+      }
+      expect(readFileSync(join(root.workspace, "protected"), "utf8")).toBe("keep");
+      expect(gateway.requests).toHaveLength(requiresApproval ? 1 : 2);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      if (reason === "policy_denied") {
+        const echo = JSON.parse(executionDeniedReason(gateway.requests[1]!.body, toolCallId)) as { error: PermissionEcho };
+        expect(echo.error.reason).toBe(reason);
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   test(
     "returns typed JSON for denied terminal",
     async () => {

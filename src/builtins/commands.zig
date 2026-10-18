@@ -140,6 +140,11 @@ pub const top_level_specs = [_]TopLevelSpec{
             "",
             "Change the mode from the interactive shell with `/permissions [ask|auto|full-access|reset]`,",
             "and manage persistent allow rules with `/allowlist`.",
+            "",
+            "Shell rules check each literal command joined by &&, ||, ;, newline, |, |&, or &.",
+            "Any denied command denies the whole request; any ask rule requires approval.",
+            "Every command must be allowed to skip approval. Grouping, substitutions,",
+            "redirections, and unsupported syntax retain whole-command permission checks.",
         },
     },
     .{
