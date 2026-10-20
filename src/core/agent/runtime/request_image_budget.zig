@@ -6,6 +6,7 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
+const image_data = @import("../../images/image_data.zig");
 const utf8PrefixLength = @import("../../config/context_limits.zig").utf8PrefixLength;
 
 const Allocator = std.mem.Allocator;
@@ -23,6 +24,13 @@ pub const Limits = struct {
     max_request_bytes: usize = default_max_request_bytes,
     max_images: usize = default_max_request_images,
 };
+
+/// The size a request must fit: the limit learned from the provider, else
+/// the default, and never more than the transport can carry.
+pub fn maxRequestBytes(learned: ?usize, transport: ?usize) usize {
+    const limit = learned orelse default_max_request_bytes;
+    return if (transport) |cap| @min(limit, cap) else limit;
+}
 
 /// Returns how many of the oldest images must leave a request of
 /// `request_bytes` for it to fit `limits`. `image_bytes` holds each image's
@@ -47,13 +55,48 @@ pub const Projection = struct {
 /// `request_bytes` until it fits `limits`. Returned messages are `messages`
 /// itself when nothing is withheld, otherwise a copy allocated in `arena`.
 /// `tool_text_limit` bounds tool result content after the note is added.
+/// A note names an attached image's saved copy (`savedImagePath` with
+/// `blob_dir`), or without a saved session the copy fx captured.
 pub fn withholdOldestImages(
     arena: Allocator,
     messages: []const ChatMessage,
     request_bytes: usize,
     limits: Limits,
     tool_text_limit: usize,
+    blob_dir: ?[]const u8,
 ) Allocator.Error!Projection {
+    const sizes = try imageSizes(arena, messages);
+    return withhold(arena, messages, oldestImagesToWithhold(sizes, request_bytes, limits), tool_text_limit, blob_dir);
+}
+
+/// A size no request is fit below: the default, or a larger limit learned
+/// from a provider's rejection. A transport may lower either, never raise it.
+pub fn largestRequestBytes(learned: ?usize) usize {
+    return @max(default_max_request_bytes, learned orelse 0);
+}
+
+/// Leaves out the oldest images a request of at most `max_request_bytes`
+/// can't carry by their serialized size alone, before the request is built.
+/// A request re-sends every image the session keeps, so building it whole
+/// would hold all of them, encoded, at once. A body is never smaller than
+/// its images, so this withholds no image `withholdOldestImages` would keep
+/// for a limit of at most `max_request_bytes`.
+pub fn withholdImagesPastLimit(
+    arena: Allocator,
+    messages: []const ChatMessage,
+    max_request_bytes: usize,
+    tool_text_limit: usize,
+    blob_dir: ?[]const u8,
+) Allocator.Error!Projection {
+    const sizes = try imageSizes(arena, messages);
+    var images_bytes: usize = 0;
+    for (sizes) |size| images_bytes +|= size;
+    const withheld = oldestImagesToWithhold(sizes, images_bytes, .{ .max_request_bytes = max_request_bytes });
+    return withhold(arena, messages, withheld, tool_text_limit, blob_dir);
+}
+
+/// Each image's serialized size, oldest first, allocated in `arena`.
+fn imageSizes(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const usize {
     var sizes: std.ArrayList(usize) = .empty;
     for (messages) |message| {
         for (message.images) |image| {
@@ -65,7 +108,11 @@ pub fn withholdOldestImages(
             for (memory.tool_images) |image| try sizes.append(arena, image.data.len);
         }
     }
-    const withheld = oldestImagesToWithhold(sizes.items, request_bytes, limits);
+    return sizes.items;
+}
+
+/// `messages` with its `withheld` oldest images replaced by notes.
+fn withhold(arena: Allocator, messages: []const ChatMessage, withheld: usize, tool_text_limit: usize, blob_dir: ?[]const u8) Allocator.Error!Projection {
     if (withheld == 0) return .{ .messages = messages };
 
     const projected = try arena.dupe(ChatMessage, messages);
@@ -75,7 +122,10 @@ pub fn withholdOldestImages(
         if (message.images.len > 0) {
             const count = @min(remaining, message.images.len);
             var notice: std.Io.Writer.Allocating = .init(arena);
-            for (message.images[0..count]) |image| writeAttachmentNotice(&notice.writer, image) catch return error.OutOfMemory;
+            for (message.images[0..count]) |image| {
+                const saved = (try image_attachments.savedImagePath(arena, image, blob_dir)) orelse image.snapshot_path;
+                writeAttachmentNotice(&notice.writer, image, saved) catch return error.OutOfMemory;
+            }
             message.images = message.images[count..];
             message.content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
             remaining -= count;
@@ -93,11 +143,9 @@ pub fn withholdOldestImages(
     return .{ .messages = projected, .withheld = withheld };
 }
 
-fn writeAttachmentNotice(writer: *std.Io.Writer, image: types.ImageAttachment) std.Io.Writer.Error!void {
+fn writeAttachmentNotice(writer: *std.Io.Writer, image: types.ImageAttachment, saved: ?[]const u8) std.Io.Writer.Error!void {
     try writer.print("[Image #{d} not sent to keep the request under the provider's size limit.", .{image.id});
-    if (image.inline_data == null) {
-        if (image.snapshot_path) |path| try writer.print(" The original is saved at {s}; read_file it to see it again.", .{path});
-    }
+    if (saved) |path| try writer.print(" The original is saved at {s}; read_file it to see it again.", .{path});
     try writer.writeAll("]\n");
 }
 
@@ -125,6 +173,15 @@ test "oldest images leave until the request fits" {
     try std.testing.expectEqual(@as(usize, 3), oldestImagesToWithhold(&sizes, 1300, limits));
     try std.testing.expectEqual(@as(usize, 3), oldestImagesToWithhold(&sizes, 50_000, limits));
     try std.testing.expectEqual(@as(usize, 0), oldestImagesToWithhold(&.{}, 50_000, limits));
+}
+
+test "a request fits the transport's limit as well as the provider's" {
+    try std.testing.expectEqual(default_max_request_bytes, maxRequestBytes(null, null));
+    try std.testing.expectEqual(@as(usize, 4000), maxRequestBytes(4000, null));
+    // A host transport that carries less lowers either limit.
+    try std.testing.expectEqual(@as(usize, 8000), maxRequestBytes(null, 8000));
+    try std.testing.expectEqual(@as(usize, 4000), maxRequestBytes(4000, 8000));
+    try std.testing.expectEqual(@as(usize, 3000), maxRequestBytes(4000, 3000));
 }
 
 test "oldest images leave when a request carries too many" {
@@ -159,7 +216,7 @@ test "withholding keeps history and names how to reload each image" {
     };
 
     // 12,500 bytes against 9,000: the attachment (4,000 encoded) is enough.
-    const first = try withholdOldestImages(arena, &messages, 12_500, .{ .max_request_bytes = 9000 }, 4096);
+    const first = try withholdOldestImages(arena, &messages, 12_500, .{ .max_request_bytes = 9000 }, 4096, null);
     try std.testing.expectEqual(@as(usize, 1), first.withheld);
     try std.testing.expectEqual(@as(usize, 0), first.messages[0].images.len);
     try std.testing.expect(std.mem.startsWith(u8, first.messages[0].content.?, "[Image #1 not sent to keep the request under the provider's size limit.]\n"));
@@ -167,7 +224,7 @@ test "withholding keeps history and names how to reload each image" {
     try std.testing.expectEqual(@as(usize, 2), first.messages[1].tool_result_memory.?.tool_images.len);
 
     // Against 5,000 every image leaves, oldest first.
-    const second = try withholdOldestImages(arena, &messages, 12_500, .{ .max_request_bytes = 5000 }, 4096);
+    const second = try withholdOldestImages(arena, &messages, 12_500, .{ .max_request_bytes = 5000 }, 4096, null);
     try std.testing.expectEqual(@as(usize, 3), second.withheld);
     try std.testing.expectEqual(@as(usize, 0), second.messages[1].tool_result_memory.?.tool_images.len);
     try std.testing.expectEqualStrings(
@@ -181,9 +238,49 @@ test "withholding keeps history and names how to reload each image" {
     try std.testing.expectEqualStrings("compare these", messages[0].content.?);
 
     // A request that already fits is returned as is.
-    const unchanged = try withholdOldestImages(arena, &messages, 9000, .{ .max_request_bytes = 9000 }, 4096);
+    const unchanged = try withholdOldestImages(arena, &messages, 9000, .{ .max_request_bytes = 9000 }, 4096, null);
     try std.testing.expectEqual(@as(usize, 0), unchanged.withheld);
     try std.testing.expectEqual(@as([*]const ChatMessage, &messages), unchanged.messages.ptr);
+}
+
+test "images no request can carry leave before it is built, and none it can" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool_images: [6]types.ToolImage = undefined;
+    for (&tool_images) |*image| image.* = try testToolImage(arena, 4000);
+    const messages = [_]ChatMessage{
+        .{ .role = .tool, .content = "<path>a.png</path>", .tool_result_memory = .{ .tool_images = tool_images[0..3], .tool_image_handle = "image-result-a" } },
+        .{ .role = .tool, .content = "<path>b.png</path>", .tool_result_memory = .{ .tool_images = tool_images[3..], .tool_image_handle = "image-result-b" } },
+    };
+
+    // 24,000 bytes of images against 10,000: the oldest four leave, whatever
+    // the text adds, and the newest two stay for the exact fit.
+    const before = try withholdImagesPastLimit(arena, &messages, 10_000, 4096, null);
+    try std.testing.expectEqual(@as(usize, 4), before.withheld);
+    try std.testing.expectEqual(@as(usize, 0), before.messages[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqual(@as(usize, 2), before.messages[1].tool_result_memory.?.tool_images.len);
+    // Fitting the whole body withholds at least as many.
+    const sizes = [_]usize{ 4000, 4000, 4000, 4000, 4000, 4000 };
+    for ([_]usize{ 24_000, 24_100, 30_000 }) |body_bytes| {
+        try std.testing.expect(oldestImagesToWithhold(&sizes, body_bytes, .{ .max_request_bytes = 10_000 }) >= before.withheld);
+    }
+
+    // Images that fit by size stay for the exact fit to decide.
+    const fits = try withholdImagesPastLimit(arena, &messages, 30_000, 4096, null);
+    try std.testing.expectEqual(@as(usize, 0), fits.withheld);
+    try std.testing.expectEqual(@as([*]const ChatMessage, &messages), fits.messages.ptr);
+
+    // The image count limit applies too.
+    const many: [default_max_request_images + 5]usize = @splat(1);
+    try std.testing.expectEqual(@as(usize, 5), oldestImagesToWithhold(&many, many.len, .{ .max_request_bytes = largestRequestBytes(null) }));
+}
+
+test "no learned limit lowers the bound a request is fit below" {
+    try std.testing.expectEqual(default_max_request_bytes, largestRequestBytes(null));
+    try std.testing.expectEqual(default_max_request_bytes, largestRequestBytes(1000));
+    // A rejected request that was mostly text can teach a larger limit.
+    try std.testing.expectEqual(default_max_request_bytes + 1, largestRequestBytes(default_max_request_bytes + 1));
 }
 
 test "withheld snapshot attachments point at their saved file" {
@@ -196,11 +293,28 @@ test "withheld snapshot attachments point at their saved file" {
         .path = try arena.dupe(u8, "screen.png"),
         .media_type = try arena.dupe(u8, "image/png"),
         .snapshot_path = try arena.dupe(u8, "/home/u/.fx/sessions/s/images/3.bin"),
-    });
+    }, "/home/u/.fx/sessions/s/images/3.bin");
     try std.testing.expectEqualStrings(
         "[Image #3 not sent to keep the request under the provider's size limit. The original is saved at /home/u/.fx/sessions/s/images/3.bin; read_file it to see it again.]\n",
         notice.written(),
     );
+}
+
+test "a prompt image left out for size names the saved copy every request names (D79)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var image = try image_attachments.captureInlineImageBytesInMemory(arena, 1, "image/png", &image_data.testPngHeader(10, 10));
+    image.snapshot_path = try arena.dupe(u8, "/tmp/fx-image-snapshots-0123456789abcdef/image-1.bin");
+    const messages = [_]ChatMessage{.{ .role = .user, .content = "look", .images = &.{image} }};
+    const blob_dir = "/Users/example/.fx/sessions/v2/s/blobs";
+    const saved = try withholdImagesPastLimit(arena, &messages, 1, 4096, blob_dir);
+    try std.testing.expectEqual(@as(usize, 1), saved.withheld);
+    const blob = try std.Io.Dir.path.join(arena, &.{ blob_dir, image.snapshot_sha256.? });
+    try std.testing.expect(std.mem.find(u8, saved.messages[0].content.?, try arena.print("The original is saved at {s};", .{blob})) != null);
+    // Without a saved session it names the copy fx captured for the run.
+    const unsaved = try withholdImagesPastLimit(arena, &messages, 1, 4096, null);
+    try std.testing.expect(std.mem.find(u8, unsaved.messages[0].content.?, "The original is saved at /tmp/fx-image-snapshots-0123456789abcdef/image-1.bin;") != null);
 }
 
 test "a withheld tool image without a saved handle says so plainly" {

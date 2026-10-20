@@ -235,7 +235,6 @@ const CapabilityImpl = struct {
     terminal_dir: ?io_mod.VerifiedDir = null,
     display_session_path: []u8,
     legacy_direct_kind: ?ManagedChildKind = null,
-    legacy_background_root: bool = false,
     legacy_display_route: ?[]u8 = null,
     replace_ops: io_mod.DurableOps,
     lock_ops: io_mod.LockOps,
@@ -290,16 +289,6 @@ const CapabilityImpl = struct {
         if (self.legacy_direct_kind) |direct_kind| {
             if (kind != direct_kind) return error.SessionChildStoreFailed;
             return self.directRoute(kind);
-        }
-        if (self.legacy_background_root) {
-            return switch (kind) {
-                .background_records => &self.background_records.?,
-                .background_logs => if (self.background_logs) |*managed_route|
-                    managed_route
-                else
-                    null,
-                else => error.SessionChildStoreFailed,
-            };
         }
         // A v2 capability has no side folder: its bodies are blobs (D48),
         // and its terminal state lives in its terminal folder (D45).
@@ -523,19 +512,6 @@ const CapabilityImpl = struct {
     ) ![]u8 {
         if (self.legacy_direct_kind == kind) {
             return alloc.dupe(u8, self.legacy_display_route.?);
-        }
-        if (self.legacy_background_root) {
-            return switch (kind) {
-                .background_records => alloc.dupe(
-                    u8,
-                    self.legacy_display_route.?,
-                ),
-                .background_logs => std.Io.Dir.path.join(
-                    alloc,
-                    &.{ self.legacy_display_route.?, "logs" },
-                ),
-                else => error.SessionChildStoreFailed,
-            };
         }
         return switch (kind) {
             .background_records => std.Io.Dir.path.join(
@@ -991,95 +967,6 @@ pub const SessionChildCapability = struct {
         return .{ .impl = impl };
     }
 
-    pub fn initLegacyBackgroundRoutes(
-        alloc: Allocator,
-        background_path: []const u8,
-        mode: Mode,
-    ) !SessionChildCapability {
-        if (mode == .writable) io_mod.e2eFailIfDurableMutationAttempted();
-        if (mode == .writable) {
-            try config_runtime.makeAbsolutePath(background_path);
-        }
-        var records = std.Io.Dir.openDirAbsolute(
-            io_mod.getIo(),
-            background_path,
-            .{ .iterate = true, .follow_symlinks = false },
-        ) catch |err| switch (err) {
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        errdefer records.close(io_mod.getIo());
-        if (mode == .writable) {
-            records.setPermissions(
-                io_mod.getIo(),
-                private_dir_permissions,
-            ) catch return error.PrivateStatePermissionsUnsupported;
-        }
-        try verifyPrivateDirectory(records);
-
-        if (mode == .writable) {
-            records.createDir(
-                io_mod.getIo(),
-                "logs",
-                private_dir_permissions,
-            ) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                error.NotDir, error.SymLinkLoop => {
-                    return error.SessionPathUnsafe;
-                },
-                else => return error.SessionChildStoreFailed,
-            };
-        }
-        const logs: ?std.Io.Dir = records.openDir(io_mod.getIo(), "logs", .{
-            .iterate = true,
-            .follow_symlinks = false,
-        }) catch |err| switch (err) {
-            error.FileNotFound => if (mode == .read_only)
-                null
-            else
-                return error.SessionChildStoreFailed,
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        errdefer if (logs) |route| route.close(io_mod.getIo());
-        if (logs) |route| {
-            if (mode == .writable) {
-                route.setPermissions(
-                    io_mod.getIo(),
-                    private_dir_permissions,
-                ) catch return error.PrivateStatePermissionsUnsupported;
-            }
-            try verifyPrivateDirectory(route);
-        }
-
-        var retained = try records.openDir(io_mod.getIo(), ".", .{
-            .iterate = true,
-            .follow_symlinks = false,
-        });
-        errdefer retained.close(io_mod.getIo());
-        const display = try alloc.dupe(u8, background_path);
-        errdefer alloc.free(display);
-        const direct_display = try alloc.dupe(u8, background_path);
-        errdefer alloc.free(direct_display);
-        const impl = try alloc.create(CapabilityImpl);
-        impl.* = .{
-            .alloc = alloc,
-            .mode = mode,
-            .session_dir = .{ .dir = retained },
-            .display_session_path = display,
-            .legacy_background_root = true,
-            .legacy_display_route = direct_display,
-            .replace_ops = .{},
-            .lock_ops = .{},
-            .background_records = .{ .dir = records },
-            .background_logs = if (logs) |route|
-                .{ .dir = route }
-            else
-                null,
-        };
-        return .{ .impl = impl };
-    }
-
     pub fn initForTesting(
         alloc: Allocator,
         session_dir: std.Io.Dir,
@@ -1122,31 +1009,6 @@ pub const SessionChildCapability = struct {
             .lock_ops = options.lock_ops,
         };
         return .{ .impl = impl };
-    }
-
-    /// Opens a capability restricted to the subagent control route. This does
-    /// not acquire or imply authority over the session transcript.
-    pub fn initSubagentControl(
-        alloc: Allocator,
-        session_dir: std.Io.Dir,
-        display_session_path: []const u8,
-        mode: Mode,
-        options: Options,
-    ) SubagentControlInitError!SessionChildCapability {
-        var capability = initWithOptions(
-            alloc,
-            session_dir,
-            display_session_path,
-            mode,
-            options,
-        ) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
-            else => error.SessionChildStoreFailed,
-        };
-        capability.impl.allowed_kind = .subagent_control;
-        return capability;
     }
 
     /// Opens a capability restricted to host-owned terminal records and
@@ -1210,11 +1072,7 @@ pub const SessionChildCapability = struct {
         self: *const SessionChildCapability,
         alloc: Allocator,
     ) !SessionChildCapability {
-        if (self.impl.legacy_direct_kind != null or
-            self.impl.legacy_background_root)
-        {
-            return error.SessionChildStoreFailed;
-        }
+        if (self.impl.legacy_direct_kind != null) return error.SessionChildStoreFailed;
         var cloned = if (self.impl.blobs) |blobs|
             try initBlobs(alloc, blobs, self.impl.display_session_path, .read_only)
         else
@@ -2000,86 +1858,6 @@ test "read only capability leaves every missing fixed route absent" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), try countEntries(session.dir));
-}
-
-test "subagent control capability is route restricted and rejects symlinks" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try openTestSession(alloc, &tmp);
-    defer session.dir.close(io_mod.getIo());
-    defer alloc.free(session.display_path);
-    var capability = try SessionChildCapability.initSubagentControl(
-        alloc,
-        session.dir,
-        session.display_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-
-    try std.testing.expectError(
-        error.SessionChildStoreFailed,
-        capability.createExclusiveFile(alloc, .background_records, "wrong-route.json"),
-    );
-    var entry = try capability.atomicReplace(
-        alloc,
-        .subagent_control,
-        "control.json",
-        "{}",
-    );
-    entry.deinit(alloc);
-    var lock = try capability.acquireTimedAdvisoryLock(
-        .subagent_control,
-        "subagent-control.lock",
-        10,
-    );
-    lock.release();
-
-    try session.dir.symLink(
-        io_mod.getIo(),
-        "../outside-control",
-        "subagent/linked.json",
-        .{},
-    );
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        capability.openFileReadOnly(alloc, .subagent_control, "linked.json"),
-    );
-}
-
-test "subagent control capability rejects a symlinked route" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try openTestSession(alloc, &tmp);
-    defer session.dir.close(io_mod.getIo());
-    defer alloc.free(session.display_path);
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "outside",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    try session.dir.symLink(
-        io_mod.getIo(),
-        "../outside",
-        "subagent",
-        .{ .is_directory = true },
-    );
-    var capability = try SessionChildCapability.initSubagentControl(
-        alloc,
-        session.dir,
-        session.display_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        capability.iterate(alloc, .subagent_control),
-    );
 }
 
 test "terminal capabilities are private route restricted and reject symlinks" {

@@ -33,7 +33,6 @@ const prompt_policy = @import("../config/prompt_policy.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
-const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -100,7 +99,6 @@ const ResumeInvocation = struct {
 
 const resume_id_alias_prefix = "--resume-";
 pub const upgrade_relaunch_arg = "--upgrade-relaunch";
-pub const sessions_v2_arg = "--sessions-v2";
 
 pub const UpgradeRelaunch = struct {
     previous_revision: ?[]u8 = null,
@@ -141,8 +139,6 @@ pub const LaunchModifiers = struct {
     ultrafast_override: ?bool = null,
     provider_order_override: ?[][]const u8 = null,
     provider_strict_override: ?bool = null,
-    /// `--sessions-v2`: keep this process's sessions in the v2 store.
-    sessions_v2: bool = false,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -321,17 +317,6 @@ const SessionDetailOptions = struct {
     }
 };
 
-const SessionMigrationOptions = struct {
-    format: output_contracts.OutputFormat = .text,
-    session_id: []u8,
-    allow_large: bool = false,
-
-    fn deinit(self: *SessionMigrationOptions, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        self.* = undefined;
-    }
-};
-
 const SessionRecoveryOptions = struct {
     format: output_contracts.OutputFormat = .text,
     session_id: []u8,
@@ -428,14 +413,11 @@ fn parseGlobalLaunchArgs(
     var provider_order_override: ?[][]const u8 = null;
     errdefer if (provider_order_override) |order| freeProviderOrderOverride(alloc, order);
     var provider_strict_override: ?bool = null;
-    var sessions_v2 = false;
 
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, sessions_v2_arg)) {
-            sessions_v2 = true;
-        } else if (std.mem.eql(u8, arg, "--context-limit")) {
+        if (std.mem.eql(u8, arg, "--context-limit")) {
             index += 1;
             if (index >= args.len) return error.MissingContextLimitValue;
             try overrides.append(alloc, try config_runtime.context_limits.parseOverride(args[index]));
@@ -527,7 +509,6 @@ fn parseGlobalLaunchArgs(
             .ultrafast_override = ultrafast_override,
             .provider_order_override = provider_order_override,
             .provider_strict_override = provider_strict_override,
-            .sessions_v2 = sessions_v2,
         },
     };
 }
@@ -565,8 +546,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--ultrafast") and
             !std.mem.eql(u8, arg, "--no-ultrafast") and
             !std.mem.eql(u8, arg, "--provider-strict") and
-            !std.mem.eql(u8, arg, "--no-provider-strict") and
-            !std.mem.eql(u8, arg, sessions_v2_arg))
+            !std.mem.eql(u8, arg, "--no-provider-strict"))
         {
             return args[index..];
         }
@@ -1088,7 +1068,6 @@ fn runNonInteractiveWithDeps(
     const global_args = &parsed_launch.global_args;
     const effective_args = parsed_launch.effective_args;
     const parsed_command = parsed_launch.command;
-    const sessions_v2 = session_adapter.enabled(global_args.modifiers.sessions_v2);
 
     if (global_args.modifiers.hasWorkspaceModifiers() and
         !commandSupportsWorkspaceModifiers(parsed_command))
@@ -1565,7 +1544,6 @@ fn runNonInteractiveWithDeps(
                 cfg.default_model,
                 cfg.default_agent_step_limit,
                 mcp_inspection.profile_diagnostic,
-                sessions_v2,
             );
             defer snapshot.deinit(alloc);
 
@@ -1599,77 +1577,7 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 };
                 defer recovery.deinit(alloc);
-                if (sessions_v2) return runSessionRecoveryV2(alloc, deps, recovery);
-
-                const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-                defer alloc.free(workspace_root);
-                var store = session_store.Store.init(
-                    alloc,
-                    workspace_root,
-                ) catch |err| {
-                    try writeLookupFailure(
-                        alloc,
-                        deps,
-                        "session",
-                        err,
-                        recovery.format,
-                    );
-                    return .handled_failure;
-                };
-                defer store.deinit(alloc);
-                var result = store.recoverSessionCopy(
-                    alloc,
-                    recovery.session_id,
-                    .{},
-                ) catch |err| {
-                    try writeLookupFailure(
-                        alloc,
-                        deps,
-                        "session",
-                        err,
-                        recovery.format,
-                    );
-                    return .handled_failure;
-                };
-                defer result.deinit(alloc);
-                return writeSessionRecovery(alloc, deps, result, recovery.format);
-            }
-
-            if (rest.len > 0 and std.mem.eql(u8, rest[0], "migrate")) {
-                var migration = parseSessionMigrationArgs(alloc, rest[1..]) catch |err| {
-                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", err, rest[1..]);
-                    return .handled_failure;
-                };
-                defer migration.deinit(alloc);
-                if (sessions_v2) {
-                    try writeLookupFailure(alloc, deps, "session", error.SessionMigrationUnavailable, migration.format);
-                    return .handled_failure;
-                }
-
-                const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-                defer alloc.free(workspace_root);
-
-                var store = session_store.Store.init(alloc, workspace_root) catch |err| {
-                    try writeLookupFailure(alloc, deps, "session", err, migration.format);
-                    return .handled_failure;
-                };
-                defer store.deinit(alloc);
-                var result = store.migrateLegacyStorageOnly(
-                    alloc,
-                    migration.session_id,
-                    .{ .allow_large = migration.allow_large },
-                ) catch |err| {
-                    try writeLookupFailure(alloc, deps, "session", err, migration.format);
-                    return .handled_failure;
-                };
-                defer result.deinit(alloc);
-
-                const text = try (output_contracts.SessionMigrationSnapshot{
-                    .result = result,
-                }).render(alloc, migration.format);
-                defer alloc.free(text);
-                try writeFormattedOutput(deps, text, migration.format);
-                return .handled_success;
+                return runSessionRecovery(alloc, deps, recovery);
             }
 
             var opts = parseSessionDetailArgs(alloc, rest) catch |err| {
@@ -1682,49 +1590,7 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", error.InvalidSessionDetailArgs, rest);
                 return .handled_failure;
             };
-            if (sessions_v2) return runSessionDetailV2(alloc, deps, target, opts.format);
-
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-
-            var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
-                try writeLookupFailure(alloc, deps, "session", err, opts.format);
-                return .handled_failure;
-            };
-            defer store.deinit(alloc);
-
-            switch (target) {
-                .last => {
-                    var summary = subagent_resume_admission.latestVisibleWorkspaceSummary(
-                        store,
-                        alloc,
-                    ) catch |err| {
-                        try writeLookupFailure(alloc, deps, "session", err, opts.format);
-                        return .handled_failure;
-                    };
-                    defer summary.deinit(alloc);
-                    return writeSessionSummary(alloc, deps, summary, opts.format);
-                },
-                .id => |id| {
-                    var detail = subagent_resume_admission.loadVisibleReadOnlyDetail(
-                        store,
-                        alloc,
-                        id,
-                        .{},
-                    ) catch |err| {
-                        try writeSessionDetailFailure(
-                            alloc,
-                            deps,
-                            id,
-                            err,
-                            opts.format,
-                        );
-                        return .handled_failure;
-                    };
-                    defer detail.deinit(alloc);
-                    return writeSessionDetail(alloc, deps, detail.state, opts.format);
-                },
-            }
+            return runSessionDetail(alloc, deps, target, opts.format);
         },
         .sessions => |rest| {
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
@@ -1732,38 +1598,13 @@ fn runNonInteractiveWithDeps(
                     try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                     return .handled_failure;
                 };
-                // It moves v1 sessions into the experimental store, where
-                // plain fx would no longer find them.
-                if (!sessions_v2) {
-                    try writeLookupFailure(alloc, deps, "sessions", error.SessionsV2Required, format);
-                    return .handled_failure;
-                }
                 return runSessionConvert(alloc, deps, format);
             }
             const opts = parseSessionListArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return .handled_failure;
             };
-            if (sessions_v2) return runSessionListV2(alloc, deps, opts);
-
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-
-            var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
-                try writeLookupFailure(alloc, deps, "sessions", err, opts.format);
-                return .handled_failure;
-            };
-            defer store.deinit(alloc);
-
-            var page = subagent_resume_admission.listVisiblePage(
-                store,
-                alloc,
-                opts.scope,
-                opts.continuation,
-                opts.limit,
-            ) catch |err| return err;
-            defer page.deinit(alloc);
-            return writeSessionList(alloc, deps, page, opts);
+            return runSessionList(alloc, deps, opts);
         },
         .workspace => |rest| {
             const opts = parseWorkspaceArgs(rest) catch |err| {
@@ -3284,7 +3125,7 @@ fn writeSessionRecovery(
 }
 
 /// `fx sessions` on v2: the page v1 shows, from the v2 catalog.
-fn runSessionListV2(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !RunResult {
+fn runSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), opts.format);
         return .handled_failure;
@@ -3310,9 +3151,6 @@ fn parseSessionConvertArgs(args: []const [:0]const u8) !output_contracts.OutputF
     return error.InvalidLocalSurfaceArgs;
 }
 
-/// Why `fx sessions convert` refuses without the v2 store switched on.
-const sessions_v2_required_message = "sessions convert moves v1 sessions into the experimental v2 store and needs --sessions-v2 or FX_SESSIONS_V2=1";
-
 /// `fx sessions convert`: converts every v1 session v2 does not hold yet,
 /// and fails when it skipped any (D61).
 fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.OutputFormat) !RunResult {
@@ -3335,14 +3173,28 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
     for (report.skipped.items, skipped) |from, *to| to.* = .{ .id = from.id, .code = from.code, .reason = from.reason };
     const left_out = try alloc.alloc(output_contracts.SessionConvertSnapshot.LeftOut, report.left_out.items.len);
     defer alloc.free(left_out);
+    var reasons = std.heap.ArenaAllocator.init(alloc);
+    defer reasons.deinit();
     for (report.left_out.items, left_out) |from, *to| to.* = .{
         .id = from.id,
         .member = from.file.member,
         .file = from.file.file,
+        .cause = @tagName(from.file.cause),
+        .reason = try from.file.reason(reasons.allocator()),
         .bytes = from.file.bytes,
         .limit = session_adapter.ConvertReport.file_limit_bytes,
     };
-    const snapshot: output_contracts.SessionConvertSnapshot = .{ .converted = report.converted, .busy = report.busy, .unreadable = report.unreadable, .skipped = skipped, .left_out = left_out };
+    const kept = try alloc.alloc(output_contracts.SessionConvertSnapshot.Kept, report.kept_children.len);
+    defer alloc.free(kept);
+    for (report.kept_children, kept) |from, *to| to.* = .{ .id = from.id, .reason = from.reason };
+    const snapshot: output_contracts.SessionConvertSnapshot = .{
+        .converted = report.converted,
+        .busy = report.busy,
+        .unreadable = report.unreadable,
+        .skipped = skipped,
+        .left_out = left_out,
+        .kept = kept,
+    };
     const text = try snapshot.render(alloc, format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);
@@ -3350,7 +3202,7 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
 }
 
 /// `fx session last|{id}` on v2, read without the session's lock (D37).
-fn runSessionDetailV2(
+fn runSessionDetail(
     alloc: Allocator,
     deps: RunDeps,
     target: SessionDetailTarget,
@@ -3371,14 +3223,14 @@ fn runSessionDetailV2(
             };
             defer page.deinit(alloc);
             if (page.summaries.items.len == 0) {
-                try writeLookupFailure(alloc, deps, "session", error.NoSavedSessions, format);
+                try writeLookupFailure(alloc, deps, "session", session_adapter.noLatestError(&store, alloc), format);
                 return .handled_failure;
             }
             return writeSessionSummary(alloc, deps, page.summaries.items[0], format);
         },
         .id => |id| {
             var resumed = session_adapter.readSession(&store, alloc, id) catch |err| {
-                try writeSessionDetailFailure(alloc, deps, id, session_adapter.commandError(err), format);
+                try writeSessionDetailFailure(alloc, deps, id, session_adapter.commandError(err), store.problem.text(), format);
                 return .handled_failure;
             };
             defer resumed.deinit(alloc);
@@ -3388,7 +3240,7 @@ fn runSessionDetailV2(
 }
 
 /// `fx session recover` on v2 (D15): a copy up to the last good turn.
-fn runSessionRecoveryV2(alloc: Allocator, deps: RunDeps, recovery: SessionRecoveryOptions) !RunResult {
+fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecoveryOptions) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), recovery.format);
         return .handled_failure;
@@ -3409,6 +3261,7 @@ fn runSessionRecoveryV2(alloc: Allocator, deps: RunDeps, recovery: SessionRecove
         .recovered_session_id = recovered_id,
         .history_len = recovered.history_len,
         .status = if (recovered.files_complete) .recovered else .recovered_with_unverified_artifacts,
+        .permission_rules_dropped = recovered.permission_rules_dropped,
     };
     defer result.deinit(alloc);
     return writeSessionRecovery(alloc, deps, result, recovery.format);
@@ -3435,18 +3288,7 @@ fn writeLookupFailure(
         error.SessionNotFound => {
             try writeStderr(deps, "fx session: record not found\n");
         },
-        error.SessionMigrationUnavailable => {
-            try writeStderr(deps, "fx session: session migrate converts v1 sessions and is not available with sessions v2 yet\n");
-        },
-        error.SessionsV2Required => {
-            try writeStderr(deps, "fx sessions: " ++ sessions_v2_required_message ++ "\n");
-        },
-        error.InvalidSessionFormat,
-        error.InvalidPermissionState,
-        error.PermissionStateTooLarge,
-        error.InvalidRecoveryCheckpoint,
-        error.InvalidUsageSidecar,
-        => {
+        error.InvalidSessionFormat => {
             try writeStderr(
                 deps,
                 "fx session: record is corrupt; run `fx doctor` for recovery guidance\n",
@@ -3461,52 +3303,10 @@ fn writeLookupFailure(
         error.InvalidSessionId => {
             try writeStderr(deps, "fx session: invalid session id\n");
         },
-        error.LegacySessionTooLarge => {
-            try writeStderr(
-                deps,
-                "fx session: legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`\n",
-            );
-        },
-        error.LegacySessionReadResourceExhausted => {
-            try writeStderr(
-                deps,
-                "fx session: legacy session could not be loaded with available resources\n",
-            );
-        },
-        error.LegacySessionMigrationResourceExhausted => {
-            try writeStderr(
-                deps,
-                "fx session: migration did not complete because resources were exhausted; the original session remains authoritative\n",
-            );
-        },
-        error.LegacySessionMigrationFailed, error.LegacySessionChanged => {
-            try writeStderr(
-                deps,
-                "fx session: migration did not complete; the original session remains authoritative\n",
-            );
-        },
-        error.LegacySessionMigrationIndeterminate => {
-            try writeStderr(
-                deps,
-                "fx session: migration outcome is indeterminate and will be resolved by the next exact writable load\n",
-            );
-        },
         error.SessionRecoveryNotNeeded => {
             try writeStderr(
                 deps,
                 "fx session: recovery was refused because the session has a valid commit boundary; resume it normally\n",
-            );
-        },
-        error.SessionRecoveryRequiresCurrentSchema => {
-            try writeStderr(
-                deps,
-                "fx session: recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first\n",
-            );
-        },
-        error.SessionRecoveryUnsupportedSchema => {
-            try writeStderr(
-                deps,
-                "fx session: recovery is unavailable for this unsupported session version\n",
             );
         },
         error.SessionRecoveryBoundaryInvalid => {
@@ -3515,42 +3315,19 @@ fn writeLookupFailure(
                 "fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
             );
         },
-        error.SessionRecoveryIndeterminate => {
-            try writeStderr(
-                deps,
-                "fx session: the recovery copy could not be confirmed; the source was left unchanged\n",
-            );
-        },
-        error.SessionAuthorityBoundaryUnavailable,
-        error.SessionCommitBoundaryUnavailable,
-        => {
-            try writeStderr(
-                deps,
-                "fx session: session authority is temporarily unavailable while an incomplete commit is resolved\n",
-            );
-        },
-        error.SessionAuthorityIntentCleanupPending => {
-            try writeStderr(
-                deps,
-                "fx session: session authority is confirmed but transition cleanup is still pending\n",
-            );
-        },
-        error.SessionBusy, error.SessionLockUnsupported => {
+        error.SessionBusy => {
             try writeStderr(
                 deps,
                 "fx session: session is busy or the filesystem cannot provide the required lock\n",
             );
         },
-        error.SessionPathUnsafe,
-        error.DurablePathUnsafe,
-        error.PrivateStatePermissionsUnsupported,
-        => {
+        error.DurablePathUnsafe => {
             try writeStderr(
                 deps,
                 "fx session: durable session storage is unsafe or does not support required private permissions\n",
             );
         },
-        error.DurableLayoutFailed, error.SessionStoreUnavailable => {
+        error.SessionStoreUnavailable => {
             try writeStderr(deps, "fx session: durable session store is unavailable\n");
         },
         error.HomeNotSet => {
@@ -3562,15 +3339,21 @@ fn writeLookupFailure(
     }
 }
 
+/// `reason` names the file and the problem of a v1 session v1's reader
+/// refuses (D78), and is empty otherwise.
 fn writeSessionDetailFailure(
     alloc: Allocator,
     deps: RunDeps,
     session_id: []const u8,
     err: anyerror,
+    reason: []const u8,
     format: output_contracts.OutputFormat,
 ) !void {
     const message = switch (err) {
-        error.InvalidSessionFormat => try alloc.print(
+        error.InvalidSessionFormat => if (reason.len > 0) try alloc.print(
+            "session {s} can't be read: {s}; run `fx doctor`",
+            .{ session_id, reason },
+        ) else try alloc.print(
             "session {s} is corrupt; run `fx session recover {s}`",
             .{ session_id, session_id },
         ),
@@ -3620,39 +3403,35 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.NoSavedSessions => "no saved sessions for this workspace",
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.SessionMigrationUnavailable => "session migrate converts v1 sessions and is not available with sessions v2 yet",
-        error.SessionsV2Required => sessions_v2_required_message,
-        error.InvalidSessionFormat,
-        error.InvalidPermissionState,
-        error.PermissionStateTooLarge,
-        error.InvalidRecoveryCheckpoint,
-        error.InvalidUsageSidecar,
-        => "record is corrupt; run `fx doctor` for recovery guidance",
+        error.InvalidSessionFormat => "record is corrupt; run `fx doctor` for recovery guidance",
         error.UnsupportedSessionSchema => "record uses an unsupported session version",
         error.InvalidSessionId => "invalid session id",
-        error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`",
-        error.LegacySessionReadResourceExhausted => "legacy session could not be loaded with available resources",
-        error.LegacySessionMigrationResourceExhausted => "migration did not complete because resources were exhausted; the original session remains authoritative",
-        error.LegacySessionMigrationFailed, error.LegacySessionChanged => "migration did not complete; the original session remains authoritative",
-        error.LegacySessionMigrationIndeterminate => "migration outcome is indeterminate and will be resolved by the next exact writable load",
         error.SessionRecoveryNotNeeded => "recovery was refused because the session has a valid commit boundary; resume it normally",
-        error.SessionRecoveryRequiresCurrentSchema => "recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first",
-        error.SessionRecoveryUnsupportedSchema => "recovery is unavailable for this unsupported session version",
         error.SessionRecoveryBoundaryInvalid => "no exact trustworthy recovery boundary was found; the source was left unchanged",
-        error.SessionRecoveryIndeterminate => "the recovery copy could not be confirmed; the source was left unchanged",
-        error.SessionAuthorityBoundaryUnavailable,
-        error.SessionCommitBoundaryUnavailable,
-        => "session authority is temporarily unavailable while an incomplete commit is resolved",
-        error.SessionAuthorityIntentCleanupPending => "session authority is confirmed but transition cleanup is still pending",
-        error.SessionBusy, error.SessionLockUnsupported => "session is busy or the filesystem cannot provide the required lock",
+        error.SessionBusy => "session is busy or the filesystem cannot provide the required lock",
         error.SessionPathUnsafe,
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
         => "durable session storage is unsafe or does not support required private permissions",
-        error.DurableLayoutFailed, error.SessionStoreUnavailable => "durable session store is unavailable",
+        error.SessionStoreUnavailable => "durable session store is unavailable",
         error.HomeNotSet => "HOME is not set",
         else => null,
     };
+}
+
+test "session detail failure names an older fx's damaged file and points at doctor (D78)" {
+    var text = CaptureOutput.init(std.testing.allocator);
+    defer text.deinit();
+    try writeSessionDetailFailure(std.testing.allocator, text.deps(), "old-session", error.InvalidSessionFormat, "events.jsonl can't be read (AccessDenied)", .text);
+    try std.testing.expectEqualStrings(
+        "fx session: session old-session can't be read: events.jsonl can't be read (AccessDenied); run `fx doctor`\n",
+        text.stderr.written(),
+    );
+    var json = CaptureOutput.init(std.testing.allocator);
+    defer json.deinit();
+    try writeSessionDetailFailure(std.testing.allocator, json.deps(), "old-session", error.InvalidSessionFormat, "events.jsonl can't be read (AccessDenied)", .json);
+    try std.testing.expect(std.mem.find(u8, json.stdout.written(), "\"code\":\"InvalidSessionFormat\"") != null);
+    try std.testing.expect(std.mem.find(u8, json.stdout.written(), "run `fx doctor`") != null);
 }
 
 test "session detail failures separate corruption from unsupported schema" {
@@ -3663,6 +3442,7 @@ test "session detail failures separate corruption from unsupported schema" {
         corrupt_text.deps(),
         "broken-session",
         error.InvalidSessionFormat,
+        "",
         .text,
     );
     try std.testing.expectEqualStrings("", corrupt_text.stdout.written());
@@ -3678,6 +3458,7 @@ test "session detail failures separate corruption from unsupported schema" {
         corrupt_json.deps(),
         "broken-session",
         error.InvalidSessionFormat,
+        "",
         .json,
     );
     try std.testing.expectEqualStrings("", corrupt_json.stderr.written());
@@ -3703,6 +3484,7 @@ test "session detail failures separate corruption from unsupported schema" {
         unsupported_text.deps(),
         "future-session",
         error.UnsupportedSessionSchema,
+        "",
         .text,
     );
     try std.testing.expectEqualStrings("", unsupported_text.stdout.written());
@@ -3710,47 +3492,6 @@ test "session detail failures separate corruption from unsupported schema" {
         "fx session: session future-session uses an unsupported session version\n",
         unsupported_text.stderr.written(),
     );
-}
-
-test "session lookup failures preserve supporting-state errors in the requested format" {
-    const cases = [_]struct { err: anyerror, code: []const u8 }{
-        .{ .err = error.InvalidPermissionState, .code = "InvalidPermissionState" },
-        .{ .err = error.PermissionStateTooLarge, .code = "PermissionStateTooLarge" },
-        .{ .err = error.InvalidRecoveryCheckpoint, .code = "InvalidRecoveryCheckpoint" },
-        .{ .err = error.InvalidUsageSidecar, .code = "InvalidUsageSidecar" },
-    };
-    for (cases) |case| {
-        for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
-            var output = CaptureOutput.init(std.testing.allocator);
-            defer output.deinit();
-            try writeLookupFailure(std.testing.allocator, output.deps(), "session", case.err, format);
-            const body = if (format == .json) output.stdout.written() else output.stderr.written();
-            const unused = if (format == .json) output.stderr.written() else output.stdout.written();
-            try std.testing.expectEqual(@as(usize, 0), unused.len);
-            try std.testing.expect(std.mem.find(u8, body, "fx doctor") != null);
-            try std.testing.expect(std.mem.find(u8, body, "resume it normally") == null);
-            if (format == .json) {
-                var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-                defer parsed.deinit();
-                try std.testing.expectEqualStrings(case.code, parsed.value.object.get("code").?.string);
-            }
-        }
-    }
-}
-
-test "sessions convert without the v2 store names the switch it needs, in text and json" {
-    for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
-        var output = CaptureOutput.init(std.testing.allocator);
-        defer output.deinit();
-        try writeLookupFailure(std.testing.allocator, output.deps(), "sessions", error.SessionsV2Required, format);
-        const body = if (format == .json) output.stdout.written() else output.stderr.written();
-        try std.testing.expect(std.mem.find(u8, body, "--sessions-v2 or FX_SESSIONS_V2=1") != null);
-        if (format == .json) {
-            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-            defer parsed.deinit();
-            try std.testing.expectEqualStrings("SessionsV2Required", parsed.value.object.get("code").?.string);
-        }
-    }
 }
 
 test "session recovery boundary failures keep stable text and json guidance" {
@@ -3832,7 +3573,6 @@ fn workflowConfigWithLaunchModifiers(
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
-    result.sessions_v2 = modifiers.sessions_v2;
     return result;
 }
 
@@ -4136,42 +3876,6 @@ fn parseSessionDetailArgs(
         options.target = .{ .id = try alloc.dupe(u8, trimmed) };
     }
     return options;
-}
-
-fn parseSessionMigrationArgs(
-    alloc: Allocator,
-    args: []const [:0]const u8,
-) !SessionMigrationOptions {
-    var format: output_contracts.OutputFormat = .text;
-    var allow_large = false;
-    var session_id: ?[]u8 = null;
-    errdefer if (session_id) |id| alloc.free(id);
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--json")) {
-            format = .json;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--allow-large")) {
-            allow_large = true;
-            continue;
-        }
-        if (session_id != null) return error.InvalidSessionMigrationArgs;
-        const exact_id = std.mem.eql(u8, arg, "--id");
-        if (exact_id) {
-            i += 1;
-            if (i >= args.len) return error.InvalidSessionMigrationArgs;
-        }
-        const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
-        if (trimmed.len == 0) return error.InvalidSessionMigrationArgs;
-        session_id = try alloc.dupe(u8, trimmed);
-    }
-    return .{
-        .format = format,
-        .session_id = session_id orelse return error.InvalidSessionMigrationArgs,
-        .allow_large = allow_large,
-    };
 }
 
 fn parseSessionRecoveryArgs(
@@ -4870,50 +4574,6 @@ test "parse session detail args treats last after id flag as exact id" {
     }
 }
 
-test "parse session migration args accepts positional and exact ids" {
-    var positional = try parseSessionMigrationArgs(std.testing.allocator, &.{
-        @constCast("session.v2"),
-        @constCast("--allow-large"),
-        @constCast("--json"),
-    });
-    defer positional.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("session.v2", positional.session_id);
-    try std.testing.expect(positional.allow_large);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, positional.format);
-
-    var exact = try parseSessionMigrationArgs(std.testing.allocator, &.{
-        @constCast("--id"),
-        @constCast("--allow-large"),
-        @constCast("--json"),
-    });
-    defer exact.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("--allow-large", exact.session_id);
-    try std.testing.expect(!exact.allow_large);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, exact.format);
-}
-
-test "parse session migration args rejects missing repeated and mixed targets" {
-    try std.testing.expectError(
-        error.InvalidSessionMigrationArgs,
-        parseSessionMigrationArgs(std.testing.allocator, &.{@constCast("--id")}),
-    );
-    try std.testing.expectError(
-        error.InvalidSessionMigrationArgs,
-        parseSessionMigrationArgs(std.testing.allocator, &.{
-            @constCast("session.v2"),
-            @constCast("--id"),
-            @constCast("session.v3"),
-        }),
-    );
-    try std.testing.expectError(
-        error.InvalidSessionMigrationArgs,
-        parseSessionMigrationArgs(std.testing.allocator, &.{
-            @constCast("session.v2"),
-            @constCast("session.v3"),
-        }),
-    );
-}
-
 test "parse session recovery args accepts exact ids and rejects ambiguity" {
     var positional = try parseSessionRecoveryArgs(
         std.testing.allocator,
@@ -5277,9 +4937,8 @@ test "top-level MCP trust persists project approval without interactive startup"
     defer environ.deinit();
     try environ.put("HOME", home);
     try environ.put("PATH", "");
-    const stable_environ = try stableCliTestEnviron();
     io_mod.setEnvironMap(&environ);
-    defer io_mod.setEnvironMap(stable_environ);
+    defer io_mod.resetEnvironForTest();
 
     var capture = CaptureOutput.init(alloc);
     defer capture.deinit();
@@ -6118,9 +5777,8 @@ test "status and doctor inspect MCP configuration once per command" {
     defer environ.deinit();
     try environ.put("HOME", home);
     try environ.put("PATH", "");
-    const stable_environ = try stableCliTestEnviron();
     io_mod.setEnvironMap(&environ);
-    defer io_mod.setEnvironMap(stable_environ);
+    defer io_mod.resetEnvironForTest();
 
     mcp_local_inspection_calls_for_test = 0;
     var cfg = testConfig();
@@ -6418,18 +6076,6 @@ fn failingMcpLocalInspectionForTest(
     result.profile_diagnostic = .{ .failed = error.McpConfigInvalidJson };
     result.inspection_error = "McpConfigInvalidJson";
     return result;
-}
-
-var stable_cli_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableCliTestEnviron() !*const std.process.Environ.Map {
-    if (stable_cli_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_cli_test_environ = map;
-    return map;
 }
 
 fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) anyerror!void {

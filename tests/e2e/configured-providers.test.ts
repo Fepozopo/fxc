@@ -9,6 +9,15 @@ async function withReasoning(response: Response, ...deltas: Record<string, unkno
   return new Response(prefix + await response.text(), { headers: response.headers });
 }
 
+// Tool calls whose arguments are sent verbatim, so they can be malformed.
+function rawToolCalls(model: string, calls: Array<{ id: string; name: string; arguments: string }>) {
+  const chunks = [
+    { id: "chat-tool", model, choices: [{ index: 0, delta: { tool_calls: calls.map((call, index) => ({ index, id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } })) }, finish_reason: null }] },
+    { id: "chat-tool", model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+}
+
 describe("configured providers", () => {
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
@@ -209,6 +218,37 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("unknown tools and malformed arguments are answered and the turn continues", async () => {
+    const f = fixture(body => body.messages.some((message: any) => message.role === "tool")
+      ? completion(body.model, "recovered")
+      : rawToolCalls(body.model, [
+        { id: "call-read", name: "read_file", arguments: JSON.stringify({ path: "note.txt" }) },
+        { id: "call-missing", name: "missing_tool", arguments: "{}" },
+        { id: "call-malformed", name: "read_file", arguments: "{\"path\":\"note.txt\"" },
+      ]));
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const output = JSON.parse(result.stdout);
+      expect(output.output).toBe("recovered");
+      expect(output.tool_calls.map((call: any) => [call.name, call.status]).sort()).toEqual([
+        ["missing_tool", "error"],
+        ["read_file", "error"],
+        ["read_file", "success"],
+      ]);
+      expect(f.requests).toHaveLength(2);
+      const messages = f.requests[1].body.messages;
+      const replayed = messages.find((message: any) => message.role === "assistant" && message.tool_calls?.length).tool_calls;
+      expect(replayed.map((call: any) => call.function.arguments)).toEqual([JSON.stringify({ path: "note.txt" }), "{}", "{}"]);
+      const results = Object.fromEntries(messages.filter((message: any) => message.role === "tool").map((message: any) => [message.tool_call_id, message.content]));
+      expect(results["call-read"]).toContain("fixture contents");
+      expect(results["call-missing"]).toBe("Unsupported tool: missing_tool");
+      expect(results["call-malformed"]).toContain("did not run the call");
+      expect(results["call-malformed"]).not.toContain("fixture contents");
+    } finally { f.close(); }
+  }, 25000);
+
   test("saved sessions resume the named connection and reject endpoint rebinding", async () => {
     const f = fixture();
     try {
@@ -336,13 +376,14 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 35000);
 
-  test.each(["clear", "caution", "missing", "refused", "truncated", "incomplete"])("custom review response recovery preserves %s outcome", async outcome => {
+  test.each(["clear", "caution", "missing", "malformed", "refused", "truncated", "incomplete"])("custom review response recovery preserves %s outcome", async outcome => {
     let marker = "";
     let reviews = 0;
     const f = fixture(body => {
       if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) {
         reviews++;
         if (reviews === 1 || (outcome === "missing" && reviews === 2)) {
+          if (outcome === "malformed") return rawToolCalls(body.model, [{ id: "review-1", name: "permission_decision", arguments: "{\"decision\":\"clear\"" }]);
           if (outcome === "refused" || outcome === "truncated" || outcome === "incomplete") {
             const chunks = [
               { id: "review", model: body.model, choices: [{ index: 0, delta: outcome === "refused" ? { refusal: "Cannot review this." } : { content: "Incomplete review." }, finish_reason: null }] },
@@ -364,8 +405,8 @@ describe("configured providers", () => {
       f.save();
       const result = await runFx(["ask", "--json", "--no-save", "Run the local fixture once."], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(readFileSync(marker, "utf8")).toBe(outcome === "clear" ? "one\n" : "");
-      expect(reviews).toBe(["clear", "caution", "missing"].includes(outcome) ? 2 : 1);
+      expect(readFileSync(marker, "utf8")).toBe(["clear", "malformed"].includes(outcome) ? "one\n" : "");
+      expect(reviews).toBe(["clear", "caution", "missing", "malformed"].includes(outcome) ? 2 : 1);
       const requests = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
       if (reviews === 2) expect(requests[1].body).toEqual(requests[0].body);
       expect(f.requests.every(request => request.path === "/v1/chat/completions")).toBe(true);

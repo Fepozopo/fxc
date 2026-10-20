@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -28,6 +27,7 @@ import {
 } from "./tmux-helpers";
 import { findActiveFileApprovalBlock } from "./tui-render-assertions";
 import { stdoutFrames } from "./render-lab/tape";
+import { onlySessionId, savedText } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const MAXIMUM_WRITE_TIMEOUT = 120_000;
@@ -188,12 +188,7 @@ function expectAtomicApprovalExit(tapePath: string, frameStart: number) {
 }
 
 function sessionIdFromHome(root: IsolatedRoot): string {
-  const sessionsRoot = join(root.home, ".fx", "sessions");
-  const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && entry.name !== "latest")
-    .map((entry) => entry.name);
-  expect(sessionIds).toHaveLength(1);
-  return sessionIds[0]!;
+  return onlySessionId(root.home);
 }
 
 type ApprovalIntent = "apply" | "reveal";
@@ -934,10 +929,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       activeSession = null;
 
       const sessionId = sessionIdFromHome(root);
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
+      const events = savedText(root.home, sessionId);
       expect(events).toContain('"permission_feedback"');
       expect(events).toContain(feedback);
 

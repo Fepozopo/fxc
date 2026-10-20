@@ -4,7 +4,6 @@ const io_mod = @import("../shared/io.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
-const session_child_store = @import("session_child_store.zig");
 const session_event = @import("session_event.zig");
 const session_json = @import("session_json.zig");
 const session_log = @import("session_log.zig");
@@ -15,7 +14,6 @@ const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
 
 const authority = @import("session_authority.zig");
-const paths = @import("session_store_paths.zig");
 const types = @import("session_store_types.zig");
 
 const classifyAuthority = authority.classifyAuthority;
@@ -26,17 +24,12 @@ const manifestSchemaVersion = authority.manifestSchemaVersion;
 const openSessionFile = authority.openSessionFile;
 const readOptionalSessionFile = authority.readOptionalSessionFile;
 const requireAuthorityFenceAbsent = authority.requireAuthorityFenceAbsent;
-const sessionDirPath = paths.sessionDirPath;
 const CandidateStorage = types.CandidateStorage;
 const DiscoveryCause = types.DiscoveryCause;
-const DoctorDiagnostic = types.DoctorDiagnostic;
-const DoctorInspectionOptions = types.DoctorInspectionOptions;
-const DoctorIssueKind = types.DoctorIssueKind;
 const ProjectionState = types.ProjectionState;
 const SessionSummary = types.SessionSummary;
 const StorageFormat = types.StorageFormat;
 const automatic_legacy_max_bytes = types.automatic_legacy_max_bytes;
-const StoreContext = types.StoreContext;
 
 pub const DiscoveryMode = enum {
     read_only_list,
@@ -49,12 +42,6 @@ const DiscoveryOutcome = enum {
     retained,
     excluded,
     skipped,
-};
-
-pub const DiscoveryCandidateMetadata = struct {
-    id: []const u8,
-    storage: CandidateStorage,
-    projection_state: ProjectionState,
 };
 
 pub const ReadOnlyCandidate = struct {
@@ -98,172 +85,6 @@ const LegacyCandidateSummary = struct {
         self.* = undefined;
     }
 };
-
-/// Frees every diagnostic in the list and the list itself. Call once on the
-/// slice returned by `Store.inspectForDoctor`.
-pub fn freeDoctorDiagnostics(
-    alloc: Allocator,
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-) void {
-    for (diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
-    diagnostics.deinit(alloc);
-}
-
-/// Appends one diagnostic for `session_id`; dupes the id so the caller keeps
-/// ownership of its slice. `bytes` carries an optional size for size-based kinds.
-pub fn appendDoctorDiagnostic(
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    alloc: Allocator,
-    session_id: []const u8,
-    kind: DoctorIssueKind,
-    bytes: ?u64,
-) !void {
-    const owned_id = try alloc.dupe(u8, session_id);
-    errdefer mem_utils.free(alloc, owned_id);
-    try diagnostics.append(alloc, .{
-        .session_id = owned_id,
-        .kind = kind,
-        .bytes = bytes,
-    });
-}
-
-/// Inspects one session directory and appends a diagnostic for the first
-/// integrity problem it finds, dispatching to the authority-state it detects.
-/// Owns only sequencing: the actual checks live in the three inspect* helpers
-/// below. Fails only on `error.OutOfMemory` from diagnostic allocation; all
-/// inspection errors are converted into diagnostics, never propagated.
-pub fn inspectDoctorSession(
-    ctx: StoreContext,
-    alloc: Allocator,
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-    _: DoctorInspectionOptions,
-) !void {
-    if (try session_log.hasConversationMetadata(alloc, session_dir)) {
-        var root = ctx.canonical_root;
-        var state = root.loadReadOnly(alloc, session_id, .{}) catch |err| {
-            try appendDoctorDiagnostic(
-                diagnostics,
-                alloc,
-                session_id,
-                if (err == error.SessionPathUnsafe)
-                    .unsafe_path
-                else
-                    .canonical_state_invalid,
-                null,
-            );
-            return;
-        };
-        state.deinit(alloc);
-        try inspectDoctorManagedChildren(
-            ctx,
-            alloc,
-            diagnostics,
-            session_dir,
-            session_id,
-        );
-        return;
-    }
-
-    if ((entryExistsRelative(session_dir, "authority.pending.json") catch false) or
-        (entryExistsRelative(session_dir, "commit.pending.json") catch false))
-    {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            .authority_transition_pending,
-            null,
-        );
-        return;
-    }
-
-    var candidate = classifyReadOnlyCandidate(
-        alloc,
-        session_dir,
-        session_id,
-    ) catch |err| {
-        try appendDoctorDiagnostic(
-            diagnostics,
-            alloc,
-            session_id,
-            if (err == error.LegacySessionTooLarge)
-                .oversized_legacy_snapshot
-            else if (err == error.SessionPathUnsafe)
-                .unsafe_path
-            else
-                .canonical_state_invalid,
-            null,
-        );
-        return;
-    };
-    const stale_schema_v3 = candidate.storage == .schema_v3 and candidate.projection_state == .stale;
-    candidate.deinit(alloc);
-    // A stale schema-v3 session resumes from its committed log, so a log that
-    // cannot be replayed leaves the session unreadable even though its
-    // manifest is valid; latest resume skips it for the same reason.
-    if (stale_schema_v3) {
-        if (migration.loadSchemaV3ReadOnly(alloc, session_dir, session_id)) |value| {
-            var replay = value;
-            replay.deinit(alloc);
-        } else |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            try appendDoctorDiagnostic(
-                diagnostics,
-                alloc,
-                session_id,
-                if (err == error.SessionPathUnsafe) .unsafe_path else .canonical_state_invalid,
-                null,
-            );
-            return;
-        }
-    }
-    try inspectDoctorManagedChildren(
-        ctx,
-        alloc,
-        diagnostics,
-        session_dir,
-        session_id,
-    );
-}
-
-fn inspectDoctorManagedChildren(
-    ctx: StoreContext,
-    alloc: Allocator,
-    diagnostics: *std.ArrayList(DoctorDiagnostic),
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !void {
-    const display_path = try sessionDirPath(alloc, ctx.sessions_dir, session_id);
-    defer alloc.free(display_path);
-    var capability = session_child_store.SessionChildCapability.init(
-        alloc,
-        session_dir.dir,
-        display_path,
-        .read_only,
-    ) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        try appendDoctorDiagnostic(diagnostics, alloc, session_id, .unsafe_path, null);
-        return;
-    };
-    defer capability.deinit();
-
-    const child_kinds = [_]session_child_store.ManagedChildKind{
-        .command_artifacts,
-        .browser_artifacts,
-        .tool_results,
-        .subagent_control,
-    };
-    for (child_kinds) |kind| {
-        var entries = capability.iterate(alloc, kind) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            try appendDoctorDiagnostic(diagnostics, alloc, session_id, .unsafe_path, null);
-            return;
-        };
-        entries.deinit();
-    }
-}
 
 /// Classifies a session directory into a read-only candidate, dispatching on
 /// its authority state to the schema-v3 or legacy classifier.
@@ -774,7 +595,7 @@ pub fn storageFormatForLegacy(
 }
 
 /// Emits one structured discovery trace line. Pure logging; never fails.
-pub fn logDiscovery(
+fn logDiscovery(
     mode: DiscoveryMode,
     session_id: []const u8,
     storage: ?CandidateStorage,

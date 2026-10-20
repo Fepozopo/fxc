@@ -28,6 +28,23 @@ pub fn writeJsonStr(s: []const u8, w: *std.Io.Writer) !void {
     try w.writeByte('"');
 }
 
+/// Writes JSON a caller built into a frame. Frames are newline-delimited, and
+/// valid JSON holds a raw CR or LF only as whitespace between tokens, so each
+/// one is written as a space. A host tool call's input, for example, is the
+/// model's own text and may be pretty-printed.
+fn writeOneLine(w: *std.Io.Writer, json: []const u8) !void {
+    if (std.mem.findScalar(u8, json, '\n') == null and std.mem.findScalar(u8, json, '\r') == null) {
+        return w.writeAll(json);
+    }
+    var rest = json;
+    while (std.mem.findAny(u8, rest, "\r\n")) |index| {
+        try w.writeAll(rest[0..index]);
+        try w.writeByte(' ');
+        rest = rest[index + 1 ..];
+    }
+    try w.writeAll(rest);
+}
+
 pub const ErrorCode = struct {
     pub const request_frame_too_large: i64 = -32000;
     pub const parse_error: i64 = -32700;
@@ -168,7 +185,7 @@ pub const Writer = struct {
                     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
                     try writeId(w, response.id);
                     try w.writeAll(",\"result\":");
-                    try w.writeAll(response.result_json);
+                    try writeOneLine(w, response.result_json);
                     try w.writeAll("}\n");
                 },
                 .error_response => |response| {
@@ -193,7 +210,7 @@ pub const Writer = struct {
                     try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
                     try writeJsonStr(notification.method, w);
                     try w.writeAll(",\"params\":");
-                    try w.writeAll(notification.params_json);
+                    try writeOneLine(w, notification.params_json);
                     try w.writeAll("}\n");
                 },
                 .request => |request| {
@@ -202,7 +219,7 @@ pub const Writer = struct {
                     try w.writeAll(",\"method\":");
                     try writeJsonStr(request.method, w);
                     try w.writeAll(",\"params\":");
-                    try w.writeAll(request.params_json);
+                    try writeOneLine(w, request.params_json);
                     try w.writeAll("}\n");
                 },
             }
@@ -677,5 +694,46 @@ test "Writer writeId handles all id types" {
         defer out.deinit();
         try Writer.writeId(&out.writer, null);
         try std.testing.expectEqualStrings("null", out.writer.buffered());
+    }
+}
+
+test "Writer keeps each frame on one line when caller JSON has line breaks" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.bytes.appendSlice(std.testing.allocator, frame);
+        }
+    };
+    // A model's tool input as some models send it: pretty-printed with LF and
+    // CRLF line breaks, holding an escaped newline that must survive.
+    const input = "{\n  \"items\": [\r\n\t{\"text\": \"a\\nb\"}\n  ]\n}";
+    var capture: Capture = .{};
+    defer capture.bytes.deinit(alloc);
+    var writer = Writer.initCallback(&capture, Capture.write);
+    try writer.writeRequest(alloc, .{ .integer = 1 }, "libfx/tool_call", "{\"name\":\"todo\",\"input\":" ++ input ++ "}");
+    try writer.writeNotification(alloc, "session/update", input);
+    try writer.writeResponse(alloc, .{ .integer = 2 }, input);
+
+    const frames = capture.bytes.items;
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, frames, "\n"));
+    try std.testing.expect(std.mem.endsWith(u8, frames, "\n"));
+    try std.testing.expect(std.mem.findScalar(u8, frames, '\r') == null);
+
+    const expected = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
+    defer expected.deinit();
+    const expected_json = try std.json.Stringify.valueAlloc(alloc, expected.value, .{});
+    defer alloc.free(expected_json);
+    var lines = std.mem.splitScalar(u8, frames[0 .. frames.len - 1], '\n');
+    for ([_][]const u8{ "params", "params", "result" }, 0..) |field, index| {
+        const frame = try std.json.parseFromSlice(std.json.Value, alloc, lines.next().?, .{});
+        defer frame.deinit();
+        var value = frame.value.object.get(field).?;
+        if (index == 0) value = value.object.get("input").?;
+        const actual_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(actual_json);
+        try std.testing.expectEqualStrings(expected_json, actual_json);
     }
 }

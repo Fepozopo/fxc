@@ -115,7 +115,6 @@ function fakeGatewayEnv(
     FX_MODEL: ULTRA_MODEL,
     FX_FAST: undefined,
     FX_ULTRAFAST: undefined,
-    FX_SESSIONS_V2: undefined,
     FX_PERMISSION_MODE: undefined,
     FX_FIRST_CALL_TOOL_CHOICE: undefined,
     ...extra,
@@ -481,63 +480,61 @@ describe("ultrafast fake Gateway", () => {
     TIMEOUT,
   );
 
-  for (const backend of ["0", "1"]) {
-    test(
-      `a saved session retains Ultrafast until an explicit CLI disable with FX_SESSIONS_V2=${backend}`,
-      async () => {
-        const root = createIsolatedRoot({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
-        const gateway = startFakeGateway(
-          [
-            finishWithServiceTier("paid preference saved", "ultrafast"),
-            finishWithServiceTier("durable paid preference resumed", "ultrafast"),
-            fakeGatewayFinalText("resumed without the paid tier"),
-          ],
-          { models: [ultrafastCatalogModel()] },
+  test(
+    "a saved session retains Ultrafast until an explicit CLI disable",
+    async () => {
+      const root = createIsolatedRoot({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
+      const gateway = startFakeGateway(
+        [
+          finishWithServiceTier("paid preference saved", "ultrafast"),
+          finishWithServiceTier("durable paid preference resumed", "ultrafast"),
+          fakeGatewayFinalText("resumed without the paid tier"),
+        ],
+        { models: [ultrafastCatalogModel()] },
+      );
+      try {
+        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
+        const saved = await runFx(
+          ["ask", "--auto", "--json", "Save the paid-tier preference."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
-        try {
-          const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: backend });
-          const saved = await runFx(
-            ["ask", "--auto", "--json", "Save the paid-tier preference."],
-            { cwd: root.workspace, env, timeoutMs: TIMEOUT },
-          );
-          expect(saved.code, saved.stderr).toBe(0);
-          expect(saved.stderr).toBe("");
-          expect(gateway.requests).toHaveLength(1);
-          const sessionId = JSON.parse(saved.stdout).session_id as string;
-          expect(sessionId).toBeTruthy();
-          expectUltrafastRequest(gateway.requests[0]!.body);
+        expect(saved.code, saved.stderr).toBe(0);
+        expect(saved.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(1);
+        const sessionId = JSON.parse(saved.stdout).session_id as string;
+        expect(sessionId).toBeTruthy();
+        expectUltrafastRequest(gateway.requests[0]!.body);
 
-          writeProfileSettings(root, {
-            ultrafast_mode: false,
-            models: { gateway: ULTRA_MODEL },
-          });
-          const durableResume = await runFx(
-            ["ask", "--auto", "--json", "--resume", sessionId, "Resume the saved paid preference."],
-            { cwd: root.workspace, env, timeoutMs: TIMEOUT },
-          );
-          expect(durableResume.code, durableResume.stderr).toBe(0);
-          expect(durableResume.stderr).toBe("");
-          expect(gateway.requests).toHaveLength(2);
-          expectUltrafastRequest(gateway.requests[1]!.body);
+        writeProfileSettings(root, {
+          ultrafast_mode: false,
+          models: { gateway: ULTRA_MODEL },
+        });
+        const durableResume = await runFx(
+          ["ask", "--auto", "--json", "--resume", sessionId, "Resume the saved paid preference."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(durableResume.code, durableResume.stderr).toBe(0);
+        expect(durableResume.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(2);
+        expectUltrafastRequest(gateway.requests[1]!.body);
 
-          const disabledResume = await runFx(
-            ["ask", "--auto", "--json", "--resume", sessionId, "--no-ultrafast", "Resume without the paid tier."],
-            { cwd: root.workspace, env, timeoutMs: TIMEOUT },
-          );
-          expect(disabledResume.code, disabledResume.stderr).toBe(0);
-          expect(disabledResume.stderr).toBe("");
-          expect(gateway.requests).toHaveLength(3);
-          expectStandardRequest(gateway.requests[2]!.body);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
-        } finally {
-          gateway.stop();
-          rmSync(root.root, { recursive: true, force: true });
-        }
-      },
-      TIMEOUT,
-    );
-  }
+        const disabledResume = await runFx(
+          ["ask", "--auto", "--json", "--resume", sessionId, "--no-ultrafast", "Resume without the paid tier."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(disabledResume.code, disabledResume.stderr).toBe(0);
+        expect(disabledResume.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(3);
+        expectStandardRequest(gateway.requests[2]!.body);
+        expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
+          .toMatchObject({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 
   test(
     "process-only Ultrafast overrides do not revive paid routing on a later resume",
@@ -810,79 +807,77 @@ describe("ultrafast fake Gateway", () => {
     TIMEOUT,
   );
 
-  for (const backend of ["0", "1"]) {
-    test(
-      `ACP saves Ultrafast enable and disable across load and resume with FX_SESSIONS_V2=${backend}`,
-      async () => {
-        const root = createIsolatedRoot({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
-        const gateway = startFakeGateway(
-          [
-            finishWithServiceTier("ACP saved Ultra", "ultrafast"),
-            finishWithServiceTier("ACP loaded Ultra", "ultrafast"),
-            fakeGatewayFinalText("ACP resumed standard"),
-          ],
-          { models: [ultrafastCatalogModel()] },
+  test(
+    "ACP saves Ultrafast enable and disable across load and resume",
+    async () => {
+      const root = createIsolatedRoot({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
+      const gateway = startFakeGateway(
+        [
+          finishWithServiceTier("ACP saved Ultra", "ultrafast"),
+          finishWithServiceTier("ACP loaded Ultra", "ultrafast"),
+          fakeGatewayFinalText("ACP resumed standard"),
+        ],
+        { models: [ultrafastCatalogModel()] },
+      );
+      const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
+      let client = AcpClient.create(root.workspace, env);
+      try {
+        const sessionId = await startAcpSession(client);
+        const enabled = await client.request(
+          "session/set_config_option", { sessionId, configId: "ultrafast", value: "true" }, 3,
         );
-        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: backend });
-        let client = AcpClient.create(root.workspace, env);
+        expect(enabled.error).toBeUndefined();
+        const saved = await client.prompt(sessionId, "Persist Ultra in this session.", 4);
+        expect(JSON.stringify(saved)).toContain("ACP saved Ultra");
+        expect(gateway.requests).toHaveLength(1);
+        expectUltrafastRequest(gateway.requests[0]!.body);
+        await client.close();
+
+        client = AcpClient.create(root.workspace, env);
+        expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
+        const loaded = await client.request("session/load", { sessionId, mcpServers: [] }, 2);
+        expect(loaded.error, JSON.stringify(loaded)).toBeUndefined();
+        expect(loaded.result?.configOptions).toContainEqual(expect.objectContaining({
+          id: "ultrafast", currentValue: "true",
+        }));
+        expect(gateway.requests).toHaveLength(1);
+        const continued = await client.prompt(sessionId, "Continue the saved Ultra session.", 3);
+        expect(JSON.stringify(continued)).toContain("ACP loaded Ultra");
+        expect(gateway.requests).toHaveLength(2);
+        expectUltrafastRequest(gateway.requests[1]!.body);
+        expect(gateway.requests[1]!.body).toContain("ACP saved Ultra");
+        const disabled = await client.request(
+          "session/set_config_option", { sessionId, configId: "ultrafast", value: "false" }, 4,
+        );
+        expect(disabled.error).toBeUndefined();
+        await client.close();
+
+        writeProfileSettings(root, { ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
+        client = AcpClient.create(root.workspace, env);
+        expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
+        const resumed = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
+        expect(resumed.error, JSON.stringify(resumed)).toBeUndefined();
+        expect(resumed.result?.configOptions).toContainEqual(expect.objectContaining({
+          id: "ultrafast", currentValue: "false",
+        }));
+        expect(gateway.requests).toHaveLength(2);
+        const standard = await client.prompt(sessionId, "Resume the durable disable.", 3);
+        expect(JSON.stringify(standard)).toContain("ACP resumed standard");
+        expect(gateway.requests).toHaveLength(3);
+        expectStandardRequest(gateway.requests[2]!.body);
+        expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
+          .toMatchObject({ ultrafast_mode: true });
+      } finally {
         try {
-          const sessionId = await startAcpSession(client);
-          const enabled = await client.request(
-            "session/set_config_option", { sessionId, configId: "ultrafast", value: "true" }, 3,
-          );
-          expect(enabled.error).toBeUndefined();
-          const saved = await client.prompt(sessionId, "Persist Ultra in this session.", 4);
-          expect(JSON.stringify(saved)).toContain("ACP saved Ultra");
-          expect(gateway.requests).toHaveLength(1);
-          expectUltrafastRequest(gateway.requests[0]!.body);
           await client.close();
-
-          client = AcpClient.create(root.workspace, env);
-          expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
-          const loaded = await client.request("session/load", { sessionId, mcpServers: [] }, 2);
-          expect(loaded.error, JSON.stringify(loaded)).toBeUndefined();
-          expect(loaded.result?.configOptions).toContainEqual(expect.objectContaining({
-            id: "ultrafast", currentValue: "true",
-          }));
-          expect(gateway.requests).toHaveLength(1);
-          const continued = await client.prompt(sessionId, "Continue the saved Ultra session.", 3);
-          expect(JSON.stringify(continued)).toContain("ACP loaded Ultra");
-          expect(gateway.requests).toHaveLength(2);
-          expectUltrafastRequest(gateway.requests[1]!.body);
-          expect(gateway.requests[1]!.body).toContain("ACP saved Ultra");
-          const disabled = await client.request(
-            "session/set_config_option", { sessionId, configId: "ultrafast", value: "false" }, 4,
-          );
-          expect(disabled.error).toBeUndefined();
-          await client.close();
-
-          writeProfileSettings(root, { ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
-          client = AcpClient.create(root.workspace, env);
-          expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
-          const resumed = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
-          expect(resumed.error, JSON.stringify(resumed)).toBeUndefined();
-          expect(resumed.result?.configOptions).toContainEqual(expect.objectContaining({
-            id: "ultrafast", currentValue: "false",
-          }));
-          expect(gateway.requests).toHaveLength(2);
-          const standard = await client.prompt(sessionId, "Resume the durable disable.", 3);
-          expect(JSON.stringify(standard)).toContain("ACP resumed standard");
-          expect(gateway.requests).toHaveLength(3);
-          expectStandardRequest(gateway.requests[2]!.body);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: true });
         } finally {
-          try {
-            await client.close();
-          } finally {
-            gateway.stop();
-            rmSync(root.root, { recursive: true, force: true });
-          }
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
         }
-      },
-      TIMEOUT,
-    );
-  }
+      }
+    },
+    TIMEOUT,
+  );
 
   test(
     "an allowed subagent child inherits ultrafast routing",
@@ -949,7 +944,7 @@ describe("ultrafast fake Gateway", () => {
         return finishWithServiceTier(`ULTRA_PARENT_${round}`, round < 3 ? "ultrafast" : "standard");
       }, { models: [ultrafastCatalogModel()] });
       try {
-        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: "1" });
+        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
         let sessionId: string | undefined;
         for (const round of [1, 2, 3]) {
           const result = await runFx(
@@ -1061,7 +1056,7 @@ describe("ultrafast fake Gateway", () => {
           { models: [ultrafastCatalogModel()] },
         );
         const stderrPath = join(root.root, "stderr.txt");
-        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: "1" });
+        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
         let session: TmuxSession | null = null;
         try {
           session = await TmuxSession.create({ cwd: root.workspace, isolated: true, stderrPath, env });
@@ -1450,51 +1445,49 @@ describe("ACP speed options", () => {
     TIMEOUT,
   );
 
-  for (const backend of ["0", "1"]) {
-    test(
-      `saves Fast across resume with FX_SESSIONS_V2=${backend}`,
-      async () => {
-        const root = createIsolatedRoot({ models: { gateway: FAST_ONLY_MODEL } });
-        const gateway = startFakeGateway(
-          [fakeGatewayFinalText("saved fast"), fakeGatewayFinalText("resumed fast"), fakeGatewayFinalText("resumed standard")],
-          { models: speedCatalog() },
-        );
-        const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, FX_SESSIONS_V2: backend });
-        let client = AcpClient.create(root.workspace, env);
+  test(
+    "saves Fast across resume",
+    async () => {
+      const root = createIsolatedRoot({ models: { gateway: FAST_ONLY_MODEL } });
+      const gateway = startFakeGateway(
+        [fakeGatewayFinalText("saved fast"), fakeGatewayFinalText("resumed fast"), fakeGatewayFinalText("resumed standard")],
+        { models: speedCatalog() },
+      );
+      const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
+      let client = AcpClient.create(root.workspace, env);
+      try {
+        const sessionId = await startAcpSession(client);
+        const enabled = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "true" }, 3);
+        expect(speedOptions(enabled.result)).toEqual({ fast: "true", ultrafast: "absent" });
+        await client.prompt(sessionId, "Save Fast.", 4);
+        expectFastRequest(gateway.requests[0]!.body);
+        await client.close();
+
+        client = AcpClient.create(root.workspace, env);
+        expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
+        const resumed = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
+        expect(speedOptions(resumed.result)).toEqual({ fast: "true", ultrafast: "absent" });
+        await client.prompt(sessionId, "Resume Fast.", 3);
+        expectFastRequest(gateway.requests[1]!.body);
+        const disabled = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "false" }, 4);
+        expect(disabled.error).toBeUndefined();
+        await client.close();
+
+        client = AcpClient.create(root.workspace, env);
+        expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
+        const standard = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
+        expect(speedOptions(standard.result)).toEqual({ fast: "false", ultrafast: "absent" });
+        await client.prompt(sessionId, "Resume standard.", 3);
+        expectNoLaneRequest(gateway.requests[2]!.body);
+      } finally {
         try {
-          const sessionId = await startAcpSession(client);
-          const enabled = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "true" }, 3);
-          expect(speedOptions(enabled.result)).toEqual({ fast: "true", ultrafast: "absent" });
-          await client.prompt(sessionId, "Save Fast.", 4);
-          expectFastRequest(gateway.requests[0]!.body);
           await client.close();
-
-          client = AcpClient.create(root.workspace, env);
-          expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
-          const resumed = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
-          expect(speedOptions(resumed.result)).toEqual({ fast: "true", ultrafast: "absent" });
-          await client.prompt(sessionId, "Resume Fast.", 3);
-          expectFastRequest(gateway.requests[1]!.body);
-          const disabled = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "false" }, 4);
-          expect(disabled.error).toBeUndefined();
-          await client.close();
-
-          client = AcpClient.create(root.workspace, env);
-          expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
-          const standard = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
-          expect(speedOptions(standard.result)).toEqual({ fast: "false", ultrafast: "absent" });
-          await client.prompt(sessionId, "Resume standard.", 3);
-          expectNoLaneRequest(gateway.requests[2]!.body);
         } finally {
-          try {
-            await client.close();
-          } finally {
-            gateway.stop();
-            rmSync(root.root, { recursive: true, force: true });
-          }
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
         }
-      },
-      TIMEOUT,
-    );
-  }
+      }
+    },
+    TIMEOUT,
+  );
 });

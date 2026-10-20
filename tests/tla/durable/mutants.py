@@ -108,10 +108,14 @@ MUTANTS = [
     # Resumption.tla
     ("Resumption", "fx -c asks the user after an unclean exit",
      [("THEN /\\ autoResumes' = autoResumes + 1\n"
-       "            /\\ notices' = notices + 1\n"
+       "            /\\ IF reply = \"saved\"\n"
+       "               THEN /\\ delivered' = delivered + 1\n"
+       "                    /\\ UNCHANGED notices\n"
+       "               ELSE /\\ notices' = notices + 1\n"
+       "                    /\\ UNCHANGED delivered\n"
        "            /\\ UNCHANGED asked",
        "THEN /\\ asked' = TRUE\n"
-       "            /\\ UNCHANGED <<autoResumes, notices>>")],
+       "            /\\ UNCHANGED <<autoResumes, notices, delivered>>")],
      "NeverAsks"),
     ("Resumption", "a crash-loop guard: stop resuming after the first resume",
      [("IF turn = \"open\"\n       THEN", "IF turn = \"open\" /\\ autoResumes < 1\n       THEN")],
@@ -122,6 +126,26 @@ MUTANTS = [
     ("Resumption", "resume without telling the model",
      [("/\\ notices' = notices + 1", "/\\ notices' = notices")],
      "ModelToldEveryTime"),
+    ("Resumption", "resume restarts a reply it saved and asks the model again",
+     [("            /\\ IF reply = \"saved\"\n", "            /\\ IF FALSE\n"),
+      ("    /\\ UNCHANGED <<turn, turns, crashesInTurn, crashes, reply, ending,\n",
+       "    /\\ reply' = \"none\"\n    /\\ UNCHANGED <<turn, turns, crashesInTurn, crashes, ending,\n")],
+     "SavedAnswerNotRequested"),
+    ("Resumption", "turn.result resolves while the turn's end is still being stored",
+     [("    /\\ turn = \"committed\"\n    /\\ resolved' = TRUE",
+       "    /\\ (turn = \"committed\" \\/ ending)\n    /\\ resolved' = TRUE")],
+     "ResultOnlyAfterDurableEnd"),
+    ("Resumption", "fault injection: a crash loses the saved reply",
+     [("    /\\ ending' = FALSE\n    /\\ UNCHANGED <<turn, turns, autoResumes, asked, notices, delivered,\n"
+       "                   badResume, reply, resolved,",
+       "    /\\ ending' = FALSE\n    /\\ reply' = \"none\"\n"
+       "    /\\ UNCHANGED <<turn, turns, autoResumes, asked, notices, delivered,\n"
+       "                   badResume, resolved,")],
+     "SavedAnswerNotRequested"),
+    # Witness: no code change; NoDelivery is added to the .cfg and must be
+    # violated, proving that a resume really delivers a saved reply.
+    ("Resumption", "witness: a resume delivers a saved reply",
+     [], "NoDelivery", ["NoDelivery"]),
 
     # ParallelBatch.tla
     ("ParallelBatch", "a writer starts while earlier calls still run",

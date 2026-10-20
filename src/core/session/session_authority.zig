@@ -65,20 +65,6 @@ pub fn classifyAuthority(
     return .legacy;
 }
 
-/// Like `classifyAuthority` but treats a marker-less directory as legacy without
-/// the creation-orphan check, so an oversized legacy snapshot can still be
-/// migrated under an explicit `allow_large` request.
-pub fn classifyAuthorityAllowingLargeLegacy(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !AuthorityClassification {
-    if (try classifyMarker(alloc, session_dir, session_id)) |classification| {
-        return classification;
-    }
-    return .legacy;
-}
-
 fn isPreparedCreationOrphan(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
@@ -334,15 +320,6 @@ pub fn parseIdentifier(raw: []const u8) error{InvalidSessionFormat}!session_even
     const canonical = std.fmt.bytesToHex(result, .lower);
     if (!std.mem.eql(u8, &canonical, raw)) return error.InvalidSessionFormat;
     return result;
-}
-
-/// Deletes one obsolete legacy-session file and syncs the directory.
-pub fn deleteSessionEntry(
-    session_dir: *io_mod.VerifiedDir,
-    name: []const u8,
-) !void {
-    try session_dir.dir.deleteFile(io_mod.getIo(), name);
-    try io_mod.syncVerifiedDir(session_dir.dir);
 }
 
 /// Reads exactly `size` bytes (+1 guard) of a legacy file into an owned slice.

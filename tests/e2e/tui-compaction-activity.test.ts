@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { onlySessionId, savedText, sessionDir } from "./saved-sessions";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
@@ -30,9 +31,16 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/// A session log's conversation: what a close or a reopen leaves as it was,
+/// since the store adds only its own `closed` and `snapshot` lines then.
+function conversationLines(text: string): string[] {
+  return text.split("\n").filter(Boolean).filter((line) => !["closed", "snapshot"].includes(JSON.parse(line).kind));
+}
+
+/// The compactions a session log holds.
 function checkpoints(bytes: Buffer): number {
   return bytes.toString().trim().split("\n").filter(Boolean)
-    .map((line) => JSON.parse(line)).filter((frame) => frame.event?.context_checkpoint).length;
+    .map((line) => JSON.parse(line)).filter((line) => line.kind === "compacted").length;
 }
 
 async function until(predicate: () => boolean, label: string, timeout = 20_000) {
@@ -206,10 +214,11 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       expect(ordinary).toBe(turn);
       expect(summaries).toBe(0);
     }
-    eventsPath = join(home, ".fx/sessions", sessionId, "events.jsonl");
+    eventsPath = join(sessionDir(home, sessionId), "log.jsonl");
     initial = readFileSync(eventsPath);
-    expect(initial.toString()).toContain(HEAD);
-    expect(initial.toString()).toContain(TAIL);
+    // A large read's body is one of the session's blobs (D44).
+    expect(savedText(home, sessionId)).toContain(HEAD);
+    expect(savedText(home, sessionId)).toContain(TAIL);
     expect(checkpoints(initial)).toBe(0);
     expect(summaries).toBe(0);
     expect(ordinary).toBe(seedTurns);
@@ -465,10 +474,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForPane((pane) => hasEmptyComposer(pane) &&
           !/Compaction cancelled|Compacting|Thinking/.test(pane), 5000);
         const interruptions = () => f.savedEvents().trim().split("\n")
-          .map((line) => JSON.parse(line)).filter((frame) => frame.event?.interrupted);
+          .map((line) => JSON.parse(line)).filter((line) => line.kind === "item" && line.type === "interruption");
         await until(() => interruptions().length === 1, "durable cancellation", 5000);
-        expect(interruptions()[0].event.interrupted.reason).toBe("cancelled");
-        expect(interruptions()[0].event.interrupted.cancellation_origin === "compaction").toBe(trigger === "auto");
+        expect(interruptions()[0].data.reason).toBe("cancelled");
+        // An ordinary cancellation leaves its origin out, which reads as "turn".
+        expect((interruptions()[0].data.cancellation_origin ?? "turn") === "compaction").toBe(trigger === "auto");
         const cancelledCounts = { summaries: trigger === "auto" ? 1 : 0,
           ordinary: f.seedTurns + (trigger === "ordinary" ? 1 : 0), overflowSent: false };
         expect(f.counts()).toEqual(cancelledCounts);
@@ -476,7 +486,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         const cancelledEvents = f.savedEvents();
         await f.close();
         expect(f.counts()).toEqual(cancelledCounts);
-        expect(f.savedEvents()).toBe(cancelledEvents);
+        expect(f.savedEvents().startsWith(cancelledEvents)).toBe(true);
+        expect(conversationLines(f.savedEvents())).toEqual(conversationLines(cancelledEvents));
 
         const reopened = await f.launch();
         await reopened.sendKeys("C-o");
@@ -491,7 +502,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(await reopened.captureFullScrollbackEscapes()).not.toMatch(COMPACTION_OUTPUT);
         await f.close();
         expect(f.counts()).toEqual(cancelledCounts);
-        expect(f.savedEvents()).toBe(cancelledEvents);
+        expect(f.savedEvents().startsWith(cancelledEvents)).toBe(true);
+        expect(conversationLines(f.savedEvents())).toEqual(conversationLines(cancelledEvents));
         expect(f.durable()).toBe(0);
         for (const tape of f.tapes) {
           const replay = await f.cli(["replay", tape, "--json"]);
@@ -676,13 +688,10 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       // The task stays the live request, so the summarizer sees it only as context.
       expect(source).toContain(`[Turn in progress]\n[User, this message stays in the conversation after the summary]\n${task}`);
 
-      const sessionId = readdirSync(join(home, ".fx/sessions"))
-        .find((id) => existsSync(join(home, ".fx/sessions", id, "events.jsonl")));
-      expect(sessionId).toBeDefined();
-      const sessionDir = join(home, ".fx/sessions", sessionId!);
-      await until(() => readFileSync(join(sessionDir, "events.jsonl"), "utf8").includes("\"turn_completed\""), "saved turn", 10_000);
-      const handoff = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n")
-        .map((line) => JSON.parse(line)).find((frame) => frame.event?.context_checkpoint)?.event.context_checkpoint.summary ?? "";
+      const log = join(sessionDir(home, onlySessionId(home)), "log.jsonl");
+      await until(() => readFileSync(log, "utf8").includes("\"turn_committed\""), "saved turn", 10_000);
+      const handoff = readFileSync(log, "utf8").trim().split("\n")
+        .map((line) => JSON.parse(line)).find((line) => line.kind === "compacted")?.data.summary ?? "";
       expect(handoff.startsWith("fx-compactor-v1\n")).toBe(true);
       const state = JSON.parse(handoff.slice("fx-compactor-v1\n".length));
       // Only the turn in progress was compacted; its steering is kept exactly.
@@ -708,206 +717,4 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       if (passed) rmSync(root, { recursive: true, force: true });
     }
   }, 90_000);
-
-  for (const injectedStaleCheckpoint of [false, true]) {
-    test(`overflow recovery ${injectedStaleCheckpoint ? "blocks a stale checkpoint" : "saves a retained image turn"} after a killed post-compaction tool`, async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-compaction-recovery-"));
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const image = join(workspace, "before.png");
-      const queuedImage = join(workspace, "queued.png");
-      const trace = join(root, "active.trace");
-      const activeStderr = join(root, "active.stderr");
-      const resumedStderr = join(root, "resumed.stderr");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspace);
-      copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), image);
-      copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), queuedImage);
-      // After an overflow the whole request, fx's own instructions included,
-      // must fit a fifth of the rejected one, so the newest reads are small
-      // enough to stay: the six newest steps are kept, the one before is not.
-      for (let step = 2; step <= 24; step++) {
-        writeFileSync(join(workspace, `probe-${step}.txt`),
-          Array.from({ length: step >= 20 ? 2 : 80 }, (_, line) =>
-            `READ_PROBE_BEFORE_OVERFLOW_67e step=${step} line=${line} long evidence for retained context boundary\n`).join(""));
-      }
-      writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
-        model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
-      }));
-
-      const summaryHold = heldFakeGatewayFinalText();
-      let phase: "seed" | "active" | "resume" | "followup" = "seed";
-      let ordinary = 0;
-      let summaries = 0;
-      let summaryReleased = false;
-      let postCompactionTool = false;
-      const gateway = startDynamicFakeGateway((raw) => {
-        const request = JSON.parse(raw);
-        const summary = request.toolChoice?.type === "none" && request.tools?.length === 0;
-        if (summary) {
-          summaries++;
-          return summaryHold.response;
-        }
-        ordinary++;
-        if (phase === "seed") return fakeGatewayFinalText("RECOVERY_COMPACTION_SEED_67e");
-        if (phase === "active" && summaryReleased) {
-          postCompactionTool = true;
-          return fakeShellRun("post-compact-tool-67e",
-            "printf POST_COMPACT_TOOL_RUNNING_67e; sleep 15; printf POST_COMPACT_TOOL_FINISHED_67e");
-        }
-        if (phase === "active" && ordinary === 10) {
-          return fakeShellRun("early-steer-tool-67e", "printf EARLY_STEER_TOOL_RUNNING_67e; sleep 2");
-        }
-        if (phase === "active" && ordinary === 19) {
-          return fakeShellRun("late-steer-tool-67e", "printf LATE_STEER_TOOL_RUNNING_67e; sleep 2");
-        }
-        if (phase === "active" && ordinary <= 24) {
-          return fakeGatewayToolCall(`probe-read-${ordinary}-67e`, "read_file", { path: `probe-${ordinary}.txt` });
-        }
-        if (phase === "active" && ordinary === 25) {
-          return Response.json({ error: {
-            type: "invalid_request_error", code: "context_length_exceeded",
-            message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
-          } }, { status: 400 });
-        }
-        if (phase === "resume") return fakeGatewayFinalText("RECOVERY_SAVED_TURN_67e");
-        return fakeGatewayFinalText("RECOVERY_FOLLOWUP_67e");
-      }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"], context_window: 400000, max_tokens: 8192 }] });
-      const env: Record<string, string> = {
-        PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
-        TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
-        FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
-        FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
-        FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "input,worker,session,agent,compaction,images,gateway",
-        FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-      };
-      const command = (sessionId: string) => `/usr/bin/env -i ${Object.entries(env)
-        .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --resume ${shellQuote(sessionId)}`;
-      const savedFrames = (eventsPath: string) => readFileSync(eventsPath, "utf8").trim().split("\n")
-        .filter(Boolean).map((line) => JSON.parse(line));
-      let active: InstanceType<typeof TmuxSession> | undefined;
-      let resumed: InstanceType<typeof TmuxSession> | undefined;
-      let passed = false;
-      try {
-        const seed = Bun.spawn([binary, "ask", "--json", "--auto", "Seed the compaction recovery scenario."], {
-          cwd: workspace, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
-        });
-        const [seedCode, seedStdout, seedStderr] = await Promise.all([
-          seed.exited, new Response(seed.stdout).text(), new Response(seed.stderr).text(),
-        ]);
-        expect(seedCode).toBe(0);
-        expect(seedStderr).toBe("");
-        const sessionId = JSON.parse(seedStdout).session_id as string;
-        const sessionDir = join(home, ".fx/sessions", sessionId);
-        const eventsPath = join(sessionDir, "events.jsonl");
-        const recoveryPath = join(sessionDir, "recovery.json");
-        const completedBefore = savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length;
-
-        phase = "active";
-        active = await TmuxSession.create({
-          cmd: command(sessionId), cwd: workspace, env, isolated: true, remainOnExit: true,
-          stderrPath: activeStderr, width: 110, height: 36, startupWaitMs: 0,
-        });
-        await active.waitForStableComposer(15_000);
-        const steer = (async () => {
-          await active!.waitForText("EARLY_STEER_TOOL_RUNNING_67e", 15_000);
-          await active!.sendText("STEER_EARLY_67e");
-          await active!.waitForText("LATE_STEER_TOOL_RUNNING_67e", 15_000);
-          await active!.sendText("STEER_LATE_67e");
-        })();
-        await active.sendText(`ACTIVE_IMAGE_TURN_67e ${image}`);
-        await until(() => summaries === 1, "context-overflow compaction", 20_000);
-        await steer;
-        summaryReleased = true;
-        summaryHold.release("COMPACTION_HANDOFF_67e preserve the retained image context");
-        await until(() => postCompactionTool && savedFrames(eventsPath)
-          .some((frame) => frame.event?.context_checkpoint), "post-compaction tool", 20_000);
-        const retained = JSON.parse(readFileSync(recoveryPath, "utf8")).checkpoint.execution;
-        expect(retained.tool_steps).toHaveLength(6);
-        expect(retained.steering).toHaveLength(1);
-        await active.waitForText("POST_COMPACT_TOOL_RUNNING_67e", 10_000);
-        await active.sendText(`QUEUED_DURING_TOOL_67e ${queuedImage}`);
-        await until(() => existsSync(trace) && readFileSync(trace, "utf8").split("event=prompt_enqueue").length >= 3,
-          "queued image admission", 5_000);
-        if (injectedStaleCheckpoint) {
-          const stale = JSON.parse(readFileSync(recoveryPath, "utf8"));
-          expect(stale.checkpoint.execution.tool_steps.length).toBeGreaterThanOrEqual(1);
-          stale.checkpoint.execution.tool_steps = stale.checkpoint.execution.tool_steps.slice(1);
-          for (const steering of stale.checkpoint.execution.steering) {
-            expect(steering.after_tool_step_count).toBeGreaterThanOrEqual(1);
-            steering.after_tool_step_count -= 1;
-          }
-          writeFileSync(recoveryPath, JSON.stringify(stale));
-          expect(stale.checkpoint.execution.tool_steps).toHaveLength(5);
-        }
-
-        const fixturePid = active.processPid();
-        const fixtureCommand = execFileSync("ps", ["-p", String(fixturePid), "-o", "command="], { encoding: "utf8" });
-        expect(fixtureCommand).toContain(binary);
-        expect(fixtureCommand).toContain(sessionId);
-        process.kill(fixturePid, "SIGKILL");
-        await until(() => active!.paneStatus().dead, "fixture fx SIGKILL", 5_000);
-        const completedAtKill = savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length;
-        expect(completedAtKill).toBe(completedBefore);
-        await active.kill();
-        active = undefined;
-
-        phase = "resume";
-        const requestsBeforeRecovery = gateway.requestCount();
-        resumed = await TmuxSession.create({
-          cmd: command(sessionId), cwd: workspace, env, isolated: true, remainOnExit: true,
-          stderrPath: resumedStderr, width: 110, height: 36, startupWaitMs: 0,
-        });
-        await resumed.waitForPane((pane) =>
-          pane.includes("fx quit unexpectedly while this response was recovering"), 15_000);
-        expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
-        await resumed.waitForStableComposer(10_000);
-        await resumed.sendText("continue");
-        const recoveryScreen = await resumed.waitForPane((pane) =>
-          pane.includes("RECOVERY_SAVED_TURN_67e") || pane.includes("InvalidContextHistoryStart"), 15_000);
-        await resumed.waitForStableComposer(10_000);
-        if (injectedStaleCheckpoint) {
-          expect(recoveryScreen).toContain("InvalidContextHistoryStart");
-          expect(recoveryScreen).not.toContain("DuplicateImageId");
-          expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
-          expect(savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length).toBe(completedAtKill);
-        } else {
-          expect(recoveryScreen).toContain("RECOVERY_SAVED_TURN_67e");
-          expect(recoveryScreen).not.toContain("InvalidContextHistoryStart");
-          const resumeRequest = gateway.requests.at(-1)?.body ?? "";
-          expect(resumeRequest).toContain("STEER_LATE_67e");
-          expect(resumeRequest).toContain('"type":"file"');
-          phase = "followup";
-          const requestsBeforeFollowup = gateway.requestCount();
-          await resumed.sendText("RECOVERY_FOLLOWUP_REQUEST_67e");
-          const finalScreen = await resumed.waitForPane((pane) => pane.includes("RECOVERY_FOLLOWUP_67e"), 15_000);
-          expect(finalScreen).not.toContain("InvalidContextHistoryStart");
-          expect(finalScreen).not.toContain("DuplicateImageId");
-          await until(() => savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length === completedAtKill + 2,
-            "saved recovered and follow-up turns", 10_000);
-          expect(gateway.requestCount()).toBe(requestsBeforeFollowup + 1);
-          expect(existsSync(recoveryPath)).toBe(false);
-        }
-        const imageIds = savedFrames(eventsPath).flatMap((frame) =>
-          frame.event?.user?.images?.map((image: { id: number }) => image.id) ?? []);
-        expect(new Set(imageIds).size).toBe(imageIds.length);
-        expect(readFileSync(activeStderr, "utf8")).toBe("");
-        expect(readFileSync(resumedStderr, "utf8")).toBe("");
-        passed = true;
-      } finally {
-        if (!passed) {
-          writeFileSync(join(root, "failure.json"), JSON.stringify({ ordinary, summaries, phase }, null, 2));
-          if (resumed) writeFileSync(join(root, "failure.scrollback.txt"), await resumed.captureFullScrollback());
-          console.error(`compaction recovery evidence retained: ${root}`);
-        }
-        await active?.kill();
-        await resumed?.kill();
-        summaryHold.dispose();
-        gateway.stop();
-        if (passed) rmSync(root, { recursive: true, force: true });
-      }
-    }, 90_000);
-  }
 });

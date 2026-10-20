@@ -1782,18 +1782,6 @@ fn soundEnvOverride() ?SoundEnvLevel {
     return if (off) .off else .on;
 }
 
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
 const EnvEntry = struct {
     key: []const u8,
     value: []const u8,
@@ -1804,8 +1792,6 @@ const TestEnv = struct {
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, entries: []const EnvEntry) !*TestEnv {
-        _ = try stableEmptyTestEnviron();
-
         const self = try alloc.create(TestEnv);
         errdefer alloc.destroy(self);
 
@@ -1824,9 +1810,7 @@ const TestEnv = struct {
     }
 
     fn deinit(self: *TestEnv) void {
-        if (stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

@@ -3,7 +3,6 @@ const observation = @import("../agent/runtime/observation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
-const session_store = @import("session_store.zig");
 const session = @import("session.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
 const gateway_step = @import("../agent/runtime/gateway_step.zig");
@@ -374,30 +373,6 @@ pub const Task = struct {
         self.finished_at_ms = io_mod.milliTimestamp();
     }
 };
-
-/// Installs a generated title only while the session still carries its
-/// automatic title (none persisted yet, or still equal to the locally derived
-/// one). A title the user set with `/rename` never compares equal to the
-/// derived title unless they retyped it, so their title is never overwritten.
-/// Returns true when the generated title was installed.
-pub fn installGeneratedTitle(
-    alloc: Allocator,
-    loaded: *session_store.LoadedWritableSession,
-    history: []const session.HistoryTurn,
-    title: []const u8,
-) !bool {
-    var display = try session_display_metadata.deriveFromHistory(alloc, history);
-    defer display.deinit(alloc);
-    const persisted = try loaded.conversationTitle(alloc);
-    defer if (persisted) |value| alloc.free(value);
-    if (persisted) |value| {
-        if (!display.present or !std.mem.eql(u8, value, display.title)) {
-            debug_trace.logf("session", "event=title_generation_apply result=dropped reason=user_title_present", .{});
-            return false;
-        }
-    }
-    return loaded.renameConversation(alloc, title);
-}
 
 test "shouldGenerate requires an enabled, supported, untitled first submit" {
     const open = Gate{

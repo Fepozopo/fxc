@@ -86,7 +86,8 @@ pub const FeedbackUpdate = struct {
 
 pub const Owner = struct {
     alloc: Allocator,
-    backend: child_state.Backend,
+    /// The parent's children, borrowed (D22).
+    children: *child_state.V2Children,
     state_store: child_state.Store,
     services: execution.Services,
     authority_resolver: *authority.Resolver,
@@ -196,15 +197,6 @@ pub const Owner = struct {
                 return;
             }
         }
-    }
-
-    pub fn hasRunningWork(self: *Owner) bool {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        for (self.slots.items) |slot| {
-            if (slot.completion == .running) return true;
-        }
-        return false;
     }
 
     pub fn hasRunningChild(self: *Owner, child_id: []const u8) bool {
@@ -347,7 +339,7 @@ pub const Owner = struct {
         defer observed.deinit(self.alloc);
         if (observed.children.len == 0) return;
 
-        var lock = try self.state_store.acquireLock(self.alloc);
+        var lock = self.state_store.acquireLock();
         defer lock.release();
         var registry = try self.state_store.load(self.alloc);
         defer registry.deinit(self.alloc);
@@ -386,8 +378,7 @@ pub const Owner = struct {
     }
 
     fn observe(self: *Owner, child_id: []const u8) WaitError!Observation {
-        var lock = self.state_store.acquireLock(self.alloc) catch
-            return error.StateUnavailable;
+        var lock = self.state_store.acquireLock();
         defer lock.release();
         var registry = self.state_store.load(self.alloc) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -405,7 +396,7 @@ pub const Owner = struct {
         phase: child_state.Phase,
     ) !void {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        var lock = try self.state_store.acquireLock(self.alloc);
+        var lock = self.state_store.acquireLock();
         defer lock.release();
         var registry = try self.state_store.load(self.alloc);
         defer registry.deinit(self.alloc);
@@ -424,10 +415,7 @@ pub const Owner = struct {
         outcome: child_state.Outcome,
         failure: ?types.ModelFailureDiagnostic,
     ) ?Observation {
-        var lock = self.state_store.acquireLock(self.alloc) catch |err| {
-            debugFailure(child_id, "state_lock", err);
-            return null;
-        };
+        var lock = self.state_store.acquireLock();
         defer lock.release();
         var registry = self.state_store.load(self.alloc) catch |err| {
             debugFailure(child_id, "state_load", err);
@@ -460,7 +448,7 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
 test "child feedback deduplicates operations and bounds queued receipts" {
     const alloc = std.testing.allocator;
     var worker = worker_runtime.WorkerRuntime{};
-    var owner = Owner{ .alloc = alloc, .backend = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     const slot = try alloc.create(Slot);
     slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child"), .worker = &worker, .work_id = "work" };
     try owner.slots.append(alloc, slot);
@@ -497,7 +485,7 @@ test "child feedback deduplicates operations and bounds queued receipts" {
 }
 
 fn checkFeedbackAllocation(alloc: Allocator) !void {
-    var owner = Owner{ .alloc = alloc, .backend = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer owner.deinit();
     var worker = worker_runtime.WorkerRuntime{};
     defer {
@@ -577,14 +565,14 @@ fn runOne(slot: *Slot) OneOutcome {
     var message = snapshot.active.queuedMessage(
         owner.alloc,
         owner.state_store.parent_id,
-        child.overlayInstructions(snapshot.instructions),
+        child.session.childInstructions(),
     ) catch |err| return failedOutcome(work_id, "message_preparation", err);
     defer message.deinit(owner.alloc);
     const admission = owner.services.capture(owner.alloc, .{
         .child_id = slot.child_id,
         .parent_id = owner.state_store.parent_id,
         .source_id = owner.state_store.parent_id,
-        .preferences = turnPreferencesForDurable(child.preferences()),
+        .preferences = turnPreferencesForDurable(child.preferences),
     }) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
         .outcome = .cancelled,
@@ -640,26 +628,15 @@ fn runOne(slot: *Slot) OneOutcome {
     };
 }
 
-/// The child session one work item runs in, on either backend.
-const OpenChild = union(enum) {
-    v1: session_store.LoadedWritableSession,
-    v2: struct {
-        session: *session_adapter.Session,
-        preferences: session_codec.DurableSessionPreferences,
-    },
+/// The child session one work item runs in (D22).
+const OpenChild = struct {
+    session: *session_adapter.Session,
+    preferences: session_codec.DurableSessionPreferences,
 
-    /// v2 opens the child's log, or starts it under the id its spawn line
+    /// Opens the child's log, or starts it under the id its spawn line
     /// names with the seed its admission left (D34).
     fn open(owner: *Owner, child_id: []const u8, instructions: []const u8) !OpenChild {
-        const children = switch (owner.backend) {
-            .v1 => |sessions| return .{ .v1 = try sessions.resumeTargetForWrite(
-                owner.alloc,
-                .{ .id = child_id },
-                sessions.workspace_root,
-                .{},
-            ) },
-            .v2 => |value| value,
-        };
+        const children = owner.children;
         var seed = (try children.seedFor(owner.alloc, child_id)) orelse blk: {
             debug_trace.logf("subagent", "child seed unavailable child_id={s} using=parent_preferences", .{child_id});
             break :blk child_state.V2Children.ChildSeed{
@@ -682,43 +659,16 @@ const OpenChild = union(enum) {
             },
         );
         errdefer session.close();
-        return .{ .v2 = .{ .session = session, .preferences = try session.currentPreferences(owner.alloc) } };
+        return .{ .session = session, .preferences = try session.currentPreferences(owner.alloc) };
     }
 
     fn close(self: *OpenChild, alloc: Allocator) void {
-        switch (self.*) {
-            .v1 => |*loaded| {
-                loaded.log.park();
-                loaded.deinit(alloc);
-            },
-            .v2 => |*v2| {
-                v2.preferences.deinit(alloc);
-                v2.session.close();
-            },
-        }
+        self.preferences.deinit(alloc);
+        self.session.close();
     }
 
     fn turn(self: *OpenChild, alloc: Allocator, max_history_turns: usize) !execution.TurnContext {
-        return switch (self.*) {
-            .v1 => |*loaded| execution.TurnContext.init(alloc, loaded, max_history_turns),
-            .v2 => |v2| execution.TurnContext.initV2(alloc, v2.session, max_history_turns),
-        };
-    }
-
-    fn preferences(self: *const OpenChild) session_codec.DurableSessionPreferences {
-        return switch (self.*) {
-            .v1 => |*loaded| loaded.state.preferences,
-            .v2 => |v2| v2.preferences,
-        };
-    }
-
-    /// v1 keeps instructions in `children.json`; a v2 child keeps them in
-    /// its own `prefs` (D34).
-    fn overlayInstructions(self: *const OpenChild, registry_instructions: []const u8) []const u8 {
-        return switch (self.*) {
-            .v1 => registry_instructions,
-            .v2 => |v2| v2.session.childInstructions(),
-        };
+        return execution.TurnContext.init(alloc, self.session, max_history_turns);
     }
 };
 
@@ -807,7 +757,7 @@ const RunSnapshot = struct {
 };
 
 fn loadRunSnapshot(owner: *Owner, child_id: []const u8) !RunSnapshot {
-    var lock = try owner.state_store.acquireLock(owner.alloc);
+    var lock = owner.state_store.acquireLock();
     defer lock.release();
     var registry = try owner.state_store.load(owner.alloc);
     defer registry.deinit(owner.alloc);
@@ -878,122 +828,6 @@ fn debugFailure(child_id: []const u8, stage: []const u8, err: anyerror) void {
         "managed child state update failed child_id={s} stage={s} err={s}",
         .{ child_id, stage, @errorName(err) },
     );
-}
-
-test "subagent completion takes the owner lock before the registry lock" {
-    const alloc = std.testing.allocator;
-    const Harness = struct {
-        owner: *Owner = undefined,
-        outcome: child_state.Outcome,
-        fail_save: bool,
-        finishing: bool = false,
-        checked: bool = false,
-        owner_was_unlocked: bool = false,
-
-        fn capture(_: ?*anyopaque, allocator: Allocator, request: execution.CaptureRequest) execution.ServiceError!domain.AdmissionSnapshot {
-            return domain.captureAdmission(allocator, .{
-                .parent_id = request.parent_id,
-                .source_id = request.source_id,
-                .model = request.preferences.model,
-                .effort = request.preferences.effort,
-            }) catch return error.AdmissionFailed;
-        }
-
-        fn run(raw: ?*anyopaque, _: *execution.TurnContext, _: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.finishing = true;
-            return if (self.outcome == .cancelled) error.Cancelled else .completed;
-        }
-
-        fn tryLock(raw: ?*anyopaque, file: std.Io.File) anyerror!bool {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (self.finishing) {
-                self.checked = true;
-                if (self.owner.mutex.tryLock()) {
-                    self.owner_was_unlocked = true;
-                    self.owner.mutex.unlock(io_mod.getIo());
-                }
-            }
-            return file.tryLock(io_mod.getIo(), .exclusive);
-        }
-
-        fn syncFile(raw: ?*anyopaque, file: std.Io.File) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (self.finishing and self.fail_save) return error.InputOutput;
-            try file.sync(io_mod.getIo());
-        }
-    };
-    for ([_]struct { outcome: child_state.Outcome, fail_save: bool }{
-        .{ .outcome = .completed, .fail_save = false },
-        .{ .outcome = .cancelled, .fail_save = false },
-        .{ .outcome = .completed, .fail_save = true },
-    }) |case| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(root);
-        var sessions = try session_store.Store.initFromHome(alloc, root, root);
-        defer sessions.deinit(alloc);
-        for ([_][]const u8{ "completion-parent", "completion-child" }) |id| {
-            var writable = try sessions.startWritableSession(alloc, .{
-                .id = @constCast(id),
-                .origin_workspace_root = @constCast(root),
-                .workspace_root = @constCast(root),
-                .created_at_ms = 1,
-                .updated_at_ms = 1,
-                .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
-                .history = &.{},
-                .total_input_tokens = 0,
-                .total_output_tokens = 0,
-                .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-            });
-            writable.deinit(alloc);
-        }
-        var approvals = approval_registry.Registry{ .alloc = alloc };
-        defer approvals.deinit();
-        var harness = Harness{ .outcome = case.outcome, .fail_save = case.fail_save };
-        var owner = Owner{
-            .alloc = alloc,
-            .backend = .{ .v1 = &sessions },
-            .state_store = .{ .backend = .{ .v1 = &sessions }, .parent_id = "completion-parent" },
-            .services = .{ .context = &harness, .capture_fn = Harness.capture, .run_fn = Harness.run },
-            .authority_resolver = undefined,
-            .approvals = &approvals,
-        };
-        defer owner.deinit();
-        harness.owner = &owner;
-        {
-            var registry = try child_state.Registry.init(alloc, "completion-parent");
-            defer registry.deinit(alloc);
-            try registry.appendPersistent(alloc, "completion-child", "reviewer", "", .{
-                .id = @constCast("completion-work"),
-                .message = @constCast("reply"),
-                .created_at_ms = 1,
-            });
-            try owner.state_store.save(alloc, registry);
-        }
-        owner.state_store.options = .{
-            .replace_ops = .{ .ctx = &harness, .sync_file = Harness.syncFile },
-            .lock_ops = .{ .ctx = &harness, .try_lock = Harness.tryLock },
-        };
-        var slot = Slot{ .owner = &owner, .child_id = @constCast("completion-child") };
-        slotMain(&slot);
-        harness.finishing = false;
-        try std.testing.expectEqual(true, harness.checked);
-        try std.testing.expectEqual(false, harness.owner_was_unlocked);
-        try std.testing.expect(slot.done.isSet());
-        try std.testing.expect(slot.worker == null);
-        const expected: std.meta.Tag(@TypeOf(slot.completion)) = if (case.fail_save) .unpublished else .published;
-        try std.testing.expectEqual(expected, std.meta.activeTag(slot.completion));
-        try std.testing.expect(owner.mutex.tryLock());
-        owner.mutex.unlock(io_mod.getIo());
-        var lock = try owner.state_store.acquireLock(alloc);
-        defer lock.release();
-        var saved = try owner.state_store.load(alloc);
-        defer saved.deinit(alloc);
-        try std.testing.expectEqual(if (case.fail_save) child_state.Phase.running else .idle, saved.children[0].phase);
-        try std.testing.expectEqual(if (case.fail_save) null else case.outcome, saved.children[0].last_outcome);
-    }
 }
 
 test "managed owner cancellation join wakes pending permission" {
@@ -1100,30 +934,12 @@ const CancellationJoinTest = struct {
 
 fn testCancellationJoin(timing: enum { pending, before_permission, before_attachment }) !void {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    var sessions = try session_store.Store.initFromHome(alloc, root, root);
-    defer sessions.deinit(alloc);
-    for ([_][]const u8{ "parent", "child" }) |id| {
-        var writable = try sessions.startWritableSession(alloc, .{
-            .id = @constCast(id),
-            .origin_workspace_root = @constCast(root),
-            .workspace_root = @constCast(root),
-            .created_at_ms = 1,
-            .updated_at_ms = 1,
-            .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
-            .history = &.{},
-            .total_input_tokens = 0,
-            .total_output_tokens = 0,
-            .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-        });
-        writable.deinit(alloc);
-    }
-    const state_store = child_state.Store{ .backend = .{ .v1 = &sessions }, .parent_id = "parent" };
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const state_store = parent.stateStore();
     {
-        var registry = try child_state.Registry.init(alloc, "parent");
+        var registry = try child_state.Registry.init(alloc, parent.parent.id());
         defer registry.deinit(alloc);
         try registry.appendOneOff(alloc, "child", .{
             .id = @constCast("work"),
@@ -1136,7 +952,7 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
     defer approvals.deinit();
     var owner = Owner{
         .alloc = alloc,
-        .backend = .{ .v1 = &sessions },
+        .children = &parent.children,
         .state_store = state_store,
         .services = undefined,
         .authority_resolver = undefined,
@@ -1237,7 +1053,7 @@ test "subagent failure to publish completion returns state unavailable instead o
     defer approvals.deinit();
     var owner = Owner{
         .alloc = alloc,
-        .backend = undefined,
+        .children = undefined,
         .state_store = undefined,
         .services = undefined,
         .authority_resolver = undefined,
@@ -1288,33 +1104,17 @@ test "subagent failure to publish completion returns state unavailable instead o
 
 test "subagent wait returns its completed observation after the registry advances" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
-    var parent = try sessions.startWritableSession(alloc, .{
-        .id = @constCast("wait-parent"),
-        .origin_workspace_root = @constCast(home),
-        .workspace_root = @constCast(home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    });
-    defer parent.deinit(alloc);
-    const store = child_state.Store{ .backend = .{ .v1 = &sessions }, .parent_id = "wait-parent" };
-    var registry = try child_state.Registry.init(alloc, "wait-parent");
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const store = parent.stateStore();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
     defer registry.deinit(alloc);
     try registry.appendPersistent(alloc, "child", "reviewer", "", .{ .id = @constCast("old-work"), .message = @constCast("old task"), .created_at_ms = 1 });
     try registry.finish(alloc, "child", "old-work", .completed, null);
     _ = try registry.startPersistentWork(alloc, "reviewer", null, .{ .id = @constCast("new-work"), .message = @constCast("new task"), .created_at_ms = 2 });
     try store.save(alloc, registry);
-    var owner = Owner{ .alloc = alloc, .backend = .{ .v1 = &sessions }, .state_store = store, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    var owner = Owner{ .alloc = alloc, .children = &parent.children, .state_store = store, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer owner.deinit();
     const slot = try alloc.create(Slot);
     slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child"), .completion = .{ .published = .{ .phase = .idle, .outcome = .completed } } };
@@ -1333,7 +1133,7 @@ test "worker detach invalidates approval routes before worker deinit" {
     defer approvals.deinit();
     var owner = Owner{
         .alloc = alloc,
-        .backend = undefined,
+        .children = undefined,
         .state_store = undefined,
         .services = undefined,
         .authority_resolver = undefined,

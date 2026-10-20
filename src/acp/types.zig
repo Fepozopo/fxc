@@ -43,7 +43,6 @@ pub fn fxMetaInteger(object: std.json.ObjectMap, key: []const u8) ?i64 {
 pub fn writeModelRecoveryInfoUpdate(
     writer: *std.Io.Writer,
     status: ?core_types.RouteRecoveryStatus,
-    durable: bool,
 ) !void {
     try writer.writeAll("{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":");
     const recovery = status orelse {
@@ -86,7 +85,7 @@ pub fn writeModelRecoveryInfoUpdate(
     if (recovery.delay_seconds != 0) {
         try writer.print(",\"delaySeconds\":{d}", .{recovery.delay_seconds});
     }
-    try writer.print(",\"durable\":{s},\"message\":", .{if (durable) "true" else "false"});
+    try writer.writeAll(",\"message\":");
     var label_buf: [core_types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try writeJsonStr(recovery.label(&label_buf), writer);
     try writer.writeAll("}}}}");
@@ -653,13 +652,13 @@ test "model recovery info update is structured and clearable" {
         .required_action = .continue_later,
         .delay_seconds = 4,
         .diagnostic = core_types.ModelFailureDiagnostic.init("ConnectionResetByPeer"),
-    }, true);
+    });
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"paused\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"cause\":\"system_resumed\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"requiredAction\":\"continue_later\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":4") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"delaySeconds\":4") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"durable\":true") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"durable\"") == null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") != null);
 
     out.writer.end = 0;
@@ -667,12 +666,12 @@ test "model recovery info update is structured and clearable" {
         .kind = .auto_recovered,
         .succeeded_attempt = 5,
         .attempt_limit = 10,
-    }, true);
+    });
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"recovered\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":5") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") == null);
 
     out.writer.end = 0;
-    try writeModelRecoveryInfoUpdate(&out.writer, null, false);
+    try writeModelRecoveryInfoUpdate(&out.writer, null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"modelResponseRecovery\":null") != null);
 }

@@ -185,7 +185,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     var reader: host_stream.HostStreamReader = undefined;
     reader.init(transport, opened.handle, request.cancel_flag, request.deadline, request.cooperative_pulse);
-    const result = xai_grok.completeFromStream(alloc, request, &reader.interface) catch |err| switch (err) {
+    const result = xai_grok.completeFromStream(alloc, request, &reader.interface, null) catch |err| switch (err) {
         error.ReadFailed => return host_stream.readFailure(&reader, request.cancel_flag),
         else => return err,
     };

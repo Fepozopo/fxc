@@ -1449,55 +1449,6 @@ pub const SessionDetailSnapshot = struct {
     }
 };
 
-pub const SessionMigrationSnapshot = struct {
-    result: session_store.SessionMigrationResult,
-
-    pub fn render(self: SessionMigrationSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: SessionMigrationSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print(
-            "[session migration] {s}\nstatus: {s}\nsource_schema_version: {d}\nsource_bytes: {d}\n",
-            .{
-                self.result.session_id,
-                sessionMigrationStatusLabel(self.result.status),
-                self.result.source_schema_version,
-                self.result.source_bytes,
-            },
-        );
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: SessionMigrationSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.writeAll("{\"kind\":\"session_migration\",\"id\":");
-        try std.json.Stringify.value(self.result.session_id, .{}, &out.writer);
-        try out.writer.writeAll(",\"status\":");
-        try std.json.Stringify.value(sessionMigrationStatusLabel(self.result.status), .{}, &out.writer);
-        try out.writer.print(
-            ",\"source_schema_version\":{d},\"source_bytes\":{d}}}",
-            .{ self.result.source_schema_version, self.result.source_bytes },
-        );
-        return try out.toOwnedSlice();
-    }
-};
-
-fn sessionMigrationStatusLabel(status: session_store.SessionMigrationStatus) []const u8 {
-    return switch (status) {
-        .migrated => "migrated",
-        .already_current => "already_current",
-    };
-}
-
 pub const SessionRecoverySnapshot = struct {
     result: session_store.SessionRecoveryResult,
 
@@ -1516,36 +1467,22 @@ pub const SessionRecoverySnapshot = struct {
         self: SessionRecoverySnapshot,
         alloc: Allocator,
     ) ![]u8 {
-        if (self.result.status == .indeterminate) {
-            return alloc.print(
-                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\nresolve: fx --resume {s}\ninspect: fx doctor\n",
-                .{
-                    self.result.recovered_session_id,
-                    self.result.source_session_id,
-                    self.result.recovered_session_id,
-                },
-            );
+        const result = self.result;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("[session recovery] copied {s} to {s}\nhistory_turns: {d}\n", .{
+            result.source_session_id,
+            result.recovered_session_id,
+            result.history_len,
+        });
+        if (result.status == .recovered_with_unverified_artifacts) {
+            try out.writer.writeAll("warning: legacy command artifacts could not be authenticated\n");
         }
-        if (self.result.status == .recovered_with_unverified_artifacts) {
-            return alloc.print(
-                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume {s}\n",
-                .{
-                    self.result.source_session_id,
-                    self.result.recovered_session_id,
-                    self.result.history_len,
-                    self.result.recovered_session_id,
-                },
-            );
+        if (result.permission_rules_dropped) {
+            try out.writer.writeAll("warning: saved permission rules could not be read and were not copied\n");
         }
-        return alloc.print(
-            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nresume: fx --resume {s}\n",
-            .{
-                self.result.source_session_id,
-                self.result.recovered_session_id,
-                self.result.history_len,
-                self.result.recovered_session_id,
-            },
-        );
+        try out.writer.print("resume: fx --resume {s}\n", .{result.recovered_session_id});
+        return try out.toOwnedSlice();
     }
 
     pub fn renderJson(
@@ -1575,8 +1512,8 @@ pub const SessionRecoverySnapshot = struct {
             &out.writer,
         );
         try out.writer.print(
-            ",\"history_turns\":{d}",
-            .{self.result.history_len},
+            ",\"history_turns\":{d},\"permission_rules_dropped\":{}",
+            .{ self.result.history_len, self.result.permission_rules_dropped },
         );
         try out.writer.writeByte('}');
         return try out.toOwnedSlice();
@@ -1590,9 +1527,17 @@ pub const SessionConvertSnapshot = struct {
     busy: usize,
     unreadable: usize,
     skipped: []const Skipped,
-    /// Each side file a converted session was converted without, being
-    /// larger than the new store keeps in one file.
+    /// Each file a converted session was converted without, which its
+    /// earlier folder keeps.
     left_out: []const LeftOut = &.{},
+    /// Each subagent an older fx saved that no conversion takes, kept as it
+    /// is, with why no fx opens it.
+    kept: []const Kept = &.{},
+
+    pub const Kept = struct {
+        id: []const u8,
+        reason: []const u8,
+    };
 
     pub const Skipped = struct {
         id: []const u8,
@@ -1608,6 +1553,12 @@ pub const SessionConvertSnapshot = struct {
         /// The session that kept the file: `id`, or one of its subagents.
         member: []const u8,
         file: []const u8,
+        /// `too_large`, a side file over `limit`, which is `bytes` long; or
+        /// `not_regular`, `unreadable` or `too_deep`, hosted terminal state
+        /// the copy can't take.
+        cause: []const u8,
+        /// Why, as a clause.
+        reason: []const u8,
         bytes: u64,
         limit: u64,
     };
@@ -1633,8 +1584,9 @@ pub const SessionConvertSnapshot = struct {
         for (self.left_out) |left| {
             try out.writer.print("{s}: converted without {s}", .{ left.id, left.file });
             if (!std.mem.eql(u8, left.member, left.id)) try out.writer.print(" of its subagent {s}", .{left.member});
-            try out.writer.print(", which is {d} bytes, more than the {d} the new store keeps in one file\n", .{ left.bytes, left.limit });
+            try out.writer.print(" because {s}; ~/.fx/sessions/{s} keeps it\n", .{ left.reason, left.member });
         }
+        for (self.kept) |kept| try out.writer.print("{s}: kept as it is: {s}\n", .{ kept.id, kept.reason });
         return out.toOwnedSlice();
     }
 
@@ -1665,7 +1617,9 @@ pub const SessionConvertSnapshot = struct {
             if (index > 0) try out.writer.writeByte(',');
             try std.json.Stringify.value(left, .{}, &out.writer);
         }
-        try out.writer.writeAll("]}");
+        try out.writer.writeAll("],\"kept\":");
+        try std.json.Stringify.value(self.kept, .{}, &out.writer);
+        try out.writer.writeByte('}');
         return out.toOwnedSlice();
     }
 };
@@ -1673,23 +1627,26 @@ pub const SessionConvertSnapshot = struct {
 test "fx sessions convert names each file it left out, in text and JSON" {
     const alloc = std.testing.allocator;
     const snapshot: SessionConvertSnapshot = .{ .converted = 1, .busy = 0, .unreadable = 0, .skipped = &.{}, .left_out = &.{
-        .{ .id = "root", .member = "root", .file = "logs/commands/replay.bin", .bytes = 600, .limit = 512 },
-        .{ .id = "root", .member = "kid", .file = "tool-results/big.txt", .bytes = 700, .limit = 512 },
+        .{ .id = "root", .member = "root", .file = "logs/commands/replay.bin", .cause = "too_large", .reason = "it is 600 bytes, more than the 512 the new store keeps in one file", .bytes = 600, .limit = 512 },
+        .{ .id = "root", .member = "kid", .file = "tool-results/big.txt", .cause = "too_large", .reason = "it is 700 bytes, more than the 512 the new store keeps in one file", .bytes = 700, .limit = 512 },
+        .{ .id = "root", .member = "root", .file = "terminal/state/link", .cause = "not_regular", .reason = "it is not a file or folder", .bytes = 0, .limit = 512 },
     } };
     const text = try snapshot.render(alloc, .text);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
         "converted 1, busy 0, unreadable 0\n" ++
-            "root: converted without logs/commands/replay.bin, which is 600 bytes, more than the 512 the new store keeps in one file\n" ++
-            "root: converted without tool-results/big.txt of its subagent kid, which is 700 bytes, more than the 512 the new store keeps in one file\n",
+            "root: converted without logs/commands/replay.bin because it is 600 bytes, more than the 512 the new store keeps in one file; ~/.fx/sessions/root keeps it\n" ++
+            "root: converted without tool-results/big.txt of its subagent kid because it is 700 bytes, more than the 512 the new store keeps in one file; ~/.fx/sessions/kid keeps it\n" ++
+            "root: converted without terminal/state/link because it is not a file or folder; ~/.fx/sessions/root keeps it\n",
         text,
     );
     const json = try snapshot.render(alloc, .json);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"sessions_convert\",\"converted\":1,\"busy\":0,\"unreadable\":0,\"skipped\":[],\"left_out\":[" ++
-            "{\"id\":\"root\",\"member\":\"root\",\"file\":\"logs/commands/replay.bin\",\"bytes\":600,\"limit\":512}," ++
-            "{\"id\":\"root\",\"member\":\"kid\",\"file\":\"tool-results/big.txt\",\"bytes\":700,\"limit\":512}]}",
+            "{\"id\":\"root\",\"member\":\"root\",\"file\":\"logs/commands/replay.bin\",\"cause\":\"too_large\",\"reason\":\"it is 600 bytes, more than the 512 the new store keeps in one file\",\"bytes\":600,\"limit\":512}," ++
+            "{\"id\":\"root\",\"member\":\"kid\",\"file\":\"tool-results/big.txt\",\"cause\":\"too_large\",\"reason\":\"it is 700 bytes, more than the 512 the new store keeps in one file\",\"bytes\":700,\"limit\":512}," ++
+            "{\"id\":\"root\",\"member\":\"root\",\"file\":\"terminal/state/link\",\"cause\":\"not_regular\",\"reason\":\"it is not a file or folder\",\"bytes\":0,\"limit\":512}],\"kept\":[]}",
         json,
     );
 }
@@ -1709,7 +1666,28 @@ test "fx sessions convert renders its counts and each skip as text and JSON from
     const json = try snapshot.render(alloc, .json);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"sessions_convert\",\"converted\":2,\"busy\":1,\"unreadable\":1,\"error\":\"SessionBusy\",\"skipped\":[{\"id\":\"held\",\"error\":\"SessionBusy\"},{\"id\":\"torn\",\"error\":\"InvalidSessionFormat\",\"reason\":\"events.jsonl line 3 is not valid JSON\"}],\"left_out\":[]}",
+        "{\"kind\":\"sessions_convert\",\"converted\":2,\"busy\":1,\"unreadable\":1,\"error\":\"SessionBusy\",\"skipped\":[{\"id\":\"held\",\"error\":\"SessionBusy\"},{\"id\":\"torn\",\"error\":\"InvalidSessionFormat\",\"reason\":\"events.jsonl line 3 is not valid JSON\"}],\"left_out\":[],\"kept\":[]}",
+        json,
+    );
+}
+
+test "fx sessions convert names each subagent it keeps as it is, in text and JSON (D88)" {
+    const alloc = std.testing.allocator;
+    const snapshot: SessionConvertSnapshot = .{ .converted = 1, .busy = 0, .unreadable = 0, .skipped = &.{}, .kept = &.{
+        .{ .id = "grandchild", .reason = "it is a subagent of the earlier subagent child, which no fx opens" },
+    } };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "converted 1, busy 0, unreadable 0\n" ++
+            "grandchild: kept as it is: it is a subagent of the earlier subagent child, which no fx opens\n",
+        text,
+    );
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sessions_convert\",\"converted\":1,\"busy\":0,\"unreadable\":0,\"skipped\":[],\"left_out\":[]," ++
+            "\"kept\":[{\"id\":\"grandchild\",\"reason\":\"it is a subagent of the earlier subagent child, which no fx opens\"}]}",
         json,
     );
 }
@@ -3155,29 +3133,6 @@ test "core session detail JSON includes assistant execution memory" {
     try std.testing.expect(std.mem.find(u8, text, "input_tokens") == null);
 }
 
-test "core session migration snapshot text and json stay stable" {
-    const result = session_store.SessionMigrationResult{
-        .session_id = @constCast("session.v3"),
-        .source_schema_version = 2,
-        .source_bytes = 4096,
-        .status = .migrated,
-    };
-
-    const text = try (SessionMigrationSnapshot{ .result = result }).renderText(std.testing.allocator);
-    defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings(
-        "[session migration] session.v3\nstatus: migrated\nsource_schema_version: 2\nsource_bytes: 4096\n",
-        text,
-    );
-
-    const json = try (SessionMigrationSnapshot{ .result = result }).renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"session_migration\",\"id\":\"session.v3\",\"status\":\"migrated\",\"source_schema_version\":2,\"source_bytes\":4096}",
-        json,
-    );
-}
-
 test "core session recovery snapshot text and json stay stable" {
     const result = session_store.SessionRecoveryResult{
         .source_session_id = @constCast("source-session"),
@@ -3199,7 +3154,7 @@ test "core session recovery snapshot text and json stay stable" {
     );
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"recovered-session\",\"status\":\"recovered\",\"history_turns\":4}",
+        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"recovered-session\",\"status\":\"recovered\",\"history_turns\":4,\"permission_rules_dropped\":false}",
         json,
     );
 
@@ -3222,23 +3177,31 @@ test "core session recovery snapshot text and json stay stable" {
     }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(partial_json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"partial-session\",\"status\":\"recovered_with_unverified_artifacts\",\"history_turns\":4}",
+        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"partial-session\",\"status\":\"recovered_with_unverified_artifacts\",\"history_turns\":4,\"permission_rules_dropped\":false}",
         partial_json,
     );
 
-    const indeterminate = session_store.SessionRecoveryResult{
+    const without_rules = session_store.SessionRecoveryResult{
         .source_session_id = @constCast("source-session"),
-        .recovered_session_id = @constCast("target-session"),
+        .recovered_session_id = @constCast("ruleless-session"),
         .history_len = 4,
-        .status = .indeterminate,
+        .permission_rules_dropped = true,
     };
-    const warning = try (SessionRecoverySnapshot{
-        .result = indeterminate,
+    const without_rules_text = try (SessionRecoverySnapshot{
+        .result = without_rules,
     }).renderText(std.testing.allocator);
-    defer std.testing.allocator.free(warning);
+    defer std.testing.allocator.free(without_rules_text);
     try std.testing.expectEqualStrings(
-        "[session recovery] could not confirm target target-session\nsource: source-session (unchanged)\nresolve: fx --resume target-session\ninspect: fx doctor\n",
-        warning,
+        "[session recovery] copied source-session to ruleless-session\nhistory_turns: 4\nwarning: saved permission rules could not be read and were not copied\nresume: fx --resume ruleless-session\n",
+        without_rules_text,
+    );
+    const without_rules_json = try (SessionRecoverySnapshot{
+        .result = without_rules,
+    }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(without_rules_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"ruleless-session\",\"status\":\"recovered\",\"history_turns\":4,\"permission_rules_dropped\":true}",
+        without_rules_json,
     );
 }
 

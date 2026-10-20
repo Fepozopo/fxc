@@ -350,9 +350,12 @@ test "terminal assistant completion continues with steering admitted during the 
         resumed_job,
     );
 
+    // The steer comes back as the live update the model saw, not as a plain
+    // user message.
     try expectBodyContainsInOrder(&resumed_gateway, 0, &.{
         "user prompt",
         "Original answer",
+        "user_steering",
         "change direction",
         "Updated answer",
         "follow up",
@@ -6090,6 +6093,134 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     try expectBodyContains(&restored_gateway, 0, "exact provider evidence");
 }
 
+test "processQueuedPrompt delivers a reply saved before its turn ended without another request" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "The saved answer" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    const config = fixture.config();
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    // The checkpoint saved after the finished reply holds it for delivery.
+    const settled = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, settled.action);
+    try std.testing.expectEqualStrings("The saved answer", settled.assistant_source);
+
+    // The process died before the turn's end was stored: the restored turn
+    // ends with the saved reply and asks the model nothing.
+    var restored_checkpoint = try settled.dupe(alloc);
+    defer restored_checkpoint.deinit(alloc);
+    var restored_gateway = FakeGateway.init(alloc, &.{});
+    defer restored_gateway.deinit();
+    var restored_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer restored_hooks.deinit();
+    var restored_job = fixture.job();
+    restored_job.recovery_checkpoint = restored_checkpoint;
+
+    try runFakePrompt(&restored_gateway, &restored_hooks, config, restored_job);
+
+    try std.testing.expectEqual(@as(usize, 0), restored_gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), restored_hooks.history_turns.items.len);
+    try std.testing.expectEqualStrings(
+        "The saved answer",
+        restored_hooks.history_turns.items[0].assistant.assistant,
+    );
+    // A host that holds none of the turn's output gets the reply as its text.
+    try std.testing.expectEqual(@as(usize, 1), restored_hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings("The saved answer", restored_hooks.assistant_sources.items[0]);
+
+    // A host that already holds it, as a durable session's stream does, gets
+    // nothing again.
+    var shown_gateway = FakeGateway.init(alloc, &.{});
+    defer shown_gateway.deinit();
+    var shown_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer shown_hooks.deinit();
+    var shown_job = fixture.job();
+    shown_job.recovery_checkpoint = restored_checkpoint;
+    shown_job.recovery_source_already_presented = true;
+
+    try runFakePrompt(&shown_gateway, &shown_hooks, config, shown_job);
+
+    try std.testing.expectEqual(@as(usize, 0), shown_gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), shown_hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(
+        "The saved answer",
+        shown_hooks.history_turns.items[0].assistant.assistant,
+    );
+}
+
+test "processQueuedPrompt saves a reply that calls a tool for a retry, not for delivery" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .content = "Reading it first", .tool_calls = &calls },
+        .{ .content = "Read it" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    var delivering: usize = 0;
+    for (hooks.recovery_checkpoints.items) |checkpoint| {
+        if (checkpoint.action != .delivering_response) continue;
+        delivering += 1;
+        try std.testing.expectEqualStrings("Read it", checkpoint.assistant_source);
+    }
+    // Only the final reply, which called no tool, is saved for delivery.
+    try std.testing.expectEqual(@as(usize, 1), delivering);
+}
+
+test "processQueuedPrompt asks the model again when a steer waits at a saved reply" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "The saved answer" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    const config = fixture.config();
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    const settled = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, settled.action);
+
+    // A steer accepted before the crash joins the resumed turn, which goes on
+    // with a request that carries it instead of ending with the saved reply.
+    var restored_checkpoint = try settled.dupe(alloc);
+    defer restored_checkpoint.deinit(alloc);
+    const restored_completions = [_]FakeCompletion{.{ .content = "Answer with the steer" }};
+    var restored_gateway = FakeGateway.init(alloc, &restored_completions);
+    defer restored_gateway.deinit();
+    const steering = [_][]const u8{"change direction"};
+    var restored_hooks = FakeAgentRuntimeDeps.init(alloc);
+    restored_hooks.steering_messages = &steering;
+    restored_hooks.steering_take_at = 1;
+    defer restored_hooks.deinit();
+    var restored_job = fixture.job();
+    restored_job.recovery_checkpoint = restored_checkpoint;
+
+    try runFakePrompt(&restored_gateway, &restored_hooks, config, restored_job);
+
+    try std.testing.expectEqual(@as(usize, 1), restored_gateway.request_bodies.items.len);
+    try expectBodyContains(&restored_gateway, 0, "change direction");
+    try std.testing.expectEqualStrings(
+        "Answer with the steer",
+        restored_hooks.history_turns.items[0].assistant.assistant,
+    );
+}
+
 test "processQueuedPrompt preserves the provider-executed subset of mixed failed tools" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
@@ -6755,12 +6886,14 @@ test "processQueuedPrompt counts and retries a definitely unsent native setup fa
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 4), hooks.recovery_checkpoints.items.len);
+    // Reserve and settle for each attempt, then the reply the turn ends with.
+    try std.testing.expectEqual(@as(usize, 5), hooks.recovery_checkpoints.items.len);
     try std.testing.expectEqual(
         @as(usize, 1),
         hooks.recovery_checkpoints.items[1].consumed_provider_attempts,
     );
     try std.testing.expect(!hooks.recovery_checkpoints.items[1].outstanding_reservation);
+    try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, hooks.recovery_checkpoints.items[4].action);
     try expectRouteStatus(
         &hooks,
         0,
@@ -6892,13 +7025,20 @@ test "processQueuedPrompt reserves and settles durable attempts before history c
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 2), hooks.recovery_checkpoints.items.len);
+    try std.testing.expectEqual(@as(usize, 3), hooks.recovery_checkpoints.items.len);
     const reserved = hooks.recovery_checkpoints.items[0];
     try std.testing.expect(reserved.outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 0), reserved.consumed_provider_attempts);
     const settled = hooks.recovery_checkpoints.items[1];
     try std.testing.expect(!settled.outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 1), settled.consumed_provider_attempts);
+    // Before the turn ends with its reply, the reply is saved for delivery,
+    // with the attempts the settled checkpoint counted.
+    const final = hooks.recovery_checkpoints.items[2];
+    try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, final.action);
+    try std.testing.expectEqualStrings("Done", final.assistant_source);
+    try std.testing.expect(!final.outstanding_reservation);
+    try std.testing.expectEqual(@as(usize, 1), final.consumed_provider_attempts);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_propagation_count);
 }
 
@@ -6944,7 +7084,7 @@ test "processQueuedPrompt carries one durable budget across transport recovery" 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 4), hooks.recovery_checkpoints.items.len);
+    try std.testing.expectEqual(@as(usize, 5), hooks.recovery_checkpoints.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.recovery_checkpoints.items[0].consumed_provider_attempts);
     try std.testing.expect(hooks.recovery_checkpoints.items[0].outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoints.items[1].consumed_provider_attempts);
@@ -6952,6 +7092,8 @@ test "processQueuedPrompt carries one durable budget across transport recovery" 
     try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoints.items[2].consumed_provider_attempts);
     try std.testing.expect(hooks.recovery_checkpoints.items[2].outstanding_reservation);
     try std.testing.expectEqual(@as(usize, 2), hooks.recovery_checkpoints.items[3].consumed_provider_attempts);
+    try std.testing.expectEqual(@as(usize, 2), hooks.recovery_checkpoints.items[4].consumed_provider_attempts);
+    try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, hooks.recovery_checkpoints.items[4].action);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_propagation_count);
 }
 
@@ -6973,7 +7115,7 @@ test "processQueuedPrompt retains interrupted source in the next reservation" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 4), hooks.recovery_checkpoints.items.len);
+    try std.testing.expectEqual(@as(usize, 5), hooks.recovery_checkpoints.items.len);
     const settled = hooks.recovery_checkpoints.items[1];
     const reserved = hooks.recovery_checkpoints.items[2];
     try std.testing.expectEqualStrings("retained interrupted preview", settled.assistant_source);
@@ -7219,6 +7361,87 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh attemp
     try std.testing.expectEqual(@as(usize, 1), second_hooks.history_propagation_count);
 }
 
+test "processQueuedPrompt resumed reply retries a size rejection with fewer images" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, image);
+    var images = [_]types.ImageAttachment{image};
+    const native_images = model_capabilities.Capabilities{
+        .image_input_support = .native,
+        .context_window = 1_000_000,
+    };
+
+    // The first run streams part of a reply, then loses the connection and
+    // parks, so its checkpoint holds the image and the partial reply.
+    const partial_chunks = [_][]const u8{"partial"};
+    const interrupted = [_]FakeCompletion{.{
+        .chunks = &partial_chunks,
+        .stream_error_after_chunks = error.ReadFailed,
+    }};
+    var first_gateway = FakeGateway.init(alloc, &interrupted);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    first_hooks.enable_recovery_checkpoint = true;
+    first_hooks.default_model_capabilities = native_images;
+    defer first_hooks.deinit();
+    var fixture = PromptFixture{};
+    var first_config = fixture.config();
+    first_config.max_provider_attempts = 1;
+    var pause_flag = std.atomic.Value(bool).init(false);
+    first_hooks.pause_on_auto_retry_status = true;
+    first_hooks.recovery_pause_flag = &pause_flag;
+    first_config.recovery_pause_flag = &pause_flag;
+    var first_job = fixture.job();
+    first_job.credential_source = .fx_login;
+    first_job.account_id = @constCast("acct_1");
+    first_job.prompt = @constCast("Describe the attached image.");
+    first_job.images = &images;
+    first_job.authorized_image_catalog = &images;
+
+    try runFakePrompt(&first_gateway, &first_hooks, first_config, first_job);
+    try expectBodyContains(&first_gateway, 0, "\"type\":\"file\"");
+    const saved = first_hooks.recovery_checkpoints.items[first_hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(@as(usize, 1), saved.user.images.len);
+    try std.testing.expect(saved.assistant_source.len > 0);
+    var checkpoint = try saved.dupe(alloc);
+    defer checkpoint.deinit(alloc);
+
+    // Resumed, the restarted reply is refused for its size before any output;
+    // the turn sends it again without the image instead of failing.
+    const resumed = [_]FakeCompletion{
+        .{ .status = .payload_too_large, .err_body = "request entity too large" },
+        .{ .content = "finished without the image" },
+    };
+    var second_gateway = FakeGateway.init(alloc, &resumed);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    second_hooks.enable_recovery_checkpoint = true;
+    second_hooks.default_model_capabilities = native_images;
+    defer second_hooks.deinit();
+    var continued_job = fixture.job();
+    continued_job.credential_source = .fx_login;
+    continued_job.account_id = @constCast("acct_1");
+    continued_job.prompt = checkpoint.user.text;
+    continued_job.images = checkpoint.user.images;
+    continued_job.authorized_image_catalog = checkpoint.user.images;
+    continued_job.recovery_checkpoint = checkpoint;
+    var continued_config = fixture.config();
+    continued_config.max_provider_attempts = 2;
+
+    try runFakePrompt(&second_gateway, &second_hooks, continued_config, continued_job);
+
+    try expectGatewayPromptTailText(&second_gateway, 0, .user, "Restart that response from the beginning");
+    try expectBodyContains(&second_gateway, 0, "\"type\":\"file\"");
+    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_models.items.len);
+    try expectBodyNotContains(&second_gateway, 1, "\"type\":\"file\"");
+    try expectBodyContains(&second_gateway, 1, "not sent to keep the request under");
+    try std.testing.expectEqualStrings("finished without the image", second_hooks.history_assistant_text.?);
+}
+
 test "processQueuedPrompt retries system resume through the heartbeat" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
@@ -7238,10 +7461,14 @@ test "processQueuedPrompt retries system resume through the heartbeat" {
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
-    const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    // The last settled attempt, before the checkpoint that saves the reply.
+    const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 2];
     try std.testing.expectEqual(types.ModelRecoveryCause.system_resumed, checkpoint.cause);
     try std.testing.expectEqual(@as(usize, 2), checkpoint.consumed_provider_attempts);
     try std.testing.expect(!checkpoint.outstanding_reservation);
+    const final = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(types.ModelRecoveryAction.delivering_response, final.action);
+    try std.testing.expectEqual(@as(usize, 2), final.consumed_provider_attempts);
     try expectRouteStatus(
         &hooks,
         0,

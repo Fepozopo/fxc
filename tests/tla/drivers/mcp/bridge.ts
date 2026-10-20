@@ -3,7 +3,7 @@
 // Turns a JSONL step trace into a generated TLA+ module (TraceObs) and asks TLC
 // whether it is a behavior of the machine's model, using a hand-written trace
 // wrapper that EXTENDS the model and TraceObs. Acceptance uses the sentinel
-// technique from sessions-v2: the wrapper's NotDone invariant is violated only
+// technique of the session manager's drivers: the wrapper's NotDone invariant is violated only
 // once every observed step has been matched, and the matched count must equal
 // the trace length.
 //

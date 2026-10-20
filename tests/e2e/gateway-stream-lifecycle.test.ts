@@ -31,6 +31,7 @@ import {
   type GatewayRequest,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -71,8 +72,9 @@ function createFixtureRoot(label: string): FixtureRoot {
   return { root, home, workspace: realpathSync(workspace) };
 }
 
-for (const action of ["run", "message"] as const) for (const stop of [false, true]) {
-  test(`subagent steering responds before ${action} finishes, stop=${stop}`, async () => {
+// `sessions.test.ts` covers steering a child that finishes; this one stops it.
+for (const action of ["run", "message"] as const) {
+  test(`subagent steering responds before ${action} finishes, and a stop cancels the child`, async () => {
     const root = createFixtureRoot("subagent-steering");
     const held = heldFakeGatewayFinalText();
     const parentReply = heldFakeGatewayFinalText();
@@ -117,17 +119,9 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
         },
       })), { headers: parentReply.response.headers });
     }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
-    const registry = () => {
-      const sessions = join(root.home, ".fx/sessions");
-      for (const id of readdirSync(sessions)) {
-        const path = join(sessions, id, "subagent/children.json");
-        if (existsSync(path)) {
-          const value = JSON.parse(readFileSync(path, "utf8"));
-          if (value.children.length) return { id, value };
-        }
-      }
-      throw new Error("child registry unavailable");
-    };
+    // The parent's log records its child's work.
+    const parent = () => rootSessionIds(root.home)[0]!;
+    const work = () => childWork(root.home, parent());
     let tui: TmuxSession | undefined;
     try {
       tui = await TmuxSession.create({
@@ -145,15 +139,15 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.waitForStableComposer(15000);
       await tui.sendText("STEERING_START");
       await tui.waitForPane(() => childRequests === 1, 10000);
-      const original = registry().value.children[0];
+      await tui.waitForPane(() => work().spawns === 1, 10000);
+      const original = work();
       await tui.sendText("STEERING_FIRST");
       const streaming = await tui.waitForText("FIRST_STREAMING", 10000);
       expect(activity(streaming)).toMatch(/^Generating \(/);
       // Keep the parent stream open without more text after the visible prefix drains.
       await Bun.sleep(300);
       expect(activity(await tui.capturePane())).toMatch(/^Generating \(/);
-      expect(registry().value.children[0].phase).toBe("running");
-      expect(registry().value.children[0].last_outcome).toBeNull();
+      expect(work().outcome).toBeNull();
       parentReply.release("FIRST_ACCEPTED");
       await tui.waitForText("FIRST_ACCEPTED", 10000);
       await tui.waitForPane(pane => activity(pane).startsWith("Running ("), 10000);
@@ -161,21 +155,12 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.waitForText("SECOND_ACCEPTED", 10000);
       await tui.waitForPane(pane => activity(pane).startsWith("Running ("), 10000);
       expect(childRequests).toBe(1);
-      const pending = registry().value.children[0];
-      expect(pending.id).toBe(original.id);
-      expect(pending.active.id).toBe(original.active.id);
-      expect(requests.some(raw => raw.includes(original.id) && raw.includes(original.active.id))).toBe(true);
-      expect(pending.phase).toBe("running");
-      expect(pending.last_outcome).toBeNull();
+      // Still the one piece of work, still running.
+      expect(work()).toEqual(original);
+      expect(requests.some(raw => raw.includes(original.child!) && raw.includes(original.work!))).toBe(true);
       expect(await tui.captureFullScrollback()).toContain("still running");
-      if (stop) {
-        await tui.sendInterruptEscapePair(10000);
-        await tui.waitForPane(() => registry().value.children[0].last_outcome === "cancelled", 10000);
-      } else {
-        held.release("HELD_CHILD_RESULT");
-        await tui.waitForText("CHILD_COMPLETE", 10000);
-        expect(requests.filter(raw => raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
-      }
+      await tui.sendInterruptEscapePair(10000);
+      await tui.waitForPane(() => work().outcome === "cancelled", 10000);
       await tui.waitForStableComposer(10000);
       await tui.sendText("STEERING_LATER");
       await tui.waitForText("LATER_OK", 10000);
@@ -184,15 +169,16 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
       expect(tui.paneStatus().status).toBe(0);
       expect(readFileSync(join(root.root, "stderr.log"), "utf8")).toBe("");
-      const events = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8");
-      const frames = events.trim().split("\n").map(line => JSON.parse(line));
-      // The saved turn keeps what the user typed while the child ran, whether
-      // the turn finished or was cancelled.
-      expect(events.split("STEERING_FIRST").length - 1).toBe(1);
-      expect(frames.filter(frame => frame.event?.tool_result?.call_id === "steering-delegation")).toHaveLength(1);
+      // The cancelled turn keeps what the user typed while the child ran, and
+      // one result for the delegation.
+      const saved = await savedSession(root.home, parent());
+      expect(JSON.stringify(saved.history).split("STEERING_FIRST").length - 1).toBe(1);
+      const results = logLines(root.home, parent()).filter((line: any) =>
+        line.kind === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-delegation"));
+      expect(results).toHaveLength(1);
       const trace = readFileSync(join(root.root, "trace.log"), "utf8");
       expect(trace).toContain("event=steering_wait_yielded ");
-      expect(trace.split("\n").filter(line => line.includes("event=steering_result_delivered "))).toHaveLength(stop ? 0 : 1);
+      expect(trace.split("\n").filter(line => line.includes("event=steering_result_delivered "))).toHaveLength(0);
     } finally {
       parentReply.dispose();
       held.dispose();
@@ -209,19 +195,15 @@ function compactionIdle(pane: string): boolean {
   return hasEmptyComposer(pane) && !COMPACTION_ACTIVITY.test(pane);
 }
 
-function compactionEventsPath(root: FixtureRoot): string {
-  const sessionsRoot = join(root.home, ".fx", "sessions");
-  const parents = readdirSync(sessionsRoot).filter((id) => {
-    const path = join(sessionsRoot, id, "session.json");
-    return existsSync(path) && !JSON.parse(readFileSync(path, "utf8")).subagent_child;
-  });
-  expect(parents).toHaveLength(1);
-  return join(sessionsRoot, parents[0]!, "events.jsonl");
+/// The one root session's log, whose `compacted` lines are its compactions.
+function compactionLogPath(root: FixtureRoot): string {
+  const roots = rootSessionIds(root.home);
+  expect(roots).toHaveLength(1);
+  return join(sessionDir(root.home, roots[0]!), "log.jsonl");
 }
 
-function checkpointCount(events: string): number {
-  return events.split("\n").slice(0, -1)
-    .filter((line) => JSON.parse(line).event?.context_checkpoint).length;
+function compactionCount(log: string): number {
+  return log.split("\n").slice(0, -1).filter((line) => JSON.parse(line).kind === "compacted").length;
 }
 
 // Automatic compaction first asks right after the conversation, which keeps
@@ -241,18 +223,18 @@ function isSummaryRequest(body: string): boolean {
 }
 
 async function compactAndWait(tui: TmuxSession, root: FixtureRoot, timeoutMs: number) {
-  const eventsPath = compactionEventsPath(root);
+  const eventsPath = compactionLogPath(root);
   const before = readFileSync(eventsPath, "utf8");
-  const checkpoints = checkpointCount(before);
+  const checkpoints = compactionCount(before);
   await tui.sendText("/compact");
   const pane = await tui.waitForPane(
     (text) => compactionIdle(text) &&
-      checkpointCount(readFileSync(eventsPath, "utf8")) === checkpoints + 1,
+      compactionCount(readFileSync(eventsPath, "utf8")) === checkpoints + 1,
     timeoutMs,
   );
   const after = readFileSync(eventsPath, "utf8");
   expect(after.startsWith(before)).toBe(true);
-  expect(checkpointCount(after)).toBe(checkpoints + 1);
+  expect(compactionCount(after)).toBe(checkpoints + 1);
   expect(pane).not.toContain("request failed:");
   expect(pane).not.toContain("Compaction failed.");
 }
@@ -918,7 +900,9 @@ describe("gateway stream lifecycle", () => {
       expect(restored.code).toBe(0);
       expect(parseAskJson(restored.stdout).tool_calls).toEqual([]);
       expect(gateway.requestCount()).toBe(4);
-      const resultDirectory = join(root.home, ".fx", "sessions", output.session_id, "tool-results");
+      // The main document's body is one blob; without it the resume says the
+      // content is unavailable.
+      const resultDirectory = join(sessionDir(root.home, output.session_id), "blobs");
       const mainArtifacts = readdirSync(resultDirectory).filter((name) =>
         readFileSync(join(resultDirectory, name), "utf8").includes("MAIN_RESOURCE_TAIL"));
       expect(mainArtifacts).toHaveLength(1);
@@ -1307,6 +1291,7 @@ describe("gateway stream lifecycle", () => {
       expect(json.error).toBeUndefined();
       expect(json.output).toContain("Memory removal verified.");
       expect(json.tool_calls).toEqual([
+        { name: "memory", status: "error" },
         { name: "read_file", status: "success" },
       ]);
       expect(gateway.requestCount()).toBe(3);
@@ -2913,11 +2898,7 @@ describe("gateway stream lifecycle", () => {
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      const sessionsDirectory = join(root.home, ".fx", "sessions");
-      const sessionIds = readdirSync(sessionsDirectory, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
-      expect(sessionIds).toHaveLength(1);
-      const resultsDirectory = join(sessionsDirectory, sessionIds[0]!, "tool-results");
+      const resultsDirectory = join(sessionDir(root.home, onlySessionId(root.home)), "blobs");
       const mainArtifacts = readdirSync(resultsDirectory).filter((name) =>
         readFileSync(join(resultsDirectory, name), "utf8").includes("MAIN_LABEL_BODY"));
       expect(mainArtifacts).toHaveLength(1);
@@ -3963,14 +3944,8 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests[1].body).toContain("REPLAY_CALL_ITEM");
       expect(gateway.requests[1].body).toContain("REPLAY_TOOL_RESULT");
       expect(firstJson.session_id).toMatch(/^[A-Za-z0-9_-]{12}$/);
-      const eventsPath = join(
-        root.home,
-        ".fx",
-        "sessions",
-        firstJson.session_id,
-        "events.jsonl",
-      );
-      const eventsBeforeResume = readFileSync(eventsPath).byteLength;
+      const logPath = join(sessionDir(root.home, firstJson.session_id), "log.jsonl");
+      const logBeforeResume = readFileSync(logPath);
 
       const resumed = await runFx(
         [
@@ -4007,16 +3982,12 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests[2].body).toContain("REPLAY_TOOL_RESULT");
       expect(resumedJson.tool_calls).toEqual([]);
 
-      const appendedEvents = readFileSync(eventsPath)
-        .subarray(eventsBeforeResume)
-        .toString("utf8")
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as { event: Record<string, unknown> });
-      const appendedKinds = appendedEvents.map((event) => Object.keys(event.event)[0]);
-      expect(appendedKinds).toContain("turn_completed");
-      expect(appendedKinds).not.toContain("state_replacement_started");
+      // The resume appends its turn and rewrites nothing before it.
+      const logAfterResume = readFileSync(logPath);
+      expect(logAfterResume.subarray(0, logBeforeResume.length)).toEqual(logBeforeResume);
+      const appendedKinds = logAfterResume.subarray(logBeforeResume.length).toString("utf8")
+        .trim().split("\n").map((line) => JSON.parse(line).kind);
+      expect(appendedKinds).toContain("turn_committed");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4026,17 +3997,12 @@ describe("gateway stream lifecycle", () => {
   test("saved ask replays standalone assistant replies without joining their metadata", async () => {
     for (const withReplay of [false, true]) {
       const root = createFixtureRoot(`standalone-replies-${withReplay}`);
-      const replies = [fakeGatewayFinalText("Seed reply."), fakeGatewayFinalText("Resumed reply.")];
+      const replies = [fakeGatewayFinalText("Resumed reply.")];
       const gateway = startGateway(() => replies.shift() ?? new Response("unexpected request", { status: 500 }));
       try {
-        const seeded = await runFx(["ask", "--json", "--auto", "Seed a conversation."], {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, join(root.root, "seed.log")),
-          timeoutMs: 15_000,
-        });
-        expect(seeded.code).toBe(0);
-        expect(seeded.stderr).toBe("");
-        const seed = parseAskJson(seeded.stdout);
+        // A session an older fx saved, its replies rewritten as standalone
+        // ones; the resume converts it.
+        const seed = { session_id: copyV1Fixture(root.home, "plain")[0]! };
         const path = join(root.home, ".fx", "sessions", seed.session_id, "events.jsonl");
         const events = readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
         const user = events.find((event) => event.event.user);
@@ -4070,8 +4036,8 @@ describe("gateway stream lifecycle", () => {
         expect(result.session_id).toBe(seed.session_id);
         expect(result.final_output).toBe("Resumed reply.");
         expect(result.tool_calls).toEqual([]);
-        expect(gateway.requests).toHaveLength(2);
-        const prompt = JSON.parse(gateway.requests[1].body).prompt as PromptMessage[];
+        expect(gateway.requests).toHaveLength(1);
+        const prompt = JSON.parse(gateway.requests[0].body).prompt as PromptMessage[];
         const assistants = prompt.filter((message) => message.role === "assistant");
         expect(assistants.map((message) => contentText(message.content))).toEqual([first, last]);
         if (withReplay) {
@@ -4096,7 +4062,7 @@ describe("gateway stream lifecycle", () => {
             expect(pane).not.toContain("REPLAY_SIGNATURE");
             expect(hasEmptyComposer(pane)).toBe(true);
             expect(readFileSync(stderrPath, "utf8")).toBe("");
-            expect(gateway.requests).toHaveLength(2);
+            expect(gateway.requests).toHaveLength(1);
           } finally {
             await tui.kill();
           }
@@ -4194,21 +4160,6 @@ describe("gateway stream lifecycle", () => {
       const firstJson = parseAskJson(first.stdout) as ReturnType<typeof parseAskJson> & {
         session_id: string;
       };
-      const sessionPath = join(
-        root.home,
-        ".fx",
-        "sessions",
-        firstJson.session_id,
-        "session.json",
-      );
-      const eventsPath = join(
-        root.home,
-        ".fx",
-        "sessions",
-        firstJson.session_id,
-        "events.jsonl",
-      );
-
       expect(first.code).toBe(0);
       expect(first.stderr).toBe("");
       expect(firstJson.output).toContain(accepted);
@@ -4221,8 +4172,8 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests[1]!.body).toContain(
         "The previous candidate used a different language",
       );
-      expect(readFileSync(sessionPath, "utf8")).not.toContain(rejected);
-      expect(readFileSync(eventsPath, "utf8")).not.toContain(rejected);
+      // Nothing the session saved holds the rejected reply.
+      expect(savedText(root.home, firstJson.session_id)).not.toContain(rejected);
 
       const resumed = await runFx(
         [
@@ -4299,10 +4250,12 @@ describe("gateway stream lifecycle", () => {
             expect(result.final_output).toBe("The notes were read.");
             expect(result.tool_calls.filter((call) => call.name === "read_file")).toEqual([{ name: "read_file", status: "success" }]);
             expect(gateway.requestCount()).toBe(2);
-            const eventsPath = join(root.home, ".fx", "sessions", result.session_id, "events.jsonl");
-            const originalEvents = readFileSync(eventsPath, "utf8");
-            expect(originalEvents).toContain("removed_call");
-            if (metadata) expect(originalEvents).toContain("removed-signature");
+            // The saved turn keeps the call the request leaves out.
+            const logPath = join(sessionDir(root.home, result.session_id), "log.jsonl");
+            const originalLog = readFileSync(logPath, "utf8");
+            const kept = savedText(root.home, result.session_id);
+            expect(kept).toContain("removed_call");
+            if (metadata) expect(kept).toContain("removed-signature");
             const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Confirm the saved result without running tools."], {
               cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
             });
@@ -4310,7 +4263,7 @@ describe("gateway stream lifecycle", () => {
             expect(resumed.stderr).toBe("");
             expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
             expect(gateway.requestCount()).toBe(3);
-            expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+            expect(readFileSync(logPath, "utf8").startsWith(originalLog)).toBe(true);
             for (const request of gateway.requests.slice(1)) {
               const prompt = gatewayRequest(request.body).prompt;
               const callIndex = prompt.findIndex((message) => Array.isArray(message.content) && message.content.some((part) => part.type === "tool-call" && part.toolCallId === "retained_call"));
@@ -4358,8 +4311,8 @@ describe("gateway stream lifecycle", () => {
       });
       expect(first.code).toBe(0);
       const sessionId = parseAskJson(first.stdout).session_id;
-      const eventsPath = join(root.home, ".fx", "sessions", sessionId, "events.jsonl");
-      const originalEvents = readFileSync(eventsPath, "utf8");
+      const logPath = join(sessionDir(root.home, sessionId), "log.jsonl");
+      const originalLog = readFileSync(logPath, "utf8");
       const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Exercise the second fixture."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
@@ -4373,7 +4326,7 @@ describe("gateway stream lifecycle", () => {
       expect(resumed.stderr).toBe("");
       expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
       expect(gateway.requestCount()).toBe(5);
-      expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
+      expect(readFileSync(logPath, "utf8").startsWith(originalLog)).toBe(true);
       for (const request of gateway.requests.slice(3)) {
         const parts = gatewayRequest(request.body).prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
         const calls = parts.filter((part) => part.type === "tool-call" && part.toolCallId === "reused");
@@ -4424,33 +4377,20 @@ describe("gateway stream lifecycle", () => {
       const firstJson = parseAskJson(first.stdout) as ReturnType<typeof parseAskJson> & {
         session_id: string;
       };
-      const sessionPath = join(
-        root.home,
-        ".fx",
-        "sessions",
-        firstJson.session_id,
-        "session.json",
-      );
-      const eventsPath = join(
-        root.home,
-        ".fx",
-        "sessions",
-        firstJson.session_id,
-        "events.jsonl",
-      );
-
       expect(first.code).toBe(0);
       expect(first.stderr).toBe("");
       expect(firstJson.session_id.length).toBeGreaterThan(0);
       expect(gateway.requestCount()).toBe(2);
       expect(existsSync(sideEffectPath)).toBe(false);
-      expect(existsSync(sessionPath)).toBe(true);
-      expect(existsSync(eventsPath)).toBe(true);
-      const savedEvents = readFileSync(eventsPath, "utf8");
-      expect(savedEvents).toContain('"arguments_json":"{}"');
-      expect(savedEvents).toContain("tool_execution_failed");
-      expect(savedEvents).not.toContain(malformedArguments);
-      expect(savedEvents).not.toContain("malformed_json");
+      // The saved call has empty arguments and a failed result, and nothing
+      // saved keeps the malformed text.
+      const history = (await savedSession(root.home, firstJson.session_id)).history;
+      const call = history.flatMap((turn) => turn.execution?.tool_steps ?? []).flatMap((step: any) => step.tool_calls).find((entry: any) => entry.id === callId);
+      expect(call?.arguments_json).toBe("{}");
+      expect(savedToolResults(history).find((entry) => entry.tool_call_id === callId)?.output).toContain("tool_execution_failed");
+      const kept = savedText(root.home, firstJson.session_id);
+      expect(kept).not.toContain(malformedArguments);
+      expect(kept).not.toContain("malformed_json");
 
       const resumed = await runFx(
         [
@@ -4514,9 +4454,10 @@ describe("gateway stream lifecycle", () => {
         "event=argument_integrity_rejected",
       );
 
-      const resumedEvents = readFileSync(eventsPath, "utf8");
-      expect(resumedEvents).not.toContain(malformedArguments);
-      expect(resumedEvents).toContain("tool_execution_failed");
+      // After the resume, still nothing saved keeps the malformed text.
+      expect(savedText(root.home, firstJson.session_id)).not.toContain(malformedArguments);
+      expect(savedToolResults((await savedSession(root.home, firstJson.session_id)).history)
+        .find((entry) => entry.tool_call_id === callId)?.output).toContain("tool_execution_failed");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4879,7 +4820,6 @@ describe("gateway stream lifecycle", () => {
         },
       );
       const json = parseAskJson(result.stdout);
-      const sessionRoot = join(root.home, ".fx", "sessions", json.session_id);
 
       expect(result.code).toBe(0);
       expect(json.error).toBeUndefined();
@@ -4891,8 +4831,11 @@ describe("gateway stream lifecycle", () => {
         status: "success",
       });
       expect(json.tool_calls.filter((call) => call.name === "read_tool_result")).toHaveLength(2);
-      expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
-      const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      // The canonical handle names one of the session's blobs.
+      const hash = /-([a-f0-9]{64})\.txt$/.exec(canonicalHandle)?.[1];
+      expect(hash).toBeDefined();
+      expect(existsSync(join(sessionDir(root.home, json.session_id), "blobs", hash!))).toBe(true);
+      const sessionEvents = savedText(root.home, json.session_id);
       expect(sessionEvents).toContain(suffixlessHandle);
       expect(sessionEvents).toContain(canonicalHandle);
       expect(sessionEvents).toContain(needle);
@@ -6106,12 +6049,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       });
       expect(latest.code).toBe(0);
       const sessionId = JSON.parse(latest.stdout).id as string;
-      const sessionRoot = join(root.home, ".fx", "sessions", sessionId);
-      expect(
-        readdirSync(join(sessionRoot, "logs", "commands")).filter((name) =>
-          name.endsWith(".bin")
-        ),
-      ).toHaveLength(1);
+      // One command replay, kept as a blob of the session.
+      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{64}\.bin/g) ?? []);
+      expect(replays.size).toBe(1);
+      const replayHash = /([a-f0-9]{64})\.bin$/.exec([...replays][0]!)![1]!;
+      expect(existsSync(join(sessionDir(root.home, sessionId), "blobs", replayHash))).toBe(true);
 
       phase = "resume";
       const resumed = await runFx(
@@ -6494,18 +6436,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
           expect(latest.code).toBe(0);
           const sessionId = JSON.parse(latest.stdout).id;
-          const sessionDir = join(root.home, ".fx", "sessions", sessionId);
-          const toolResults = join(sessionDir, "tool-results");
-          // The clipped page keeps its whole copy on disk.
-          const snapshotHandle = readdirSync(toolResults).find((name) => /^result-read_tool_result-[a-f0-9-]+\.txt$/.test(name)) ?? "";
-          expect(snapshotHandle).not.toBe("");
-          const snapshot = readFileSync(join(toolResults, snapshotHandle), "utf8");
-          expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
-          expect(snapshot).toContain(token);
-          expect(snapshot).toContain(tail);
-          expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
+          // The clipped page keeps its whole copy as one of the session's blobs,
+          // beside the command's own output, and the session names it.
+          const blobs = join(sessionDir(root.home, sessionId), "blobs");
+          const pages = readdirSync(blobs)
+            .filter((hash) => !sourceHandle.includes(hash))
+            .map((hash) => ({ hash, body: readFileSync(join(blobs, hash), "utf8") }))
+            .filter((page) => Buffer.byteLength(page.body) > 65536 && page.body.includes(token) && page.body.includes(tail));
+          expect(pages).toHaveLength(1);
+          expect(savedText(root.home, sessionId)).toContain(pages[0]!.hash);
           // The compacted command is saved as T1 with the handle of its whole output.
-          expect(readFileSync(join(toolResults, "compacted-T1.txt"), "utf8")).toContain(sourceHandle);
+          expect(readFileSync(compactionRecordPath(root.home, sessionId, "compacted-T1.txt")!, "utf8")).toContain(sourceHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           // Compaction folded the command into T1, so the read has no call
@@ -6614,14 +6555,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           },
         );
         expect(beforeResume.code).toBe(0);
-        const sessionsRoot = join(root.home, ".fx", "sessions");
-        const sessionFiles = readdirSync(join(sessionsRoot, sessionId));
-        expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(4);
-        expect(sessionFiles).not.toContain("checkpoint.json");
-        expect(sessionFiles).not.toContain("display.json");
-        expect(sessionFiles).not.toContain("recovery.json");
-        expect(readdirSync(sessionsRoot)).not.toContain("index.json");
-        expect(readdirSync(sessionsRoot)).not.toContain("latest.lock");
+        // Nothing outside the store.
+        expect(readdirSync(join(root.home, ".fx", "sessions"))).toEqual(["v2"]);
         const canonical = JSON.parse(beforeResume.stdout) as {
           history_len: number;
           history: Array<{
@@ -6775,7 +6710,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(secondSummary).toContain("The user sent two sentinel prompts and restarted fx.");
         // The first compaction, its notes included, is saved whole as L1.
         expect(secondSummary).not.toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
-        const firstLedger = readFileSync(join(root.home, ".fx", "sessions", sessionId, "tool-results", "compacted-L1.txt"), "utf8");
+        const firstLedger = readFileSync(compactionRecordPath(root.home, sessionId, "compacted-L1.txt")!, "utf8");
         expect(firstLedger).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(firstLedger).toContain("Continue the compacted session.");
       } finally {
@@ -6851,15 +6786,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(gateway.requests).toHaveLength(2);
           await tui.sendKeys("C-c");
           await tui.waitForPane((pane) => pane.includes("cancelled") && hasEmptyComposer(pane), 15000);
-          const sessionsRoot = join(root.home, ".fx", "sessions");
-          const sessionId = readdirSync(sessionsRoot).find((id) => {
-            const path = join(sessionsRoot, id, "session.json");
-            return existsSync(path) && !JSON.parse(readFileSync(path, "utf8")).subagent_child;
-          });
-          expect(sessionId).toBeString();
-          const sessionDir = join(sessionsRoot, sessionId!);
-          const eventsPath = join(sessionDir, "events.jsonl");
-          const before = readFileSync(eventsPath, "utf8");
+          const roots = rootSessionIds(root.home);
+          expect(roots).toHaveLength(1);
+          const sessionId = roots[0]!;
+          const logPath = join(sessionDir(root.home, sessionId), "log.jsonl");
+          const before = readFileSync(logPath, "utf8");
           expect(before).toContain('"reason":"cancelled"');
           await tui.sendText("Read the follow-up file and briefly acknowledge it. Do not rerun the child.");
           const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("CANCEL_FOLLOWUP_COMPLETE") || text.includes("request failed:")), 20000);
@@ -6870,10 +6801,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           }
           expect(compactions).toBe(1);
           expect(gateway.requests).toHaveLength(5);
-          const saved = readFileSync(eventsPath, "utf8");
+          const saved = readFileSync(logPath, "utf8");
           expect(saved.startsWith(before)).toBe(true);
-          expect(saved.match(/"context_checkpoint":/g)).toHaveLength(1);
-          const savedTool = readFileSync(join(sessionDir, "tool-results", `compacted-${diagnosticHandle}.txt`), "utf8");
+          expect(compactionCount(saved)).toBe(1);
+          const savedTool = readFileSync(compactionRecordPath(root.home, sessionId, `compacted-${diagnosticHandle}.txt`)!, "utf8");
           expect(savedTool.startsWith("T1 subagent: run Wait for further input without tools.\n")).toBe(true);
           expect(savedTool).toContain("\nResult:\naborted by user\n");
           expect(await tui.captureFullScrollback()).not.toContain("IncompleteCompactionResult");
@@ -6886,10 +6817,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           await tui.sendText("Continue without repeating cancelled work.");
           await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("CANCEL_RESTART_COMPLETE"), 15000);
           expect(gateway.requests).toHaveLength(6);
-          const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
-          expect(events.filter((event) => event.tool_call?.call_id === "cancelled-history-child")).toHaveLength(1);
-          expect(events.filter((event) => event.tool_call?.call_id === "cancel-follow-up-read")).toHaveLength(1);
-          expect(events.some((event) => event.assistant?.text === "CANCEL_RESTART_COMPLETE")).toBe(true);
+          const history = (await savedSession(root.home, sessionId)).history;
+          const calls = savedToolCallIds(history);
+          expect(calls.filter((id) => id === "cancelled-history-child")).toHaveLength(1);
+          expect(calls.filter((id) => id === "cancel-follow-up-read")).toHaveLength(1);
+          expect(history.some((turn) => turn.assistant === "CANCEL_RESTART_COMPLETE")).toBe(true);
           await tui.sendText("/quit");
           await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
           expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -6951,9 +6883,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           15_000,
         );
 
-        const eventsPath = compactionEventsPath(root);
+        const eventsPath = compactionLogPath(root);
         const originalHistory = readFileSync(eventsPath, "utf8");
-        expect(checkpointCount(originalHistory)).toBe(0);
+        expect(compactionCount(originalHistory)).toBe(0);
         await tui.sendText("/compact");
         const requestDeadline = Date.now() + 15_000;
         while (gateway.requests.length < 4) {
@@ -7009,7 +6941,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(followUpRequest).not.toContain("compacted_conversation");
         const beforeFailure = readFileSync(eventsPath, "utf8");
         expect(beforeFailure.startsWith(originalHistory)).toBe(true);
-        expect(checkpointCount(beforeFailure)).toBe(0);
+        expect(compactionCount(beforeFailure)).toBe(0);
         expect(readFileSync(tracePath, "utf8")).not.toContain(
           "[context_compaction] event=installed",
         );
@@ -7967,32 +7899,36 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("ask continues and persists a healthy parent when child recovery is unavailable", async () => {
+  test("ask continues and persists a healthy parent when its child's session is gone", async () => {
     const root = createFixtureRoot("subagent-recovery-unavailable");
     const tracePath = join(root.root, "trace.log");
-    const replies = ["PARENT_SEED_SENTINEL", "PARENT_CONTINUATION_SAVED", "PARENT_REOPENED"];
-    let requestIndex = 0;
+    let phase = 0;
     const gateway = startDynamicFakeGateway((body) => {
-      if (requestIndex > 0) expect(body).toContain(replies[0]);
-      if (requestIndex === 2) expect(body).toContain(replies[1]);
-      return fakeGatewayFinalText(replies[requestIndex++] ?? "UNEXPECTED_REQUEST");
-    });
+      if (!body.includes('"name":"subagent"')) return fakeGatewayFinalText("CHILD_SEED_DONE");
+      if (phase === 0) {
+        return body.includes("CHILD_SEED_DONE")
+          ? fakeGatewayFinalText("PARENT_SEED_SENTINEL")
+          : fakeGatewayToolCall("seed-delegate", "subagent", { request: { action: "message", agent: "worker", message: "Do the seed work." } });
+      }
+      expect(body).toContain("PARENT_SEED_SENTINEL");
+      if (phase === 2) expect(body).toContain("PARENT_CONTINUATION_SAVED");
+      return fakeGatewayFinalText(phase === 1 ? "PARENT_CONTINUATION_SAVED" : "PARENT_REOPENED");
+    }, { classifierDecision: "clear" });
     const env = { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "subagent,session" };
     try {
-      const seeded = await runFx(["ask", "--json", "Start a saved conversation."], {
+      const seeded = await runFx(["ask", "--json", "--auto", "Start a saved conversation with a worker."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
       expect(seeded.code).toBe(0);
       const id = parseAskJson(seeded.stdout).session_id;
       expect(id).not.toBe("");
-      const directory = join(root.home, ".fx", "sessions", id);
-      const eventsPath = join(directory, "events.jsonl");
-      const originalEvents = readFileSync(eventsPath, "utf8");
-      const childDirectory = join(directory, "subagent");
-      mkdirSync(childDirectory, { recursive: true, mode: 0o700 });
-      const registryPath = join(childDirectory, "children.json");
-      writeFileSync(registryPath, "[]", { mode: 0o600 });
+      // The child's own session is gone, so nothing of it can come back.
+      const child = childWork(root.home, id).child;
+      rmSync(sessionDir(root.home, child), { recursive: true, force: true });
+      const logPath = join(sessionDir(root.home, id), "log.jsonl");
+      const originalLog = readFileSync(logPath, "utf8");
 
+      phase = 1;
       const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without delegation."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
@@ -8000,25 +7936,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(resumed.stderr).toBe("");
       const result = parseAskJson(resumed.stdout);
       expect(result.session_id).toBe(id);
-      expect(result.final_output).toBe(replies[1]);
+      expect(result.final_output).toBe("PARENT_CONTINUATION_SAVED");
       expect(result.tool_calls).toEqual([]);
-      expect(gateway.requests).toHaveLength(2);
-      const continuedEvents = readFileSync(eventsPath, "utf8");
-      expect(continuedEvents.startsWith(originalEvents)).toBe(true);
-      expect(continuedEvents).toContain(replies[1]);
-      expect(continuedEvents.trim().split("\n").map(line => JSON.parse(line)).filter(frame => frame.event.turn_completed)).toHaveLength(2);
-      expect(readFileSync(registryPath, "utf8")).toBe("[]");
-      expect(readFileSync(tracePath, "utf8")).toContain("ask subagent host unavailable");
+      expect(readFileSync(logPath, "utf8").startsWith(originalLog)).toBe(true);
+      expect((await savedSession(root.home, id)).history.map((turn) => turn.assistant))
+        .toEqual(["PARENT_SEED_SENTINEL", "PARENT_CONTINUATION_SAVED"]);
+      expect(readFileSync(tracePath, "utf8")).toContain(`child_id=${child} reason=session_load_failed error=NotFound`);
 
+      phase = 2;
       const reopened = await runFx(["ask", "--json", "--resume-id", id, "Continue again without delegation."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
       expect(reopened.code).toBe(0);
       expect(reopened.stderr).toBe("");
       expect(parseAskJson(reopened.stdout).session_id).toBe(id);
-      expect(parseAskJson(reopened.stdout).final_output).toBe(replies[2]);
-      expect(gateway.requests).toHaveLength(3);
-      expect(readFileSync(registryPath, "utf8")).toBe("[]");
+      expect(parseAskJson(reopened.stdout).final_output).toBe("PARENT_REOPENED");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -8293,18 +8225,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const childTask = "Write the effect once, then read it.";
     const nextTask = "Reply CHILD_RECOVERED without tools.";
     let childRequests = 0;
-    let childId = "";
-    let registryPath = "";
-    let recoveryPath = "";
+    let parentId = "";
+    let childBlobs = "";
     let failureObserved = false;
     const scripted = startDynamicFakeGateway((body) => {
       if (hasCurrentToolResult(body, "followup")) {
         const result = JSON.parse(toolResultOutput(body, "followup"));
         expect(result).toEqual({ ok: true, result: "CHILD_RECOVERED", error_code: null });
-        const registry = JSON.parse(readFileSync(registryPath, "utf8"));
-        const child = registry.children.find((entry: { id: string }) => entry.id === childId);
-        expect(child.last_outcome).toBe("completed");
-        expect(child.last_failure).toBeNull();
+        expect(childWork(root.home, parentId).outcome).toBe("ok");
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
         return fakeGatewayFinalText("SUBAGENT_FAILURE_REPORTED");
       }
@@ -8312,19 +8240,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const result = JSON.parse(toolResultOutput(body, "delegate"));
         expect(result.ok).toBe(false);
         expect(result.error_code).toBe("child_failed");
-        expect(result.result).toContain("SessionCommitFailed");
+        expect(result.result).toContain("agent_turn_failed: AccessDenied");
         expect(result.result).toContain("agent_turn_failed");
         expect(result.result).toContain("Earlier tool calls may have completed");
         expect(childRequests).toBe(2);
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
-        const registry = JSON.parse(readFileSync(registryPath, "utf8"));
-        expect(registry.schema_version).toBe(2);
-        const child = registry.children.find((entry: { id: string }) => entry.id === childId);
-        expect(child.phase).toBe("idle");
-        expect(child.active).toBeNull();
-        expect(child.last_failure).toContain("SessionCommitFailed");
+        // The parent's log records the child's work failed, with its cause.
+        expect(childWork(root.home, parentId).outcome).toBe("failed");
+        expect(JSON.stringify(childLines(root.home, parentId).at(-1).data)).toContain("AccessDenied");
         failureObserved = true;
-        rmSync(recoveryPath, { recursive: true });
+        chmodSync(childBlobs, 0o700);
         return fakeGatewayToolCall("followup", "subagent", {
           request: { action: "message", agent: "reporter", message: nextTask },
         });
@@ -8334,14 +8259,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequests++;
         if (hasCurrentToolResult(body, "child_effect")) {
           expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
-          const sessions = join(root.home, ".fx", "sessions");
-          childId = readdirSync(sessions).find((id) => existsSync(join(sessions, id, "subagent", "owner.json")))!;
-          expect(childId).toBeTruthy();
-          const owner = JSON.parse(readFileSync(join(sessions, childId, "subagent", "owner.json"), "utf8"));
-          registryPath = join(sessions, owner.parent_id, "subagent", "children.json");
-          recoveryPath = join(sessions, childId, "recovery.json");
-          if (existsSync(recoveryPath)) renameSync(recoveryPath, `${recoveryPath}.saved`);
-          mkdirSync(recoveryPath);
+          // The child's next tool result needs a new blob, which a read-only
+          // blobs folder refuses, so the child's turn fails after its effect
+          // and reports that cause.
+          parentId = rootSessionIds(root.home)[0]!;
+          childBlobs = join(sessionDir(root.home, childWork(root.home, parentId).child), "blobs");
+          chmodSync(childBlobs, 0o500);
           return fakeGatewayToolCall("read_effect", "read_file", { path: marker });
         }
         return fakeShellRun("child_effect", "printf 'EFFECT_ONCE\\n' >> effect.txt");
@@ -8359,11 +8282,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(failureObserved).toBe(true);
       expect(parseAskJson(result.stdout).output).toContain("SUBAGENT_FAILURE_REPORTED");
-      const events = readFileSync(join(root.home, ".fx", "sessions", parseAskJson(result.stdout).session_id, "events.jsonl"), "utf8")
-        .trim().split("\n").map((line) => JSON.parse(line));
-      const persisted = events.find((entry) => entry.event.tool_result?.call_id === "delegate")?.event.tool_result;
+      const history = (await savedSession(root.home, parseAskJson(result.stdout).session_id)).history;
+      const persisted = savedToolResults(history).find((entry) => entry.tool_call_id === "delegate");
       expect(persisted?.status).toBe("failure");
-      expect(persisted?.preview).toContain("agent_turn_failed: SessionCommitFailed");
+      expect(persisted?.preview).toContain("agent_turn_failed: AccessDenied");
       expect(scripted.requestCount()).toBe(6);
       expect(result.stderr).not.toContain("panic");
     } finally {
@@ -8380,13 +8302,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const marker = join(root.workspace, "effect.txt");
     const task = "SUBAGENT_HTTP_OUTCOME: perform the prepared task once.";
     const followupTask = "SUBAGENT_HTTP_RECOVERY: reply CHILD_RECOVERED without tools.";
-    type Child = { id: string; phase: string; active: unknown; last_outcome: string; last_failure: string | null };
     let failed: { ok: boolean; result: string | null; error_code: string | null } | undefined;
     let recovered: typeof failed;
-    let failedChild: Child | undefined;
+    let parentId = "";
+    let failedWork: ReturnType<typeof childWork> | undefined;
+    let failedCause = "";
     let childRequests = 0;
     let markerAtFailure: string | null = null;
-    let registryPath = "";
     const gateway = startDynamicFakeGateway((body) => {
       if (hasCurrentToolResult(body, "http_followup")) {
         recovered = JSON.parse(toolResultOutput(body, "http_followup"));
@@ -8394,10 +8316,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       if (hasCurrentToolResult(body, "http_delegate")) {
         failed = JSON.parse(toolResultOutput(body, "http_delegate"));
-        const sessions = join(root.home, ".fx", "sessions");
-        const parentId = readdirSync(sessions).find((id) => existsSync(join(sessions, id, "subagent", "children.json")))!;
-        registryPath = join(sessions, parentId, "subagent", "children.json");
-        failedChild = JSON.parse(readFileSync(registryPath, "utf8")).children[0];
+        parentId = rootSessionIds(root.home)[0]!;
+        failedWork = childWork(root.home, parentId);
+        failedCause = JSON.stringify(childLines(root.home, parentId).at(-1).data);
         return withEffect
           ? fakeGatewayToolCall("http_followup", "subagent", { request: { action: "message", agent: "reporter", message: followupTask } })
           : fakeGatewayFinalText("SUBAGENT_HTTP_OBSERVED");
@@ -8429,22 +8350,22 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(failed).toMatchObject({ ok: false, error_code: "child_failed" });
       expect(failed?.result).toContain(`provider_http_error: API access denied · HTTP ${status}`);
       expect(failed?.result).toContain("Earlier tool calls may have completed");
-      expect(failedChild).toMatchObject({ phase: withEffect ? "idle" : "finished", active: null, last_outcome: "failed" });
-      expect(failedChild?.last_failure).toContain(`HTTP ${status}`);
-      const saved = JSON.parse(readFileSync(registryPath, "utf8"));
-      expect(saved.children).toHaveLength(1);
-      expect(saved.children[0].id).toBe(failedChild?.id);
+      expect(failedWork?.outcome).toBe("failed");
+      expect(failedCause).toContain(`HTTP ${status}`);
+      // One child, whose every piece of work the parent's log records.
+      const spawned = childLines(root.home, parentId).filter((line) => line.kind === "child_spawned");
+      expect(new Set(spawned.map((line) => line.child))).toEqual(new Set([failedWork!.child]));
       expect(childRequests).toBe(withEffect ? 3 : 1);
       expect(gateway.requestCount()).toBe(withEffect ? 6 : 3);
       if (withEffect) {
         expect(markerAtFailure).toBe("EFFECT_ONCE\n");
         expect(readFileSync(marker, "utf8")).toBe("EFFECT_ONCE\n");
         expect(recovered).toEqual({ ok: true, result: "CHILD_RECOVERED", error_code: null });
-        expect(saved.children[0]).toMatchObject({ active: null, last_outcome: "completed", last_failure: null });
+        expect(childWork(root.home, parentId).outcome).toBe("ok");
       } else {
         expect(markerAtFailure).toBeNull();
         expect(existsSync(marker)).toBe(false);
-        expect(saved.children[0].last_failure).toBe(failedChild?.last_failure);
+        expect(childWork(root.home, parentId)).toEqual(failedWork);
       }
       const json = parseAskJson(run.stdout);
       expect(json.output).toContain("SUBAGENT_HTTP_OBSERVED");
@@ -8460,50 +8381,53 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
   test("subagent replay returns saved success and failure without another worker", async () => {
     const root = createFixtureRoot("subagent-completed-replay");
-    const task = "Reply REPLAY_CHILD_DONE without tools.";
-    const seen: Array<{ ok: boolean; result: string; error_code: string | null }> = [];
+    const tasks = { ok: "Reply REPLAY_CHILD_DONE without tools.", failed: "Fail REPLAY_CHILD_FAILED before any output." };
+    type Seen = { ok: boolean; result: string | null; error_code: string | null };
+    const seen: Record<keyof typeof tasks, Seen[]> = { ok: [], failed: [] };
+    let delegation: keyof typeof tasks = "ok";
     let childRequests = 0;
     const gateway = startDynamicFakeGateway((body) => {
       const prompt = gatewayRequest(body).prompt;
       const lastUser = prompt.findLastIndex((message) => message.role === "user");
       const parts = prompt.slice(lastUser + 1).flatMap((message) => Array.isArray(message.content) ? message.content : []) as Array<Record<string, unknown>>;
-      const result = parts.find((part) => part.type === "tool-result" && part.toolCallId === "replayed_delegation");
+      const result = parts.find((part) => part.type === "tool-result" && part.toolCallId === `replayed_${delegation}`);
       if (result) {
-        seen.push(JSON.parse(contentText(result.output)));
+        seen[delegation].push(JSON.parse(contentText(result.output)));
         return fakeGatewayFinalText("REPLAY_PARENT_DONE");
       }
-      if (contentText(prompt[lastUser]?.content).includes(task)) {
+      const asked = contentText(prompt[lastUser]?.content);
+      if (asked.includes(tasks.ok)) {
         childRequests++;
         return fakeGatewayFinalText("REPLAY_CHILD_DONE");
       }
-      return fakeGatewayToolCall("replayed_delegation", "subagent", { request: { action: "run", task } });
+      if (asked.includes(tasks.failed)) {
+        childRequests++;
+        return new Response(JSON.stringify({ error: { message: "Fixture access rejected" } }), {
+          status: 401, headers: { "content-type": "application/json" },
+        });
+      }
+      return fakeGatewayToolCall(`replayed_${delegation}`, "subagent", { request: { action: "run", task: tasks[delegation] } });
     }, { classifierDecision: "clear", models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const env = fixtureEnv(root, gateway, join(root.root, "trace.log"));
     try {
-      const first = await runFx(["ask", "--json", "--auto", "Run the delegation."], { cwd: root.workspace, env, timeoutMs: 10_000 });
-      expect(first.code).toBe(0);
-      const sessionId = parseAskJson(first.stdout).session_id;
-      const repeat = ["ask", "--json", "--auto", "--resume-id", sessionId, "Observe that same delegation again."];
-      const second = await runFx(repeat, { cwd: root.workspace, env, timeoutMs: 10_000 });
-      expect(second.code).toBe(0);
-      expect(seen).toHaveLength(2);
-      expect(seen[0]).toEqual({ ok: true, result: "REPLAY_CHILD_DONE", error_code: null });
-      expect(seen[1]).toEqual(seen[0]);
-      const registryPath = join(root.home, ".fx", "sessions", sessionId, "subagent", "children.json");
-      const registry = JSON.parse(readFileSync(registryPath, "utf8"));
-      expect(registry.children).toHaveLength(1);
-      registry.children[0].last_outcome = "failed";
-      registry.children[0].last_failure = "agent_turn_failed: RetainedFailure";
-      writeFileSync(registryPath, JSON.stringify(registry));
-      const third = await runFx(repeat, { cwd: root.workspace, env, timeoutMs: 10_000 });
-      expect(third.code).toBe(0);
-      expect(seen).toHaveLength(3);
-      expect(seen[2]?.ok).toBe(false);
-      expect(seen[2]?.error_code).toBe("child_failed");
-      expect(seen[2]?.result).toContain("agent_turn_failed: RetainedFailure");
-      expect(seen[2]?.result).toContain("Partial result:\nREPLAY_CHILD_DONE");
-      expect(childRequests).toBe(1);
-      expect(gateway.requestCount()).toBe(7);
+      // Each delegation runs once, then the same call in the resumed session
+      // gets the saved outcome back.
+      for (const outcome of ["ok", "failed"] as const) {
+        delegation = outcome;
+        const first = await runFx(["ask", "--json", "--auto", `Run the ${outcome} delegation.`], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        expect(first.code).toBe(0);
+        const sessionId = parseAskJson(first.stdout).session_id;
+        const repeat = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        expect(repeat.code).toBe(0);
+        expect(seen[outcome]).toHaveLength(2);
+        expect(seen[outcome][1]).toEqual(seen[outcome][0]);
+      }
+      expect(seen.ok[0]).toEqual({ ok: true, result: "REPLAY_CHILD_DONE", error_code: null });
+      expect(seen.failed[0]?.ok).toBe(false);
+      expect(seen.failed[0]?.error_code).toBe("child_failed");
+      expect(seen.failed[0]?.result).toContain("HTTP 401");
+      expect(childRequests).toBe(2);
+      expect(gateway.requestCount()).toBe(10);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -8737,12 +8661,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(first.code).toBe(0);
       const firstJson = parseAskJson(first.stdout);
       expect(firstJson.output).toContain("PARENT_FIRST_COMPLETE");
-      const childRegistry = JSON.parse(readFileSync(
-        join(root.home, ".fx", "sessions", firstJson.session_id, "subagent", "children.json"),
-        "utf8",
-      )) as { children: Array<{ id: string }> };
-      expect(childRegistry.children).toHaveLength(1);
-      const internalChildId = childRegistry.children[0]!.id;
+      // One child, named by the parent's log.
+      const children = new Set(childLines(root.home, firstJson.session_id).filter((line) => line.kind === "child_spawned").map((line) => line.child));
+      expect(children.size).toBe(1);
+      const internalChildId = [...children][0]!;
 
       const second = await runFx(
         [
@@ -8889,20 +8811,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(latest.code).toBe(0);
       const latestId = (JSON.parse(latest.stdout) as { id: string }).id;
 
-      const sessionsRoot = join(root.home, ".fx", "sessions");
-      const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
-        .filter((entry) =>
-          entry.isDirectory() &&
-          existsSync(join(sessionsRoot, entry.name, "session.json"))
-        )
-        .map((entry) => entry.name);
+      // The parent and its child are both saved, and the parent's log names
+      // the child.
+      const sessionIds = savedSessionIds(root.home);
       expect(sessionIds).toHaveLength(2);
-      const parentId = sessionIds.find((id) =>
-        existsSync(join(root.home, ".fx", "sessions", id, "subagent", "children.json"))
-      );
+      const roots = rootSessionIds(root.home);
+      expect(roots).toHaveLength(1);
+      const parentId = roots[0]!;
       const childId = sessionIds.find((id) => id !== parentId);
-      expect(parentId).toBeDefined();
       expect(childId).toBeDefined();
+      expect(childLines(root.home, parentId).filter((line) => line.kind === "child_spawned").map((line) => line.child)).toEqual([childId]);
       expect(latestId).toBe(parentId!);
       const listed = await runFx(["sessions", "--json"], {
         cwd: root.workspace,
@@ -9415,80 +9333,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
-  test("saved gateway stream timeout reloads and continues explicitly", async () => {
-    const root = createFixtureRoot("saved-gateway-stream-timeout");
-    const tracePath = join(root.root, "trace.log");
-    let continued = false;
-    const gateway = startGateway(() =>
-      continued
-        ? fakeGatewayFinalText("Recovered after explicit timeout continuation.")
-        : gatewayStreamTimeoutWithFinishResponse()
-    );
-    try {
-      // The timeout probes the connection forever on its own; the only way the
-      // turn parks is killing the process, which leaves a durable checkpoint.
-      const first = await runFx(
-        ["ask", "--json", "--auto", "Pause on the fixture timeout."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 5_000,
-        },
-      );
-
-      expect(first.timedOut).toBe(true);
-      expect(first.stderr).toContain(
-        "Gateway stream timed out · checking the connection",
-      );
-      expect(first.stderr).not.toContain("retrying request");
-      const probedRequests = gateway.requestCount();
-      expect(probedRequests).toBeGreaterThanOrEqual(2);
-      const sessionsRoot = join(root.home, ".fx", "sessions");
-      const sessionId = readdirSync(sessionsRoot).find((name) =>
-        existsSync(join(sessionsRoot, name, "recovery.json"))
-      );
-      expect(sessionId).toBeDefined();
-      const checkpoint = JSON.parse(
-        readFileSync(join(sessionsRoot, sessionId!, "recovery.json"), "utf8"),
-      ).checkpoint;
-      expect(checkpoint.cause).toBe("provider_stream_timeout");
-
-      const detail = await runFx(
-        ["session", "--id", sessionId!, "--json"],
-        { cwd: root.workspace, env: { HOME: root.home } },
-      );
-      expect(detail.code).toBe(0);
-      expect(gateway.requestCount()).toBe(probedRequests);
-
-      continued = true;
-      const resumed = await runFx(
-        [
-          "ask",
-          "--json",
-          "--auto",
-          "--resume-id",
-          sessionId!,
-          "--continue-recovery",
-        ],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      const recovered = parseAskJson(resumed.stdout);
-
-      expect(resumed.code).toBe(0);
-      expect(recovered.output).toContain(
-        "Recovered after explicit timeout continuation.",
-      );
-      expect(gateway.requestCount()).toBe(probedRequests + 1);
-      expect(gateway.requests[probedRequests]!.body).toContain("Pause on the fixture timeout.");
-    } finally {
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  }, 30_000);
 
   test("model response recovery keeps retrying status failures past ten real requests", async () => {
     const root = createFixtureRoot("provider-attempt-budget");
@@ -9565,74 +9409,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
-  test("interrupted status-failure backoff continues explicitly with preserved context", async () => {
-    const root = createFixtureRoot("retry-backoff-kill-continue");
-    const tracePath = join(root.root, "trace.log");
-    let continued = false;
-    const gateway = startGateway(() =>
-      continued
-        ? fakeGatewayFinalText("Recovered after explicit continuation.")
-        : unavailableResponse("30")
-    );
-    try {
-      // A 30 s server-hinted backoff parks the retry inside the first run; the
-      // SIGKILL leaves a durable checkpoint behind for explicit continuation.
-      const first = await runFx(
-        ["ask", "--json", "--auto", "Pause after exhausting recovery."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 5_000,
-        },
-      );
-      expect(first.timedOut).toBe(true);
-      expect(first.stderr).toContain(
-        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request in 30s",
-      );
-      expect(gateway.requestCount()).toBe(1);
-      const sessionsRoot = join(root.home, ".fx", "sessions");
-      const sessionId = readdirSync(sessionsRoot).find((name) =>
-        existsSync(join(sessionsRoot, name, "recovery.json"))
-      );
-      expect(sessionId).toBeDefined();
-      const checkpoint = JSON.parse(
-        readFileSync(join(sessionsRoot, sessionId!, "recovery.json"), "utf8"),
-      ).checkpoint;
-      expect(checkpoint.consumed_provider_attempts).toBe(1);
-
-      const detail = await runFx(
-        ["session", "--id", sessionId!, "--json"],
-        { cwd: root.workspace, env: { HOME: root.home } },
-      );
-      expect(detail.code).toBe(0);
-      expect(gateway.requestCount()).toBe(1);
-
-      continued = true;
-      const resumed = await runFx(
-        [
-          "ask",
-          "--json",
-          "--auto",
-          "--resume-id",
-          sessionId!,
-          "--continue-recovery",
-        ],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      const recovered = parseAskJson(resumed.stdout);
-      expect(resumed.code).toBe(0);
-      expect(recovered.output).toContain("Recovered after explicit continuation.");
-      expect(gateway.requestCount()).toBe(2);
-      expect(gateway.requests[1]!.body).toContain("Pause after exhausting recovery.");
-    } finally {
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  }, 30_000);
 
   test("CLI recovery prints one complete response after checkpointed partial output", async () => {
     const root = createFixtureRoot("partial-autonomous-recovery");

@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { jpegHeader, paddedPng, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { copyV1Fixture, rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 
 const TIMEOUT = 15_000;
 const GLM_MODEL = "zai/glm-5.2-fast";
@@ -1212,6 +1213,44 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "fx ask names the saved copy of an attached image but not its source path",
+    async () => {
+      const root = createIsolatedRoot();
+      const shotPath = join(root.workspace, "CleanShot 2026-10-18 at 4.36.41 PM@2x.png");
+      const original = solidPng(40, 20);
+      writeFileSync(shotPath, original);
+      const gateway = startImageGateway([sseText("Located image answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--image", shotPath, "Crop the attached screenshot."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(result).output).toContain("Located image answer");
+        expect(result.stderr).toBe("");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(1);
+        const prompt = promptParts(body).find(
+          (part) => part.type === "text" && String(part.text).endsWith("Crop the attached screenshot."),
+        );
+        const note = String(prompt?.text).match(
+          /^\[Image #1 \(image\/png\) is saved at ("(?:[^"\\]|\\.)*")\.\]\n/,
+        );
+        expect(note).not.toBeNull();
+        expect(body).not.toContain(shotPath);
+        // The saved copy outlives the run and holds the bytes the model saw.
+        const saved = JSON.parse(note![1]!) as string;
+        expect(saved.startsWith(join(root.home, ".fx", "sessions"))).toBe(true);
+        expect(readFileSync(saved)).toEqual(original);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask withholds native JPEG images over the 8000-pixel limit with saved-path guidance",
     async () => {
       const root = createIsolatedRoot();
@@ -1386,9 +1425,9 @@ describe("Vision route fake Gateway", () => {
         });
         expect(rejectionOutput as string).not.toContain(fixture.imagePath);
         expect(filePartCount(recoveryRequest.body)).toBe(1);
-        const eventsPath = join(root.home, ".fx", "sessions", firstJson.session_id, "events.jsonl");
+        const eventsPath = join(sessionDir(root.home, firstJson.session_id), "log.jsonl");
         const originalEvents = readFileSync(eventsPath, "utf8");
-        if (shape !== "plain") expect(originalEvents).toContain("removed-vision-signature");
+        if (shape !== "plain") expect(savedText(root.home, firstJson.session_id)).toContain("removed-vision-signature");
 
         const resumed = await runFx(
           [
@@ -1483,42 +1522,18 @@ describe("Vision route fake Gateway", () => {
 
       for (const entry of cases) {
         const root = createIsolatedRoot();
-        const imagePath = join(root.workspace, `${entry.name}.png`);
-        const imagePayload = writeMarkedImage(
-          imagePath,
-          `OWNED_${entry.name.toUpperCase()}_A`,
-        );
+        // A prompt image only an older fx's session file holds, damaged
+        // before the session converts on its next open.
+        const [sessionId] = copyV1Fixture(root.home, "image", 1, root.workspace) as [string];
+        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+        const snapshotNames = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
+        expect(snapshotNames).toHaveLength(1);
+        entry.damage(join(imageDir, snapshotNames[0]));
         const gateway = startImageGateway([
-          sseText(`saved ${entry.name}`),
           sseToolCall("vision", { image_ids: [1], focus: entry.name }, `vision_${entry.name}`),
           sseText(`final ${entry.name}`),
         ]);
         try {
-          const saved = await runFx(
-            [
-              "ask",
-              "--json",
-              "--auto",
-              "--no-color",
-              "--image",
-              imagePath,
-              `Save ${entry.name} image.`,
-            ],
-            {
-              cwd: root.workspace,
-              env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-              timeoutMs: TIMEOUT,
-            },
-          );
-          const savedJson = parseFxJson(saved);
-          expect(savedJson.output).toContain(`saved ${entry.name}`);
-          expect(gateway.chatRequests).toHaveLength(1);
-
-          const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
-          const snapshotNames = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
-          expect(snapshotNames).toHaveLength(1);
-          entry.damage(join(imageDir, snapshotNames[0]));
-
           const reread = await runFx(
             [
               "ask",
@@ -1526,7 +1541,7 @@ describe("Vision route fake Gateway", () => {
               "--auto",
               "--no-color",
               "--resume-id",
-              savedJson.session_id,
+              sessionId,
               `Reread ${entry.name} image.`,
             ],
             {
@@ -1538,12 +1553,12 @@ describe("Vision route fake Gateway", () => {
           const rereadJson = parseFxJson(reread);
           expect(rereadJson.output).toContain(`final ${entry.name}`);
           expect(rereadJson.tool_calls).toContainEqual({ name: "vision", status: "error" });
-          expect(gateway.chatRequests).toHaveLength(3);
+          expect(gateway.chatRequests).toHaveLength(2);
+          expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
+          expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
           expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
-          expect(gateway.chatRequests[1].body).toContain('"name":"vision"');
-          expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
           const resultText = toolResultText(
-            gateway.chatRequests[2].body,
+            gateway.chatRequests[1].body,
             `vision_${entry.name}`,
           );
           expect(resultText).toContain('"code":"image_unavailable"');
@@ -1552,15 +1567,12 @@ describe("Vision route fake Gateway", () => {
             "do not retry the same snapshot unchanged",
           );
           expect(resultText).not.toContain("provider_response_invalid");
-          expect(gateway.chatRequests[2].body).not.toContain("Vision is unavailable right now");
-          expect(gateway.chatRequests[2].body).not.toContain(imageDir);
-          expect(gateway.chatRequests[2].body).not.toContain(imagePath);
-          expect(gateway.chatRequests[2].body).not.toContain(imagePayload);
-          expect(gateway.chatRequests[2].body).not.toContain("data:image");
+          expect(gateway.chatRequests[1].body).not.toContain("Vision is unavailable right now");
+          expect(gateway.chatRequests[1].body).not.toContain(imageDir);
+          expect(gateway.chatRequests[1].body).not.toContain("data:image");
           expect(
             gateway.chatRequests.some(
-              (request, index) =>
-                index > 0 && request.headers.get("ai-language-model-id") === GEMINI_MODEL,
+              (request) => request.headers.get("ai-language-model-id") === GEMINI_MODEL,
             ),
           ).toBe(false);
         } finally {
@@ -2373,42 +2385,19 @@ describe("Vision route fake Gateway", () => {
     "one corrupt image does not block its healthy sibling from Vision",
     async () => {
       const root = createIsolatedRoot();
-      const imagePaths = [1, 2].map((id) => {
-        const path = join(root.workspace, `partial-${id}.png`);
-        copyFileSync(IMAGE_PATH, path);
-        return path;
-      });
+      // Twenty prompt images only an older fx's session file holds; one is
+      // damaged before the session converts on its next open.
+      const [sessionId] = copyV1Fixture(root.home, "many-images", 1, root.workspace) as [string];
+      const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+      const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
+      expect(firstSnapshot).toBeDefined();
+      writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
       const gateway = startImageGateway([
-        sseText("saved partial images"),
         sseToolCall("vision", { image_ids: [1, 2], focus: "inspect both" }, "vision_partial"),
         sseText(visionBatchResult([2])),
         sseText("mixed-result recovery completed"),
       ]);
       try {
-        const saved = await runFx(
-          [
-            "ask",
-            "--json",
-            "--auto",
-            "--no-color",
-            "--image",
-            imagePaths[0],
-            "--image",
-            imagePaths[1],
-            "Save both images.",
-          ],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const savedJson = parseFxJson(saved);
-        const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
-        const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
-        expect(firstSnapshot).toBeDefined();
-        writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
-
         const result = await runFx(
           [
             "ask",
@@ -2416,7 +2405,7 @@ describe("Vision route fake Gateway", () => {
             "--auto",
             "--no-color",
             "--resume-id",
-            savedJson.session_id,
+            sessionId,
             "Inspect both saved images.",
           ],
           {
@@ -2428,12 +2417,12 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("mixed-result recovery completed");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(gateway.chatRequests).toHaveLength(4);
-        expect(filePartCount(gateway.chatRequests[2].body)).toBe(1);
-        expect(gateway.chatRequests[2].body).toContain("image_id=2");
-        expect(gateway.chatRequests[2].body).not.toContain("image_id=1");
+        expect(gateway.chatRequests).toHaveLength(3);
+        expect(filePartCount(gateway.chatRequests[1].body)).toBe(1);
+        expect(gateway.chatRequests[1].body).toContain("image_id=2");
+        expect(gateway.chatRequests[1].body).not.toContain("image_id=1");
         const visionResult = JSON.parse(
-          toolResultText(gateway.chatRequests[3].body, "vision_partial"),
+          toolResultText(gateway.chatRequests[2].body, "vision_partial"),
         ) as {
           images: Array<{
             image_id: number;
@@ -2465,14 +2454,15 @@ describe("Vision route fake Gateway", () => {
     "one corrupt first-batch image keeps twenty-image provider batches at seven eight four",
     async () => {
       const root = createIsolatedRoot();
-      const imagePaths = Array.from({ length: 20 }, (_, index) => {
-        const imagePath = join(root.workspace, `partial-twenty-${index + 1}.png`);
-        copyFileSync(IMAGE_PATH, imagePath);
-        return imagePath;
-      });
+      // Twenty prompt images only an older fx's session file holds; one is
+      // damaged before the session converts on its next open.
+      const [sessionId] = copyV1Fixture(root.home, "many-images", 1, root.workspace) as [string];
+      const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+      const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
+      expect(firstSnapshot).toBeDefined();
+      writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
       const allIds = Array.from({ length: 20 }, (_, index) => index + 1);
       const gateway = startImageGateway([
-        sseText("saved twenty images"),
         sseToolCall("vision", { image_ids: allIds, focus: "inspect all" }, "vision_partial_twenty"),
         sseText(visionBatchResult(allIds.slice(1, 8))),
         sseText(visionBatchResult(allIds.slice(8, 16))),
@@ -2480,21 +2470,6 @@ describe("Vision route fake Gateway", () => {
         sseText("twenty-image mixed-result recovery completed"),
       ]);
       try {
-        const imageArgs = imagePaths.flatMap((imagePath) => ["--image", imagePath]);
-        const saved = await runFx(
-          ["ask", "--json", "--auto", "--no-color", ...imageArgs, "Save every image."],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const savedJson = parseFxJson(saved);
-        const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
-        const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
-        expect(firstSnapshot).toBeDefined();
-        writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
-
         const result = await runFx(
           [
             "ask",
@@ -2502,7 +2477,7 @@ describe("Vision route fake Gateway", () => {
             "--auto",
             "--no-color",
             "--resume-id",
-            savedJson.session_id,
+            sessionId,
             "Inspect all saved images.",
           ],
           {
@@ -2514,16 +2489,16 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("twenty-image mixed-result recovery completed");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(gateway.chatRequests).toHaveLength(6);
-        expect(filePartCount(gateway.chatRequests[2].body)).toBe(7);
-        expect(filePartCount(gateway.chatRequests[3].body)).toBe(8);
-        expect(filePartCount(gateway.chatRequests[4].body)).toBe(4);
-        expect(gateway.chatRequests[2].body).not.toContain("image_id=1");
-        expect(gateway.chatRequests[2].body).toContain("image_id=8");
-        expect(gateway.chatRequests[3].body).toContain("image_id=9");
-        expect(gateway.chatRequests[4].body).toContain("image_id=17");
+        expect(gateway.chatRequests).toHaveLength(5);
+        expect(filePartCount(gateway.chatRequests[1].body)).toBe(7);
+        expect(filePartCount(gateway.chatRequests[2].body)).toBe(8);
+        expect(filePartCount(gateway.chatRequests[3].body)).toBe(4);
+        expect(gateway.chatRequests[1].body).not.toContain("image_id=1");
+        expect(gateway.chatRequests[1].body).toContain("image_id=8");
+        expect(gateway.chatRequests[2].body).toContain("image_id=9");
+        expect(gateway.chatRequests[3].body).toContain("image_id=17");
         const visionResult = JSON.parse(
-          toolResultText(gateway.chatRequests[5].body, "vision_partial_twenty"),
+          toolResultText(gateway.chatRequests[4].body, "vision_partial_twenty"),
         ) as {
           images: Array<{
             image_id: number;
@@ -3123,15 +3098,9 @@ describe("Vision route fake Gateway", () => {
         expect(selectedFollowup).toContain(rootRequest);
         expect(selectedFollowup).not.toContain(imagePath);
 
-        const sessionsRoot = join(root.home, ".fx", "sessions");
-        const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory() && entry.name !== "latest")
-          .map((entry) => entry.name);
+        const sessionIds = rootSessionIds(root.home);
         expect(sessionIds).toHaveLength(1);
-        const events = readFileSync(
-          join(sessionsRoot, sessionIds[0]!, "events.jsonl"),
-          "utf8",
-        );
+        const events = savedText(root.home, sessionIds[0]!);
         expect(events).toContain(feedback);
         expect(events).not.toContain("<available_images>");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3246,8 +3215,8 @@ describe("Vision route fake Gateway", () => {
   );
 });
 
-for (const sourceChange of ["removed", "changed", "saved snapshot missing", "saved snapshot corrupt"] as const) {
-  test(`recovery preserves captured image identity when ${sourceChange}`, async () => {
+for (const sourceChange of ["removed", "changed"] as const) {
+  test(`a failed turn keeps its captured image when the source is ${sourceChange}`, async () => {
     const root = createIsolatedRoot();
     const input = join(root.workspace, "input.png");
     const original = writeMarkedImage(input, "ORIGINAL_RECOVERY_INPUT");
@@ -3263,37 +3232,18 @@ for (const sourceChange of ["removed", "changed", "saved snapshot missing", "sav
       const failed = await runFx(["ask", "--json", "--auto", "--image", input, "Describe the saved image."], options);
       expect(failed.code).toBe(1);
       expect(failed.stdout).toContain("RequiredVisionToolCallMissing");
-      const sessions = join(root.home, ".fx", "sessions");
-      const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "recovery.json")))!;
-      expect(id).toBeDefined();
-      const checkpointPath = join(sessions, id, "recovery.json");
-      const checkpointBytes = readFileSync(checkpointPath);
-      const image = JSON.parse(checkpointBytes.toString()).checkpoint.user.images[0];
-      const snapshot = join(sessions, id, image.snapshot_path);
-      expect(image.id).toBe(1);
-      expect(image.snapshot_sha256).toBe(digest);
-      expect(readFileSync(snapshot).toString("base64")).toBe(original);
+      const id = JSON.parse(failed.stdout).session_id;
+      // The failed turn keeps the captured image inside its saved prompt (D44).
+      expect(savedText(root.home, id)).toContain(original);
       if (sourceChange === "removed") rmSync(input);
-      else if (sourceChange === "changed") writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
-      else if (sourceChange === "saved snapshot missing") rmSync(snapshot);
-      else writeFileSync(snapshot, "corrupted saved bytes");
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "--continue-recovery"], options);
-      if (sourceChange.startsWith("saved snapshot")) {
-        expect(resumed.code).toBe(1);
-        expect(resumed.stdout).toContain(sourceChange.endsWith("missing") ? "MissingImageSnapshot" : "ImageSnapshotCorrupt");
-        expect(gateway.chatRequests).toHaveLength(1);
-        expect(readFileSync(checkpointPath).equals(checkpointBytes)).toBe(true);
-        return;
-      }
+      else writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Describe the saved image again."], options);
       expect(parseFxJson(resumed).output).toContain("RECOVERY_IMAGE_COMPLETE");
       expect(gateway.chatRequests).toHaveLength(4);
       const parts = nativeFileParts(gateway.chatRequests[2]!.body);
       expect(parts).toHaveLength(1);
       expect(createHash("sha256").update(Buffer.from(parts[0]!.data.data, "base64")).digest("hex")).toBe(digest);
-      const history = readFileSync(join(sessions, id, "events.jsonl"), "utf8");
-      expect(history).toContain(digest);
-      expect(readFileSync(snapshot).toString("base64")).toBe(original);
-      expect(existsSync(checkpointPath)).toBe(false);
+      expect(savedText(root.home, id)).toContain(digest);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -3301,7 +3251,7 @@ for (const sourceChange of ["removed", "changed", "saved snapshot missing", "sav
   }, TIMEOUT * 2);
 }
 
-test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and cold restart", async () => {
+test.skipIf(!tmuxAvailable())("TUI keeps a failed turn's image through a cold restart", async () => {
   const root = createIsolatedRoot();
   const input = join(root.workspace, "input.png");
   const original = writeMarkedImage(input, "TUI_RECOVERY_INPUT");
@@ -3324,11 +3274,9 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     await session.sendText("Describe this image.");
     await session.waitForText("RequiredVisionToolCallMissing", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
-    const sessions = join(root.home, ".fx", "sessions");
-    const id = readdirSync(sessions).find(name => existsSync(join(sessions, name, "recovery.json")))!;
-    const checkpoint = JSON.parse(readFileSync(join(sessions, id, "recovery.json"), "utf8")).checkpoint;
-    const snapshot = join(sessions, id, checkpoint.user.images[0].snapshot_path);
-    expect(readFileSync(snapshot).toString("base64")).toBe(original);
+    const [id] = rootSessionIds(root.home) as [string];
+    // The failed turn keeps the captured image inside its saved prompt (D44).
+    expect(savedText(root.home, id)).toContain(original);
     await session.sendText("/quit");
     await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
     expect(session.paneStatus().status).toBe(0);
@@ -3337,8 +3285,8 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     rmSync(input);
     session = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${id}`, cwd: root.workspace, env, isolated: true, remainOnExit: true });
     await session.waitForStableComposer(TIMEOUT);
-    // A pending recovery checkpoint continues automatically on resume.
-    await session.waitForText(/continues\s+automatically/, TIMEOUT);
+    // Nothing continues on its own (D54): a new prompt asks again.
+    await session.sendText("Describe this image again.");
     await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);
@@ -3355,7 +3303,7 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     await session.sendText("/quit");
     await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
     expect(session.paneStatus().status).toBe(0);
-    expect(readFileSync(snapshot).toString("base64")).toBe(original);
+    expect(savedText(root.home, id)).toContain(original);
   } finally {
     await session?.kill();
     gateway.stop();
@@ -3397,7 +3345,13 @@ describe("request size budget", () => {
 
   type SizeRequest = { body: string; images: string[]; tools: boolean; status: number };
 
-  function startSizeCappedGateway(rejection: { status: number; body: string }, images: Map<string, string>) {
+  // Refuses every request over `cap`. By default each answer asks for the next
+  // image with read_file; `describe` answers at once instead.
+  function startSizeCappedGateway(
+    rejection: { status: number; body: string },
+    images: Map<string, string>,
+    { cap = SIZE_CAP_BYTES, answer = "read" }: { cap?: number; answer?: "read" | "describe" } = {},
+  ) {
     const byData = new Map([...images].map(([name, data]) => [data, name]));
     const requests: SizeRequest[] = [];
     let issued = 0;
@@ -3415,12 +3369,13 @@ describe("request size budget", () => {
         const parsed = JSON.parse(body) as { tools?: unknown[] };
         const tools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
         const carried = nativeFileParts(body).map((part) => byData.get(part.data.data) ?? "unknown");
-        const status = body.length > SIZE_CAP_BYTES ? rejection.status : 200;
+        const status = body.length > cap ? rejection.status : 200;
         requests.push({ body, images: carried, tools, status });
         if (status !== 200) {
           return new Response(rejection.body, { status, headers: { "content-type": "application/json" } });
         }
         if (!tools) return sseText("Summary: the user asked fx to read six images.");
+        if (answer === "describe") return sseText("done: described the images");
         if (issued < SIZE_IMAGE_COUNT) {
           issued += 1;
           return sseToolCall("read_file", { path: `img0${issued}.png` }, `call_img_${issued}`);
@@ -3498,4 +3453,37 @@ describe("request size budget", () => {
       }
     }, TIMEOUT * 3);
   }
+
+  test("a size limit two retries can't reach still leaves out images instead of compacting", async () => {
+    const root = createIsolatedRoot();
+    const images = writeSizeImages(root.workspace);
+    // Six images of about 1 MB in one prompt against a 1.5 MB limit: each
+    // refusal lowers fx's limit by a quarter, so the request fits only after
+    // a third refusal leaves out all but the newest image.
+    const cap = 1_500_000;
+    const gateway = startSizeCappedGateway({ status: 413, body: payloadTooLargeBody }, images, { cap, answer: "describe" });
+    try {
+      const imageArgs = [...images.keys()].flatMap((name) => ["--image", join(root.workspace, name)]);
+      const result = await runFx(["ask", "--json", "--auto", "--no-color", ...imageArgs, "Describe these images."], {
+        cwd: root.workspace,
+        env: gateway.env(root),
+        timeoutMs: TIMEOUT * 2,
+      });
+      const json = parseFxJson(result);
+      expect(json.output).toContain("done: described the images");
+
+      const rejected = gateway.requests.filter((request) => request.status !== 200);
+      expect(rejected.length).toBeGreaterThan(2);
+      // No summary request: the conversation was not compacted.
+      expect(gateway.requests.every((request) => request.tools)).toBe(true);
+      const accepted = gateway.requests.at(-1)!;
+      expect(accepted.status).toBe(200);
+      expect(accepted.body.length).toBeLessThanOrEqual(cap);
+      expect(accepted.images).toEqual(["img06.png"]);
+      expect(accepted.body).toContain(SIZE_NOTICE);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
 });

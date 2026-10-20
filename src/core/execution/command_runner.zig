@@ -5219,6 +5219,11 @@ test "timeout prevents captured user shell from evaluating trailing statements" 
     if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
         return error.SkipZigTest;
+    // The timeout can expire while the process owner is still capturing the
+    // user's zsh. Resetting the owner on the way out joins that capture, so
+    // the capture never outlives this test or its allocator.
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5246,6 +5251,19 @@ test "timeout prevents captured user shell from evaluating trailing statements" 
     }, alloc, command, workspace, .{ .user = "/bin/zsh" }));
     try std.testing.expect(!capture.contains(.stdout, "SHOULD-NOT-RUN\n"));
     try std.testing.expect(!absoluteFileExists(effect_path));
+}
+
+test "child commands inherit the test runner environment" {
+    // A test fixture that installs its own environment resets it on teardown.
+    // One that leaves even an empty map behind gives the child processes of
+    // every later test no environment, so a login shell whose startup files
+    // read `$HOME` fails.
+    var expected = try std.process.Environ.createMap(std.testing.environ, std.testing.allocator);
+    defer expected.deinit();
+    const home = expected.get("HOME") orelse return error.SkipZigTest;
+    var inherited = try io_mod.cloneEnvironMap(std.testing.allocator);
+    defer inherited.deinit();
+    try std.testing.expectEqualStrings(home, inherited.get("HOME") orelse "");
 }
 
 test "timeout remains dominant when its output callback fails" {

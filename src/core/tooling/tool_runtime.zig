@@ -6775,6 +6775,7 @@ test "skill tool preserves resource and discovery notices separately" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
+    defer io_mod.resetEnvironForTest();
 
     var rt = TestRuntime{ .workspace_root = workspace_root, .skills_dir = skills_dir, .session_allocator = alloc };
     defer rt.deinit(alloc);
@@ -6850,7 +6851,7 @@ test "skill tool loads the first advertised name and rejects shadowed or untrust
     const outside_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/outside/workflow");
     defer alloc.free(outside_skill);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var rt = TestRuntime{ .workspace_root = workspace_root, .skills_dir = skills_dir, .session_allocator = alloc };
     defer rt.deinit(alloc);
@@ -6917,7 +6918,7 @@ test "name-only skill call selects a higher-precedence duplicate added after the
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var rt = TestRuntime{ .workspace_root = workspace_root, .skills_dir = skills_dir, .session_allocator = alloc };
     defer rt.deinit(alloc);
@@ -6977,7 +6978,7 @@ test "skill tool reports missing skill" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var rt = TestRuntime{ .workspace_root = workspace_root, .skills_dir = skills_dir };
     defer rt.deinit(alloc);

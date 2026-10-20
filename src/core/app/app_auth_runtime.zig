@@ -3509,19 +3509,12 @@ test "prompt credential refresh falls back when its task cannot start" {
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
 }
 
-var stable_startup_credential_test_environ: ?*std.process.Environ.Map = null;
-
 /// Installs exactly `entries` with the Keychain disabled, so the launch lookup
 /// reads only what a test provides and never the developer's real Keychain.
 const StartupCredentialTestEnv = struct {
     map: std.process.Environ.Map,
 
     fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*StartupCredentialTestEnv {
-        if (stable_startup_credential_test_environ == null) {
-            const empty = try std.heap.page_allocator.create(std.process.Environ.Map);
-            empty.* = std.process.Environ.Map.init(std.heap.page_allocator);
-            stable_startup_credential_test_environ = empty;
-        }
         const self = try alloc.create(StartupCredentialTestEnv);
         errdefer alloc.destroy(self);
         self.* = .{ .map = std.process.Environ.Map.init(alloc) };
@@ -3533,7 +3526,7 @@ const StartupCredentialTestEnv = struct {
     }
 
     fn deinit(self: *StartupCredentialTestEnv, alloc: std.mem.Allocator) void {
-        io_mod.setEnvironMap(stable_startup_credential_test_environ.?);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         alloc.destroy(self);
     }

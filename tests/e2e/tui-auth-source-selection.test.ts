@@ -20,6 +20,7 @@ import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
+import { rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -5073,7 +5074,7 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
       expect(result.output).toBe("REASONING_SNAPSHOT_OK");
       expect(first.stderr).toMatch(/^(?:● Reading\x1b\[0m\n)?Reading notes\.txt\n$/);
       expect(direct.bodies).toHaveLength(2);
-      const saved = readFileSync(join(profile, ".fx", "sessions", result.session_id, "events.jsonl"), "utf8");
+      const saved = savedText(profile, result.session_id);
       expect(saved).toContain(signature);
       const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
@@ -5543,10 +5544,12 @@ test("direct providers keep images with their users through tools and resume", a
       };
       const firstPrompt = "Read fixture.txt, then describe the attached image.";
       const secondPrompt = "Compare the earlier image with this new image.";
+      // Each image's message starts with a note naming its saved copy.
       const imageOwners = (raw: string): Array<{ text: string; images: string[] }> => JSON.parse(raw).input
         .filter((entry: { role?: string }) => entry.role === "user")
         .map((entry: { content: Array<{ type: string; text?: string; image_url?: string }> }) => ({
-          text: entry.content.filter(part => part.type === "input_text").map(part => part.text).join(""),
+          text: entry.content.filter(part => part.type === "input_text").map(part => part.text).join("")
+            .replace(/^(\[Image #\d+ \(image\/png\) is saved at "[^"\n]*"\.\]\n)+/, ""),
           images: entry.content.filter(part => part.type === "input_image").map(part => part.image_url!),
         }))
         .filter((entry: { images: string[] }) => entry.images.length > 0);
@@ -5579,18 +5582,6 @@ test("direct providers keep images with their users through tools and resume", a
       const history = JSON.parse(detail.stdout).history;
       expect(history).toHaveLength(3);
       expect(history.map((turn: { user: { images?: unknown[] } }) => turn.user.images?.length ?? 0)).toEqual([1, 1, 0]);
-      const imageDir = join(profile, ".fx", "sessions", sessionId, "images");
-      const snapshotName = readdirSync(imageDir).find(name => name.endsWith(".bin") && readFileSync(join(imageDir, name)).equals(firstImage));
-      expect(snapshotName).toBeDefined();
-      writeFileSync(join(imageDir, snapshotName!), secondImage);
-      const rejected = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Inspect the earlier images again."], { cwd: profile, env, timeoutMs: TIMEOUT });
-      expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
-      expect(rejected.signal).toBeNull();
-      expect(rejected.stdout + rejected.stderr).toContain("ImageSnapshotCorrupt");
-      expect(direct.bodies).toHaveLength(4);
-      const retained = await runFx(["session", "--json", "--id", sessionId], { cwd: profile, env });
-      expect(retained.code).toBe(0);
-      expect(JSON.parse(retained.stdout).history).toEqual(history);
       expect(testGateway.requests).toHaveLength(0);
     } finally {
       direct.stop(); testGateway.stop();
@@ -5697,8 +5688,11 @@ test("direct provider tool identities obey the session boundary before execution
         const detail = await runFx(["session", "--json", "--id", json.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
-        expect(history).toHaveLength(accepted ? 1 : 0);
+        expect(history).toHaveLength(1);
         if (accepted) expect(history[0].execution.tool_steps[0].tool_calls[0].id).toBe(options.toolCallId);
+        // A refused identity fails the turn before anything runs: it is kept
+        // as interrupted (D1), holding only the prompt.
+        else expect(history[0]).toMatchObject({ kind: "interrupted", tool_call: null, completed_tool_names: [] });
       } finally {
         direct.stop(); testGateway.stop();
         rmSync(profile, { recursive: true, force: true });
@@ -6633,9 +6627,9 @@ tmuxTest(
     await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
     await session.sendText("/status");
     await session.waitForText("auth_expired=true", TIMEOUT);
-    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    const sessionIds = rootSessionIds(home);
     expect(sessionIds).toHaveLength(1);
-    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const historyPath = join(sessionDir(home, sessionIds[0]!), "log.jsonl");
     const before = readFileSync(historyPath, "utf8");
     await session.sendText("/compact");
     await waitForTrace(tracePath, "manual_compaction_auth_pending", TIMEOUT);
@@ -6647,7 +6641,7 @@ tmuxTest(
     await session.waitForPane((pane) =>
       pane.includes("PRESERVE_COMPACTION_DRAFT") &&
       !/Preparing compaction|Compacting|Stopping compaction/.test(pane) &&
-      readFileSync(historyPath, "utf8").includes('"context_checkpoint"'),
+      readFileSync(historyPath, "utf8").includes('"kind":"compacted"'),
     TIMEOUT);
     const scrollback = await session.captureFullScrollback();
     expect(scrollback).toContain("PRESERVE_COMPACTION_DRAFT");
@@ -6658,7 +6652,7 @@ tmuxTest(
     expect(JSON.parse(gateway.requests[3].body).tools ?? []).toHaveLength(0);
     expect(readFileSync(historyPath, "utf8").startsWith(before)).toBe(true);
     const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-    expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
+    expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
     await session.sendKeys("C-u");
     await session.sendText("Continue after the manual compaction.");
     await session.waitForText("COMPACT_AUTH_CONTINUED", TIMEOUT);
@@ -6697,9 +6691,9 @@ for (const outcome of ["failure", "cancel"] as const) {
     await session.waitForText("AUTH_BOUNDARY_FIRST_REPLY", TIMEOUT);
     await session.sendText("Remember AUTH_BOUNDARY_SECOND.");
     await session.waitForText("AUTH_BOUNDARY_SECOND_REPLY", TIMEOUT);
-    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    const sessionIds = rootSessionIds(home);
     expect(sessionIds).toHaveLength(1);
-    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const historyPath = join(sessionDir(home, sessionIds[0]!), "log.jsonl");
     const before = readFileSync(historyPath, "utf8");
     expect(gateway.requests).toHaveLength(2);
     expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
@@ -6728,7 +6722,7 @@ for (const outcome of ["failure", "cancel"] as const) {
     await session.waitForText("AUTH_BOUNDARY_RECOVERED", TIMEOUT);
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
-    expect(readFileSync(historyPath, "utf8")).not.toContain('"context_checkpoint"');
+    expect(readFileSync(historyPath, "utf8")).not.toContain('"kind":"compacted"');
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
     expect(readFileSync(stderrPath, "utf8")).toBe("");

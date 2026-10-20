@@ -1107,18 +1107,6 @@ test "credential clone owns every secret and authority field independently" {
     try std.testing.expectEqual(original.refresh_after_ms, cloned.refresh_after_ms);
 }
 
-var stable_credential_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableCredentialTestEnviron() !*const std.process.Environ.Map {
-    if (stable_credential_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_credential_test_environ = map;
-    return map;
-}
-
 const CredentialTestEnv = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
@@ -1130,8 +1118,6 @@ const CredentialTestEnv = struct {
     /// migrates into the developer's real `FX_OAUTH_SESSION_V1` item and
     /// destroys their fx login.
     fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*CredentialTestEnv {
-        _ = try stableCredentialTestEnviron();
-
         const self = try alloc.create(CredentialTestEnv);
         errdefer alloc.destroy(self);
         self.* = .{
@@ -1147,7 +1133,7 @@ const CredentialTestEnv = struct {
     }
 
     fn deinit(self: *CredentialTestEnv) void {
-        if (stable_credential_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

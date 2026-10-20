@@ -308,10 +308,13 @@ pub fn streamPrepared(
     );
     var http_request = opened.take();
     defer http_request.deinit();
-    var cancel_watch: gateway_client.CancelWatch = .{};
-    defer cancel_watch.stop();
+    var watch: gateway_client.ConnectionWatch = .init(.{
+        .patient = true,
+        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
+    defer watch.stop();
     if (http_request.connection) |connection|
-        try cancel_watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
+        try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -323,7 +326,9 @@ pub fn streamPrepared(
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var response = try http_request.receiveHead(&.{});
+    if (watch.armHead()) |err| return err;
+    var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
@@ -343,7 +348,12 @@ pub fn streamPrepared(
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    return completeFromStream(alloc, request, response.reader(&transfer_buffer));
+    var result = completeFromStream(alloc, request, response.reader(&transfer_buffer), watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        result.deinit(alloc);
+        return err;
+    }
+    return result;
 }
 
 /// Parses one successful Grok event stream into a completion with its
@@ -352,6 +362,7 @@ pub fn completeFromStream(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     reader: *std.Io.Reader,
+    progress: ?sse_stream.Progress,
 ) !stream_provider.Result {
     var events = request.events;
     const completion = try consumeSse(
@@ -364,6 +375,7 @@ pub fn completeFromStream(
         EventBridge.toolInput,
         request.cancel_flag,
         request.content_capture_limit,
+        progress,
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -425,10 +437,11 @@ fn consumeSse(
     on_tool_input_chunk: ?stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
+    progress: ?sse_stream.Progress,
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes };
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes, .progress = progress };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -684,6 +697,7 @@ test "xAI Grok SSE maps text reasoning tools and usage" {
         null,
         &cancelled,
         null,
+        null,
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -842,23 +856,11 @@ fn writeTestErrorResponse(zio: std.Io, stream: std.Io.net.Stream, body_bytes: us
     try writer.interface.flush();
 }
 
-var stable_xai_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableXaiTestEnviron() !*const std.process.Environ.Map {
-    if (stable_xai_test_environ) |map| return map;
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_xai_test_environ = map;
-    return map;
-}
-
 const XaiTestEnvironment = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, responses_url: []const u8) !*@This() {
-        _ = try stableXaiTestEnviron();
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
         self.* = .{
@@ -873,7 +875,7 @@ const XaiTestEnvironment = struct {
     }
 
     fn deinit(self: *@This()) void {
-        if (stable_xai_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -927,6 +929,37 @@ test "xAI Grok request deadline closes slow headers and stalled SSE" {
         try std.testing.expect(elapsed_ms < 1000);
         try std.testing.expect(fixture.thread == null);
     }
+}
+
+test "xAI Grok agent stream closes a silent body as stalled so recovery restarts it" {
+    gateway_client.test_body_stall_timeout_ms = 80;
+    defer gateway_client.test_body_stall_timeout_ms = null;
+    var fixture = try TestResponseFixture.init(.stalled_sse);
+    defer fixture.deinit();
+    try fixture.start();
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/responses", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+    const environment = try XaiTestEnvironment.install(std.testing.allocator, url);
+    defer environment.deinit();
+
+    var delivery = stream_provider.DeliveryCertainty.init();
+    var evidence: stream_provider.AttemptEvidence = .{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    var callback_context: u8 = 0;
+    var request = testModelRequest("grok-test-token", .grok_subscription, "acct_grok_test", &delivery, &evidence, &cancelled, &callback_context);
+    request.content_capture_limit = 1024;
+    // An agent stream has no caller deadline.
+    request.deadline = null;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = agent_stream_provider.stream(std.testing.allocator, request);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    fixture.deinit();
+
+    try std.testing.expectError(error.StreamStalled, result);
+    if (fixture.failure) |err| return err;
+    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
+    try std.testing.expect(elapsed_ms >= 70 and elapsed_ms < 2_000);
+    try std.testing.expectEqual(stream_provider.NetworkFailureCause.stream_stalled, evidence.network_failure.?.cause);
 }
 
 fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
@@ -992,6 +1025,7 @@ fn consumeTestSse(bytes: []const u8) !types.ModelCompletion {
         null,
         null,
         &cancelled,
+        null,
         null,
     );
 }

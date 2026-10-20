@@ -51,9 +51,6 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 
 fn discardThematicRule(_: *anyopaque) !void {}
 fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) !void {}
-fn unavailableFreshPrompt(_: *anyopaque, _: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
-    return error.SessionPersistenceUnavailable;
-}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 
 /// A retained delivery owns its own payload; a settled delivery acknowledges history.
@@ -79,7 +76,6 @@ pub const WorkerEventHandlers = struct {
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
     context_compaction: worker_runtime.ContextCompactionHandler = discardContextCompaction,
-    prepare_fresh_prompt: worker_runtime.FreshPromptHandler = unavailableFreshPrompt,
     append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!HistoryDelivery,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
@@ -136,8 +132,7 @@ fn writeRouteRecoveryBody(
 
 test "shutdown settles queued and pacer-owned finishes exactly once" {
     const session_runtime = @import("../session/session.zig");
-    const session_store = @import("../session/session_store.zig");
-    const session_codec = @import("../session/session_codec.zig");
+    const session_adapter = @import("../session/session_adapter.zig");
     const ShutdownApp = struct {
         alloc: std.mem.Allocator,
         session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
@@ -178,38 +173,22 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         defer app.session_persistence.deinit(alloc);
         defer app.worker.deinit(std.heap.c_allocator);
         defer app.pacer.deinit(alloc);
-        app.session_persistence.store = try session_store.Store.initFromHome(alloc, root, root);
-        const store = &app.session_persistence.store.?;
-        app.session_persistence.writable = try store.startWritableSession(alloc, .{
-            .id = @constCast("shutdown-finish"),
-            .origin_workspace_root = @constCast(root),
-            .workspace_root = @constCast(root),
-            .created_at_ms = 1,
-            .updated_at_ms = 1,
-            .conversation_language = .literal("en"),
-            .history = &.{},
-            .total_input_tokens = 0,
-            .total_output_tokens = 0,
-            .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+        _ = try app.session_persistence.adoptStore(alloc, try session_adapter.Store.open(alloc, root));
+        var model = "test-model".*;
+        app.session_persistence.v2 = try session_adapter.Session.create(alloc, app.session_persistence.v2_store.?, root, .app, .{
+            .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+            .language = .literal("en"),
+            .permission_state = .{},
         });
-        const checkpoint: session_codec.RecoveryCheckpoint = .{
-            .turn_id = 41,
-            .user = .{ .text = @constCast("cancel this response") },
-            .assistant_source = @constCast("partial response"),
-            .cause = .response_interrupted,
-            .action = .continuing_response,
-            .authority = .{ .provider = .gateway, .model = @constCast("test-model") },
-            .requested_fast_mode = false,
-            .fast_mode = false,
-            .max_provider_attempts = 10,
-            .consumed_provider_attempts = 1,
-        };
-        try app_session_runtime.Runtime(ShutdownApp).setRecoveryCheckpoint(&app, checkpoint);
 
         var ownership: Ownership = .{};
         const summary: types.TurnSummary = .{ .token_progress = .{ .input_tokens = 7, .output_tokens = 11 } };
         const finished: types.FinishedPrompt = .{
-            .turn = checkpoint.interruptedTurn(),
+            .turn = .{ .interrupted = .{
+                .user = .{ .text = @constCast("cancel this response") },
+                .assistant = @constCast("partial response"),
+                .terminal_reason = .failed,
+            } },
             .summary = summary,
             .terminal_outcome = .interrupted,
             .snapshot_file_ownership = ownership.handle(),
@@ -231,7 +210,6 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         app.worker.requestShutdown();
         app_session_runtime.Runtime(ShutdownApp).recordShutdownFailure(&app, error.PreviousSessionSaveFailed);
         try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
-        try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint != null);
 
         try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app);
         try Runtime(ShutdownApp).settleFinishedPromptsForShutdown(&app);
@@ -240,18 +218,19 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         try std.testing.expectEqual(@as(usize, 0), ownership.references);
         try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
         try std.testing.expect(app.pacer.deferred_turn == null);
-        try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
-        try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
-        // Close the actual writer before reload so only durable state can pass.
-        app.session_persistence.writable.?.deinit(alloc);
-        app.session_persistence.writable = null;
-        var loaded = try store.loadReadOnly(alloc, "shutdown-finish");
+        // Close the session before reloading so only what it saved can pass.
+        const id = try alloc.dupe(u8, app.session_persistence.v2.?.id());
+        defer alloc.free(id);
+        app.session_persistence.v2.?.close();
+        app.session_persistence.v2 = null;
+        const resumed = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = id }, root, .app);
+        defer resumed.close();
+        var loaded = try resumed.restore(alloc);
         defer loaded.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 2), loaded.history.len);
         try std.testing.expectEqualStrings("partial response", loaded.history[0].interrupted.assistant.?);
         try std.testing.expectEqualDeep(summary, types.historyTurnSummary(loaded.history[0]).?);
         try std.testing.expectEqualStrings("later answer", loaded.history[1].assistant.assistant);
-        try std.testing.expect(loaded.recovery_checkpoint == null);
     }
 }
 
@@ -401,7 +380,6 @@ pub fn Runtime(comptime App: type) type {
                 .provider_resolved,
                 .api_status_text,
                 .context_compaction,
-                .prepare_fresh_prompt,
                 .credential_refreshed,
                 .finish_prompt,
                 .session_grant,
@@ -444,7 +422,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 app.appendFinishedPrompt(finished);
             appended catch |err| {
-                app_session_runtime.Runtime(App).recordFailedHistoryDelivery(app, err);
+                app_session_runtime.Runtime(App).recordShutdownFailure(app, err);
                 return err;
             };
         }
@@ -674,16 +652,6 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn pushDiffBlock(app: *App, payload: diff_mod.DiffEntryPayload) !void {
             try pushOwnedEvent(app, .{ .diff_block = payload });
-        }
-
-        /// Activate an admitted continuation without presenting another user turn.
-        pub fn beginRecoveryPresentation(app: *App) void {
-            app.stream = .{
-                .active = true,
-                .turn_started_ms = io_mod.milliTimestamp(),
-            };
-            _ = app.shell.worker_status_state().clear();
-            app.shell.render_requests.request(.footer);
         }
 
         pub fn syncState(
@@ -1197,10 +1165,6 @@ pub fn Runtime(comptime App: type) type {
                             try handlers.context_compaction(handlers.ctx, value);
                         }
                     },
-                    .prepare_fresh_prompt => |value| {
-                        const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
-                        app.worker.resolveFreshPrompt(std.heap.c_allocator, current, handlers.ctx, handlers.prepare_fresh_prompt);
-                    },
                     .tool_lifecycle => |lifecycle| {
                         switch (lifecycle) {
                             .provisional, .authoritative_started => {
@@ -1525,11 +1489,6 @@ const FakeWorker = struct {
 
     pub fn expireCompactionActivity(self: *FakeWorker, id: @import("../output/compaction_activity.zig").OperationId, revision: u64, now_ms: i64) bool {
         return self.compaction.expire(id, revision, now_ms);
-    }
-
-    fn resolveFreshPrompt(_: *FakeWorker, alloc: std.mem.Allocator, value: worker_runtime.FreshPromptPreparation, ctx: *anyopaque, handler: worker_runtime.FreshPromptHandler) void {
-        var result = handler(ctx, value) catch return;
-        result.deinit(alloc);
     }
 
     fn deinit(self: *FakeWorker) void {
@@ -3119,31 +3078,6 @@ test "core.app_worker_runtime syncState does not start activity for idle queued 
 
     try std.testing.expect(!app.stream.active);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
-}
-
-test "core.app_worker_runtime admitted recovery activates progress without resetting command display" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = 1,
-        .attempt_limit = 10,
-        .action = .paused,
-    } });
-    try tickNoop(&app);
-    app.shell.command_output_display.touched = true;
-    app.worker.queued_count = 1;
-
-    Runtime(FakeApp).beginRecoveryPresentation(&app);
-    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
-
-    try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
-    try std.testing.expect(app.stream.turn_started_ms > 0);
-    try std.testing.expect(app.shell.activityProjection() == .none);
-    try std.testing.expect(app.shell.command_output_display.touched);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
 
 test "core.app_worker_runtime syncState does not start activity for idle processing snapshot" {

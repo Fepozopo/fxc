@@ -35,6 +35,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
+import { commandReplays, logLines, onlySessionId, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const UPGRADE_TIMEOUT = TIMEOUT * 2;
@@ -69,23 +70,21 @@ function fakeShellStop(callId: string, sessionId: string): Response {
   });
 }
 
-/// Set when this run exercises sessions v2, whose sessions are folders
-/// under `sessions/v2` holding `log.jsonl`.
-const SESSIONS_V2 = process.env.FX_SESSIONS_V2 === "1";
-
-/// The command fx prints to continue a session; v2 keeps its flag.
-const RESUME_COMMAND = SESSIONS_V2 ? "fx --sessions-v2 --resume" : "fx --resume";
-
-function sessionsRoot(home: string): string {
-  return SESSIONS_V2 ? join(home, ".fx", "sessions", "v2") : join(home, ".fx", "sessions");
-}
+/// The command fx prints to continue a session.
+const RESUME_COMMAND = "fx --resume";
 
 function sessionIdFromHome(home: string): string {
-  const ids = readdirSync(sessionsRoot(home), { withFileTypes: true })
-    .filter((entry) => entry.name !== "latest" && entry.name !== "v2" && !entry.name.startsWith(".") && entry.isDirectory())
-    .map((entry) => entry.name);
-  expect(ids).toHaveLength(1);
-  return ids[0]!;
+  return onlySessionId(home);
+}
+
+/// Session `id`'s log.
+function logOf(home: string, id: string): string {
+  return join(sessionDir(home, id), "log.jsonl");
+}
+
+/// Session `id`'s items, each as `{ [type]: data }`.
+function savedItems(home: string, id: string): any[] {
+  return logLines(home, id).filter((line: any) => line.kind === "item").map((line: any) => ({ [line.type]: line.data }));
 }
 
 function shellQuote(value: string): string {
@@ -243,16 +242,12 @@ async function waitForPersistedSessionMarker(
   marker: string,
   timeout = TIMEOUT,
 ): Promise<void> {
-  const sessionsDir = sessionsRoot(home);
   await waitForCondition(() => {
-    if (!existsSync(sessionsDir)) return false;
-    return readdirSync(sessionsDir, { withFileTypes: true })
-      .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-      .some((entry) => {
-        const eventsPath = join(sessionsDir, entry.name, SESSIONS_V2 ? "log.jsonl" : "events.jsonl");
-        return existsSync(eventsPath) &&
-          readFileSync(eventsPath, "utf8").includes(marker);
-      });
+    if (!existsSync(storeRoot(home))) return false;
+    return savedSessionIds(home).some((id) => {
+      const log = join(sessionDir(home, id), "log.jsonl");
+      return existsSync(log) && readFileSync(log, "utf8").includes(marker);
+    });
   }, `persisted session marker ${marker}`, timeout);
 }
 
@@ -273,7 +268,7 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
     const seeded = await runFx(["ask", "--json", "Remember the original turn."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(seeded.code).toBe(0);
     const id = JSON.parse(seeded.stdout).session_id;
-    const events = join(home, ".fx", "sessions", id, "events.jsonl");
+    const events = logOf(home, id);
     const accepted = readFileSync(events);
     tui = await TmuxSession.create({
       cmd: "/bin/sh -i", cwd: workspace, isolated: true, remainOnExit: true, width: 110, height: 36,
@@ -361,8 +356,7 @@ test.skipIf(!tmuxAvailable())(
       expect(seeded.code).toBe(0);
       expect(seeded.stderr).toBe("");
       const id = sessionIdFromHome(home);
-      const eventsPath = join(home, ".fx", "sessions", id, "events.jsonl");
-      const events = readFileSync(eventsPath, "utf8");
+      const events = savedText(home, id);
       for (const label of labels) expect(events).toContain(label);
 
       // Pause after real terminal output, with no synthetic cursor response.
@@ -953,9 +947,11 @@ test.skipIf(!tmuxAvailable())(
         expect(gateway.requests).toHaveLength(index + 1);
         expect(gateway.requests[index]!.body).toContain("INTERNAL_SUMMARY_ONLY");
         expect(gateway.requests[index]!.body).toContain("INTERNAL_CALL_506");
-        const events = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-        expect(events.filter((event) => event.event.context_checkpoint).map((event) => event.event.context_checkpoint.summary)).toEqual([summary]);
-        expect(JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8")).schema_version).toBe(4);
+        // The legacy session converted on its first open and its v1 folder went
+        // (D55, D60); its checkpoint is the log's one compaction.
+        const compactions = (logLines(home, sessionId) as any[]).filter((line) => line.kind === "compacted").map((line) => line.data.summary);
+        expect(compactions).toEqual([summary]);
+        expect(existsSync(sessionDir)).toBe(false);
         const replay = await runFx(["replay", tapePath, "--frames"], { cwd: workspace, env: { HOME: home } });
         expect(replay.code).toBe(0);
         expect(replay.stderr).toBe("");
@@ -1793,11 +1789,9 @@ test.skipIf(!tmuxAvailable())(
       expect(active.paneStatus()).toEqual({ dead: false, status: null });
       const sessionId = sessionIdFromHome(home);
 
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const artifactFiles = readdirSync(commandDir);
-      const replayFiles = artifactFiles.filter((name) => name.endsWith(".bin"));
-      expect(replayFiles).toHaveLength(1);
-      const replayBytes = readFileSync(join(commandDir, replayFiles[0]!));
+      const replays = commandReplays(home, sessionId);
+      expect(replays).toHaveLength(1);
+      const replayBytes = readFileSync(replays[0]!.path);
       expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
       expect(replayBytes.includes(Buffer.from(stdoutTail))).toBe(true);
       expect(replayBytes.includes(Buffer.from(stderrTail))).toBe(true);
@@ -2005,12 +1999,9 @@ printf '${tailMarker}\\n'
       expect(terminalCompact).not.toContain(tailMarker);
       expect(terminalCompact).not.toContain(futureMarker);
       const sessionId = sessionIdFromHome(home);
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const replayFiles = readdirSync(commandDir).filter((name) =>
-        name.endsWith(".bin")
-      );
-      expect(replayFiles).toHaveLength(1);
-      const replayBytes = readFileSync(join(commandDir, replayFiles[0]!));
+      const replays = commandReplays(home, sessionId);
+      expect(replays).toHaveLength(1);
+      const replayBytes = readFileSync(replays[0]!.path);
       expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
       expect(replayBytes.includes(Buffer.from(stableMarker))).toBe(true);
       expect(replayBytes.includes(Buffer.from("ACTIVE_OPEN_059999"))).toBe(true);
@@ -2156,13 +2147,10 @@ while :; do :; done
       expect(beforePlain).not.toContain(tailMarker);
 
       const sessionId = sessionIdFromHome(home);
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const replayNames = readdirSync(commandDir).filter((name) =>
-        name.endsWith(".bin")
-      );
-      expect(replayNames).toHaveLength(1);
-      const replayName = replayNames[0]!;
-      const replayPath = join(commandDir, replayName);
+      const replays = commandReplays(home, sessionId);
+      expect(replays).toHaveLength(1);
+      const replayName = replays[0]!.name;
+      const replayPath = replays[0]!.path;
       const replayBytes = readFileSync(replayPath);
       expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
 
@@ -2377,12 +2365,9 @@ while :; do :; done
       expect(countOccurrences(compact, headMarker)).toBe(0);
       expect(compact).not.toContain(tailMarker);
       const sessionId = sessionIdFromHome(home);
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const replayFiles = readdirSync(commandDir).filter((name) =>
-        name.endsWith(".bin")
-      );
-      expect(replayFiles).toHaveLength(1);
-      expect(statSync(join(commandDir, replayFiles[0]!)).size).toBeGreaterThan(0);
+      const replays = commandReplays(home, sessionId);
+      expect(replays).toHaveLength(1);
+      expect(statSync(replays[0]!.path).size).toBeGreaterThan(0);
 
       await active.sendKeys("C-o");
       await active.waitForText(tailMarker, timeout);
@@ -3590,9 +3575,7 @@ test.skipIf(!tmuxAvailable())(
             expect(start).toBeGreaterThanOrEqual(previousEnd);
             previousEnd = start + text.length;
           }
-          const events = readFileSync(
-            join(home, ".fx", "sessions", sessionIdFromHome(home), "events.jsonl"), "utf8",
-          );
+          const events = savedText(home, sessionIdFromHome(home));
           expect(events).toContain("ROW28 ALPHA28_abcdefghijklmnopqrstuvwxyz0123456789");
 
           await active.sendKeys("C-u");
@@ -5750,7 +5733,7 @@ test.skipIf(!tmuxAvailable())(
       // A v2 relaunch keeps its switch, so it reopens the same store.
       expect(argvLines).toEqual([
         installedFx,
-        `${installedFx}${SESSIONS_V2 ? "\t--sessions-v2" : ""}\tresume\t${sessionId}\t--upgrade-relaunch`,
+        `${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`,
       ]);
 
       await active.sendText("Continue after upgrade handoff.");
@@ -5993,10 +5976,7 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       const sessionId = sessionIdFromHome(home);
-      const eventsJsonl = readFileSync(
-        join(home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
+      const eventsJsonl = savedText(home, sessionId);
       expect(eventsJsonl).toContain("committed_file_presentation");
       expect(eventsJsonl).not.toContain("sk-abcdefghijklmnop");
       writeFileSync(stderrPath, "");
@@ -6067,7 +6047,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "spilled diff snapshots stay out of events.jsonl and reload on resume",
+  "large diff snapshots reload on resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-diff-spill-")));
     const home = join(root, "home");
@@ -6119,35 +6099,10 @@ test.skipIf(!tmuxAvailable())(
       await active.kill();
       active = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      // The log frame carries only the artifact reference; the snapshots live
-      // in the session result store.
       const sessionId = sessionIdFromHome(home);
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
-      const eventsJsonl = readFileSync(join(sessionDir, "events.jsonl"), "utf8");
-      const toolResultFrame = eventsJsonl
-        .split("\n")
-        .filter((line) => line.length > 0)
-        .map((line) => JSON.parse(line))
-        .find((frame) => frame.event?.tool_result);
-      const presentation = toolResultFrame?.event?.tool_result?.committed_file_presentation;
-      expect(presentation).toBeDefined();
-      expect(presentation.previous_content).toBeNull();
-      expect(presentation.after_content).toBeNull();
-      expect(presentation.content_handle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
-      // The elided middle of the file is nowhere in the result frame; only
-      // the bounded preview lines stay inline. (The write arguments in the
-      // tool_call frame legitimately carry the full content.)
-      expect(JSON.stringify(toolResultFrame)).not.toContain("SPILLED_DIFF_LINE_200_");
-      const storedArtifact = readFileSync(
-        join(sessionDir, "tool-results", presentation.content_handle),
-        "utf8",
-      );
-      expect(storedArtifact).toContain("SPILLED_DIFF_LINE_200_");
-      expect(storedArtifact).toContain("SPILLED_DIFF_LINE_400");
 
-      // Resume renders the compact row from the inline preview lines and the
-      // full diff reloads the spilled snapshots through the handle.
+      // Resume renders the compact row, and the full diff reloads the
+      // snapshots, which stay inside the result's item (D44).
       const resumedGateway = startFakeGateway([]);
       try {
         active = await TmuxSession.create({
@@ -6191,303 +6146,6 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   90_000,
-);
-
-test.skipIf(!tmuxAvailable())(
-  "missing diff artifact degrades to the inline preview on resume",
-  async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-diff-missing-")));
-    const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
-    mkdirSync(workspace);
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
-    );
-    writeFileSync(stderrPath, "");
-
-    const spilledLines = Array.from(
-      { length: 400 },
-      (_, index) => `MISSING_DIFF_LINE_${String(index + 1).padStart(3, "0")}_0123456789`,
-    );
-    const completion = "MISSING_DIFF_COMPLETE";
-    const gateway = startFakeGateway([
-      fakeGatewayToolCall("write-missing-diff", "write_file", {
-        path: "missing-diff.md",
-        content: `${spilledLines.join("\n")}\n`,
-      }),
-      fakeGatewayFinalText(completion),
-    ]);
-    let active: TmuxSession | null = null;
-    try {
-      active = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, gateway), FX_RECORD: join(root, "initial.fxtape") },
-        stderrPath,
-        width: 120,
-        height: 32,
-      });
-      await active.waitForComposer(TIMEOUT);
-      await active.sendText("Create the missing diff fixture file.");
-      await active.waitForText("Apply this change?", TIMEOUT);
-      await active.sendKeys("1");
-      await active.sendKeys("Enter");
-      const live = await waitForScrollback(active, completion);
-      expect(live).toContain("Wrote missing-diff.md +400");
-      await active.sendText("/quit");
-      expect(await active.waitForSessionEnd()).toBe(true);
-      await active.kill();
-      active = null;
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      // Delete the spilled artifact; resume must degrade to the inline
-      // preview instead of failing.
-      const sessionId = sessionIdFromHome(home);
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
-      const eventsJsonl = readFileSync(join(sessionDir, "events.jsonl"), "utf8");
-      const toolResultFrame = eventsJsonl
-        .split("\n")
-        .filter((line) => line.length > 0)
-        .map((line) => JSON.parse(line))
-        .find((frame) => frame.event?.tool_result);
-      const handle =
-        toolResultFrame?.event?.tool_result?.committed_file_presentation?.content_handle;
-      expect(handle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
-      rmSync(join(sessionDir, "tool-results", handle));
-
-      const resumedGateway = startFakeGateway([]);
-      try {
-        active = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-${sessionId}`,
-          cwd: realpathSync(workspace),
-          env: { ...gatewayEnv(home, resumedGateway), FX_RECORD: join(root, "resumed.fxtape") },
-          stderrPath,
-          width: 120,
-          height: 32,
-        });
-        await active.waitForComposer(TIMEOUT);
-        const resumed = await waitForScrollback(active, completion);
-        expect(resumed).toContain("Wrote missing-diff.md +400");
-
-        // Full detail renders the inline preview lines; the spilled middle
-        // content is unavailable and nothing crashes.
-        await active.sendKeys("C-o");
-        await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
-        await active.waitForText("MISSING_DIFF_LINE_001_", TIMEOUT);
-        const full = await active.capturePane();
-        expect(full).toContain("MISSING_DIFF_LINE_001_");
-        expect(full).not.toContain("MISSING_DIFF_LINE_200_");
-        await active.sendKeys("C-o");
-        await active.waitForComposer(TIMEOUT);
-        expect(readFileSync(stderrPath, "utf8")).toBe("");
-        await active.sendText("/quit");
-        expect(await active.waitForSessionEnd()).toBe(true);
-        await active.kill();
-        active = null;
-      } finally {
-        if (active) {
-          try {
-            await active.sendText("/quit");
-          } catch {}
-          await active.kill();
-        }
-        resumedGateway.stop();
-      }
-    } finally {
-      if (active) await active.kill();
-      gateway.stop();
-      rmSync(root, { recursive: true, force: true });
-    }
-  },
-  90_000,
-);
-
-test.skipIf(!tmuxAvailable())(
-  "resume compacts a legacy log with inline diff snapshots",
-  async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-log-compact-")));
-    const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const stderrPath = join(root, "stderr.log");
-    mkdirSync(join(home, ".fx"), { recursive: true });
-    mkdirSync(workspace);
-    writeFileSync(
-      join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
-    );
-    writeFileSync(stderrPath, "");
-
-    // A live session writes a 400-line file; the commit spills the snapshots
-    // into the result store.
-    const spilledLines = Array.from(
-      { length: 400 },
-      (_, index) => `COMPACT_DIFF_LINE_${String(index + 1).padStart(3, "0")}_0123456789`,
-    );
-    const completion = "COMPACT_DIFF_COMPLETE";
-    const gateway = startFakeGateway([
-      fakeGatewayToolCall("write-compact-diff", "write_file", {
-        path: "compact-diff.md",
-        content: `${spilledLines.join("\n")}\n`,
-      }),
-      fakeGatewayFinalText(completion),
-    ]);
-    let active: TmuxSession | null = null;
-    try {
-      active = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, gateway), FX_RECORD: join(root, "initial.fxtape") },
-        stderrPath,
-        width: 120,
-        height: 32,
-      });
-      await active.waitForComposer(TIMEOUT);
-      await active.sendText("Create the compact diff fixture file.");
-      await active.waitForText("Apply this change?", TIMEOUT);
-      await active.sendKeys("1");
-      await active.sendKeys("Enter");
-      const live = await waitForScrollback(active, completion);
-      expect(live).toContain("Wrote compact-diff.md +400");
-      await active.sendText("/quit");
-      expect(await active.waitForSessionEnd()).toBe(true);
-      await active.kill();
-      active = null;
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      // Rewrite the log into the actual schema-v2 legacy shape: inline
-      // snapshots, no handle, no artifact. Version 3 introduced the handle.
-      const sessionId = sessionIdFromHome(home);
-      const sessionDir = join(home, ".fx", "sessions", sessionId);
-      const eventsPath = join(sessionDir, "events.jsonl");
-      const frames = readFileSync(eventsPath, "utf8")
-        .split("\n")
-        .filter((line) => line.length > 0)
-        .map((line) => JSON.parse(line));
-      const toolResultFrame = frames.find(
-        (frame) => frame.event?.tool_result?.committed_file_presentation,
-      );
-      const presentation = toolResultFrame.event.tool_result.committed_file_presentation;
-      const originalHandle = presentation.content_handle as string;
-      expect(originalHandle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
-      rmSync(join(sessionDir, "tool-results", originalHandle));
-      const legacyLines = Array.from(
-        { length: 12000 },
-        (_, index) => `LEGACY_INLINE_PAYLOAD_${String(index).padStart(4, "0")}`,
-      );
-      const legacyBlob = `${legacyLines.join("\n")}\n`;
-      // A created file's legacy shape: no previous content, full after inline.
-      // (Identical previous/after would produce an empty diff in full detail.)
-      presentation.previous_content = null;
-      presentation.after_content = legacyBlob;
-      delete presentation.content_handle;
-      for (const frame of frames) frame.schema_version = 2;
-      writeFileSync(eventsPath, `${frames.map((frame) => JSON.stringify(frame)).join("\n")}\n`);
-      const fatBytes = statSync(eventsPath).size;
-      expect(fatBytes).toBeGreaterThan(256 * 1024);
-
-      // Resume compacts the log before the transcript hydrates.
-      const tracePath = join(root, "resume.trace.log");
-      const resumedGateway = startFakeGateway([]);
-      try {
-        active = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-${sessionId}`,
-          cwd: realpathSync(workspace),
-          env: {
-            ...gatewayEnv(home, resumedGateway),
-            FX_RECORD: join(root, "resumed.fxtape"),
-            FX_TRACE_LOG: tracePath,
-          },
-          stderrPath,
-          width: 120,
-          height: 32,
-        });
-        await active.waitForComposer(TIMEOUT);
-        const resumed = await waitForScrollback(active, completion);
-        expect(resumed).toContain("Wrote compact-diff.md +400");
-        expect(resumed).not.toContain("LEGACY_INLINE_PAYLOAD_4000");
-        await active.sendText("/quit");
-        expect(await active.waitForSessionEnd()).toBe(true);
-        await active.kill();
-        active = null;
-        expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-        // The log is compact again: snapshots moved to a fresh artifact, the
-        // frame carries a handle, and the freshness marker is recorded.
-        const compactedBytes = statSync(eventsPath).size;
-        expect(compactedBytes).toBeLessThan(fatBytes / 4);
-        const compacted = readFileSync(eventsPath, "utf8");
-        expect(compacted).not.toContain("LEGACY_INLINE_PAYLOAD_4000");
-        expect(compacted).toContain('"content_handle":"diff-');
-        expect(existsSync(join(sessionDir, "events-compaction.marker"))).toBe(true);
-        expect(existsSync(join(sessionDir, "events-compaction.pending"))).toBe(false);
-        const compactedFrames = compacted
-          .split("\n")
-          .filter((line) => line.length > 0)
-          .map((line) => JSON.parse(line));
-        const compactedPresentation = compactedFrames.find(
-          (frame) => frame.event?.tool_result?.committed_file_presentation,
-        ).event.tool_result.committed_file_presentation;
-        const newHandle = compactedPresentation.content_handle as string;
-        expect(newHandle).toMatch(/^diff-[0-9a-f]{16}-[0-9a-f]{16}\.json$/);
-        const artifact = readFileSync(join(sessionDir, "tool-results", newHandle), "utf8");
-        expect(artifact).toContain("LEGACY_INLINE_PAYLOAD_4000");
-        const trace = readFileSync(tracePath, "utf8");
-        expect(trace).toContain("event=session_log_compacted");
-        expect(trace).toContain("event=session_log_compaction_verified");
-
-        // A second resume replays the compacted log and its rebuilt cache;
-        // the full detail reloads the snapshots through the new handle.
-        const secondGateway = startFakeGateway([]);
-        try {
-          active = await TmuxSession.create({
-            cmd: `${FX_BIN} --resume-${sessionId}`,
-            cwd: realpathSync(workspace),
-            env: { ...gatewayEnv(home, secondGateway), FX_RECORD: join(root, "second.fxtape") },
-            stderrPath,
-            width: 120,
-            height: 32,
-          });
-          await active.waitForComposer(TIMEOUT);
-          const second = await waitForScrollback(active, completion);
-          expect(second).toContain("Wrote compact-diff.md +400");
-          await active.sendKeys("C-o");
-          await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
-          await active.waitForText("LEGACY_INLINE_PAYLOAD_11999", TIMEOUT);
-          await active.sendKeys("C-o");
-          await active.waitForComposer(TIMEOUT);
-          expect(readFileSync(stderrPath, "utf8")).toBe("");
-          await active.sendText("/quit");
-          expect(await active.waitForSessionEnd()).toBe(true);
-          await active.kill();
-          active = null;
-        } finally {
-          if (active) {
-            try {
-              await active.sendText("/quit");
-            } catch {}
-            await active.kill();
-          }
-          secondGateway.stop();
-        }
-      } finally {
-        if (active) {
-          try {
-            await active.sendText("/quit");
-          } catch {}
-          await active.kill();
-        }
-        resumedGateway.stop();
-      }
-    } finally {
-      if (active) await active.kill();
-      gateway.stop();
-      rmSync(root, { recursive: true, force: true });
-    }
-  },
-  120_000,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -6777,12 +6435,7 @@ test.skipIf(!tmuxAvailable())(
       expect(filteredPicker).toContain("workspace B");
       expect(filteredPicker).toContain("workspace-b");
       expect(filteredPicker).not.toContain("Preview:");
-      const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-        .map((entry) => entry.name);
-      for (const sessionId of sessionIds) {
+      for (const sessionId of savedSessionIds(home)) {
         expect(filteredPicker).not.toContain(sessionId);
       }
       await active.sendKeys("Enter");
@@ -7435,13 +7088,10 @@ while :; do sleep 1; done
       expect(followUpBody).not.toContain(".command_artifacts");
 
       const sessionId = sessionIdFromHome(home);
-      const commandDir = join(home, ".fx", "sessions", sessionId, "logs", "commands");
-      const replayNames = readdirSync(commandDir).filter((name) =>
-        name.endsWith(".bin")
-      );
-      expect(replayNames).toHaveLength(1);
-      const replayName = replayNames[0]!;
-      const replayPath = join(commandDir, replayName);
+      const replays = commandReplays(home, sessionId);
+      expect(replays).toHaveLength(1);
+      const replayName = replays[0]!.name;
+      const replayPath = replays[0]!.path;
       expect(statSync(replayPath).size).toBeGreaterThan(0);
       expect(followUpBody).toContain(replayName);
       expect(followUpBody).not.toContain(replayPath);
@@ -7652,10 +7302,11 @@ test.skipIf(!tmuxAvailable())(
       const seed = await runFx(["ask", "--json", "Save the conversation."], { cwd: workspace, env });
       expect(seed.code).toBe(0);
       const id = JSON.parse(seed.stdout).session_id;
+      // v1 folders a crash left mid-creation, where the converter looks.
       const sessions = join(home, ".fx", "sessions");
-      const eventsPath = join(sessions, id, "events.jsonl");
+      const eventsPath = logOf(home, id);
       const before = readFileSync(eventsPath);
-      const metadata = JSON.parse(readFileSync(join(sessions, id, "session.json"), "utf8"));
+      const metadata = { schema_version: 4, created_at_ms: 1, updated_at_ms: 2, workspace_root: workspace };
       const remnants: Array<[string, string]> = [];
       for (const failedId of ["temporary-start", "metadata-start", "creating+unpublished"]) {
         const directory = join(sessions, failedId);
@@ -7677,8 +7328,12 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForStableComposer(TIMEOUT);
         await active.sendText("Continue the saved conversation without tools.");
         await active.waitForPane((pane) => pane.includes(reply) && hasEmptyComposer(pane), TIMEOUT);
-        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
-        expect(events.filter((event) => event.assistant?.text === reply)).toHaveLength(1);
+        // The reply shows as it streams, before the turn saves it.
+        const savedReplies = () => savedItems(home, id).filter((event) => event.assistant?.text === reply);
+        await waitForCondition(() => {
+          try { return savedReplies().length > 0; } catch { return false; }
+        }, `the saved ${reply}`);
+        expect(savedReplies()).toHaveLength(1);
         expect(readFileSync(eventsPath).subarray(0, before.length).equals(before)).toBe(true);
         expect(await active.captureFullScrollback()).not.toContain("FileNotFound");
         await active.sendText("/quit");
@@ -7731,23 +7386,23 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForComposer(TIMEOUT);
       }
       const sessionId = sessionIdFromHome(home);
-      const historyPath = join(home, ".fx", "sessions", sessionId, "events.jsonl");
+      const historyPath = logOf(home, sessionId);
       const before = readFileSync(historyPath, "utf8");
       await active.sendText("/compact");
       // Success is silent; publication, not a transcript notice, gates resume.
-      await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"context_checkpoint"'), "durable context checkpoint");
+      await waitForCondition(() => readFileSync(historyPath, "utf8").includes('"kind":"compacted"'), "durable context checkpoint");
       await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
       expect(compacted.startsWith(before)).toBe(true);
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
-      expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
+      expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
       expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
       // Plain turns have nothing to summarize, but the earlier message may set
       // a rule, so the one model call files it; the checkpoint keeps the
       // earlier message and reply word for word.
       expect(gateway.requests).toHaveLength(4);
       expect(gateway.requests[3].body).toContain(JSON.stringify(`- M1: "${earlierRequest}"`).slice(1, -1));
-      const saved: string = records.find((record) => record.event.context_checkpoint).event.context_checkpoint.summary;
+      const saved: string = records.find((record) => record.kind === "compacted").data.summary;
       expect(saved.startsWith("fx-compactor-v1\n")).toBe(true);
       const payload = JSON.parse(saved.slice("fx-compactor-v1\n".length));
       expect(payload.turns[0].users).toEqual([earlierRequest]);
@@ -7815,10 +7470,11 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["0f"]);
       await active.waitForPane((pane) => pane.includes("full detail · ctrl+o close") && pane.includes(tail), TIMEOUT);
-      const resultsDir = join(home, ".fx", "sessions", sessionIdFromHome(home), "tool-results");
-      const files = readdirSync(resultsDir).filter((name) => name.endsWith(".txt"));
-      expect(files).toHaveLength(1);
-      renameSync(join(resultsDir, files[0]!), join(root, "withheld-result.txt"));
+      // The full result is the blob its `artifact_ref` names; hide it.
+      const sessionId = sessionIdFromHome(home);
+      const ref = savedItems(home, sessionId).find((item) => item.tool_result)!.tool_result.artifact_ref as string;
+      expect(ref).toMatch(/^result-[0-9a-f]{64}\.txt$/);
+      renameSync(join(sessionDir(home, sessionId), "blobs", ref.slice("result-".length, -".txt".length)), join(root, "withheld-result.txt"));
       for (let page = 0; page < 3; page += 1) await active.sendKeys("PPage");
       const recovered = await active.waitForPane((pane) =>
         pane.includes("Full saved result unavailable.") && pane.includes(tail),
@@ -7891,7 +7547,6 @@ for (const inspectDetails of [false, true]) {
         await prompt("Read missing.txt once without retrying.");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const sessionId = sessionIdFromHome(home);
-        const eventsPath = join(home, ".fx", "sessions", sessionId, "events.jsonl");
         await active.kill();
         active = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, stderrPath, isolated: true, remainOnExit: true, width: 88, height: 24 });
         await active.waitForComposer(TIMEOUT);
@@ -7922,7 +7577,7 @@ for (const inspectDetails of [false, true]) {
         await active.sendText("/quit");
         await waitForCondition(() => active!.paneStatus().dead, "session exit", TIMEOUT);
         expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
-        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map(line => JSON.parse(line).event);
+        const events = savedItems(home, sessionId);
         expect(events.filter(event => event.tool_result?.call_id === "write-second")).toHaveLength(1);
         expect(events.find(event => event.tool_result?.call_id === "write-receipt").tool_result.committed_file_presentation.lifecycle_id)
           .toEqual({ turn_id: 2, call_id: "write-receipt" });
@@ -7949,13 +7604,12 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     fakeGatewayFinalText("LATEST_B_ACTIVITY"),
   ]);
   const env = gatewayEnv(home, gateway);
-  const bookmark = join(home, ".fx", "continue", createHash("sha256").update(workspace).digest("hex"));
   let active: TmuxSession | null = null, other: TmuxSession | null = null;
   let passed = false;
-  async function open(args: string[], label: string) {
+  async function open(args: string[], label: string, profile = home) {
     return TmuxSession.create({
       cmd: [FX_BIN, ...args].map(shellQuote).join(" "), cwd: workspace,
-      env: { ...env, FX_TRACE_LOG: join(root, label + ".trace"), FX_TRACE_SCOPES: "core,session" },
+      env: { ...env, HOME: profile, FX_TRACE_LOG: join(root, label + ".trace"), FX_TRACE_SCOPES: "core,session" },
       stderrPath: join(root, label + ".stderr"), isolated: true, remainOnExit: true,
       width: 110, height: 40,
     });
@@ -7970,7 +7624,6 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     const a = await runFx(["ask", "--json", "Remember conversation A."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(a.code).toBe(0);
     const aId = JSON.parse(a.stdout).session_id;
-    expect(existsSync(bookmark)).toBe(false);
     active = await open(["-c"], "missing");
     await active.waitForPane(() => active!.paneStatus().dead, TIMEOUT);
     expect(active.paneStatus().status).toBe(1);
@@ -7979,38 +7632,30 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     active = await open(["--resume", aId], "select-a");
     await active.waitForText("REMEMBERED_A_HISTORY", TIMEOUT);
     await active.waitForStableComposer(TIMEOUT);
-    expect(readFileSync(bookmark, "utf8")).toBe(aId + "\n");
     const b = await runFx(["ask", "--json", "Remember conversation B."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(b.code).toBe(0);
     const bId = JSON.parse(b.stdout).session_id;
     other = await open(["--resume", bId], "select-b");
     await other.waitForText("REMEMBERED_B_HISTORY", TIMEOUT);
     await other.waitForStableComposer(TIMEOUT);
-    expect(readFileSync(bookmark, "utf8")).toBe(bId + "\n");
     await active.sendText("Continue the older active conversation without tools.");
     await active.waitForText("LATER_A_ACTIVITY", TIMEOUT);
     await active.waitForStableComposer(TIMEOUT);
-    expect(readFileSync(bookmark, "utf8")).toBe(bId + "\n");
     await close(active); active = null;
     await close(other); other = null;
     active = await open(["--resume", aId], "reselect-a");
     await active.waitForStableComposer(TIMEOUT);
-    expect(readFileSync(bookmark, "utf8")).toBe(aId + "\n");
     await close(active); active = null;
     active = await open([], "empty-window");
     await active.waitForStableComposer(TIMEOUT);
     await close(active); active = null;
-    expect(readFileSync(bookmark, "utf8")).toBe(aId + "\n");
     const latest = await runFx(["ask", "--json", "--resume-id", bId, "Update B without tools."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(latest.code).toBe(0);
     const last = await runFx(["session", "last", "--json"], { cwd: workspace, env });
     expect(last.code).toBe(0); expect(JSON.parse(last.stdout).id).toBe(bId);
-    const before = statSync(bookmark);
     active = await open(["-c"], "continue-a");
     await active.waitForText("LATER_A_ACTIVITY", TIMEOUT);
     await active.waitForStableComposer(TIMEOUT);
-    expect(readFileSync(bookmark, "utf8")).toBe(aId + "\n");
-    expect(statSync(bookmark).ino).toBe(before.ino);
     const trace = readFileSync(join(root, "continue-a.trace"), "utf8");
     expect(trace).not.toContain("mode=workspace_writable_last");
     expect(trace).not.toContain("session picker catalog loaded");
@@ -8025,16 +7670,24 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     await active.waitForText("Sessions 1", TIMEOUT);
     await active.sendKeys("Enter");
     await active.waitForStableComposer(TIMEOUT);
-    expect(readFileSync(bookmark, "utf8")).toBe(bId + "\n");
+    await close(active); active = null;
+    // The picker's choice is what -c opens next.
+    active = await open(["-c"], "continue-b");
+    await active.waitForText("LATEST_B_ACTIVITY", TIMEOUT);
+    await active.waitForStableComposer(TIMEOUT);
     await close(active); active = null;
     expect(gateway.requests).toHaveLength(4);
-    for (const label of ["select-a", "select-b", "reselect-a", "empty-window", "continue-a"]) {
+    for (const label of ["select-a", "select-b", "reselect-a", "empty-window", "continue-a", "continue-b"]) {
       expect(readFileSync(join(root, label + ".stderr"), "utf8")).toBe("");
     }
-    rmSync(bookmark);
+    // A v1 bookmark fx cannot read, in a profile the new store remembers
+    // nothing for, is named as such (D86).
+    const unread = join(root, "unread-home");
+    const bookmark = join(unread, ".fx", "continue", createHash("sha256").update(workspace).digest("hex"));
+    mkdirSync(join(unread, ".fx", "continue"), { recursive: true, mode: 0o700 });
     const fifo = Bun.spawnSync(["mkfifo", bookmark]);
     expect(fifo.exitCode).toBe(0);
-    active = await open(["-c"], "invalid-bookmark");
+    active = await open(["-c"], "invalid-bookmark", unread);
     await active.waitForPane(() => active!.paneStatus().dead, 3000);
     expect(active.paneStatus().status).toBe(1);
     expect(readFileSync(join(root, "invalid-bookmark.stderr"), "utf8")).toContain("remembered session ID could not be read");

@@ -104,35 +104,17 @@ def main():
             time.sleep(0.1)
         code = proc.wait()
     server.shutdown()
-    retained = {"execution_json_bytes": 0, "tool_output_bytes": 0, "tool_steps": 0, "conversation_json_bytes": 0}
-
-    def measure(value):
-        if isinstance(value, dict):
-            if isinstance(value.get("tool_steps"), list):
-                size = len(json.dumps(value, separators=(",", ":")).encode())
-                if size > retained["execution_json_bytes"]:
-                    retained.update(execution_json_bytes=size, tool_steps=len(value["tool_steps"]), tool_output_bytes=sum(result.get("output_bytes", 0) for step in value["tool_steps"] for result in step.get("tool_results", [])))
-            for child in value.values():
-                measure(child)
-        elif isinstance(value, list):
-            for child in value:
-                measure(child)
-
-    for checkpoint in list((home / ".fx/sessions").glob("*/checkpoint.json")) + list((home / ".fx/sessions").glob("*/recovery.json")):
-        measure(json.loads(checkpoint.read_text()))
-    for event_log in (home / ".fx/sessions").glob("*/events.jsonl"):
-        retained["conversation_json_bytes"] += event_log.stat().st_size
+    # What the session kept: its log and blobs, and each step's tool result.
+    retained = {"session_bytes": 0, "tool_output_bytes": 0, "tool_steps": 0}
+    for log in (home / ".fx/sessions/v2").glob("*/log.jsonl"):
+        retained["session_bytes"] += sum(path.stat().st_size for path in log.parent.rglob("*") if path.is_file())
         result_count = 0
         output_bytes = 0
-        for line in event_log.open():
+        for line in log.open():
             value = json.loads(line)
-            measure(value)
-            result = value.get("event", {}).get("tool_result")
-            if isinstance(result, dict):
+            if value.get("kind") == "item" and value.get("type") == "tool_result":
                 result_count += 1
-                output_bytes += result.get("output_bytes", 0)
-        # This workload has one read per step. Completed v4 turns use normalized
-        # conversation events instead of an embedded execution snapshot.
+                output_bytes += value["data"].get("output_bytes", 0)
         if result_count > retained["tool_steps"]:
             retained.update(tool_steps=result_count, tool_output_bytes=output_bytes)
     try:

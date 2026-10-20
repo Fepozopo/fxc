@@ -2004,25 +2004,11 @@ fn expectTranscriptContains(app: *const FakeApp, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, app.text(), needle) != null);
 }
 
-var session_command_stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableSessionCommandTestEnviron() !*const std.process.Environ.Map {
-    if (session_command_stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    session_command_stable_test_environ = map;
-    return map;
-}
-
 const SessionCommandTestHome = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: std.mem.Allocator, home: ?[]const u8) !*SessionCommandTestHome {
-        _ = try stableSessionCommandTestEnviron();
-
         const self = try alloc.create(SessionCommandTestHome);
         errdefer alloc.destroy(self);
 
@@ -2040,9 +2026,7 @@ const SessionCommandTestHome = struct {
     }
 
     fn deinit(self: *SessionCommandTestHome) void {
-        if (session_command_stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

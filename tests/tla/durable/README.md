@@ -11,7 +11,7 @@ plants realistic bugs and requires TLC to catch each one.
 | `ParallelBatch.tla` | Parallel by default, `writes: true` as a fence, results in model order | A writer never overlaps another call, and nothing passes a writer |
 | `Fencing.tla` | Two processes on one World log with conditional appends | One intent, one outcome, one run across processes |
 | `Inbox.tla` | Prompts, steers, and follow-ups through the journal; withdraw | A resolved promise means durable, and each input is placed once |
-| `Resumption.tla` | Resuming a turn a crash cut off | fx never asks, every crash of an open turn is resumed, and the model is told |
+| `Resumption.tla` | Resuming a turn a crash cut off, including after its reply was saved | fx never asks, every crash of an open turn is resumed, the model is told, a saved reply is delivered without asking the model again, and `turn.result` waits for the turn's durable end |
 | `SnapshotTail.tla` | `load()` returning a snapshot plus the events after it | Snapshots only cover durable events, and restore replays the tail exactly once |
 
 Every spec also checks `TypeOK`.

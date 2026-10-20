@@ -26,131 +26,39 @@ const Allocator = std.mem.Allocator;
 
 test "child compaction preserves work identity and permits final commit" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    var store = try session_store.Store.initFromHome(alloc, root, root);
-    defer store.deinit(alloc);
-    const state = session_codec.DurableSessionState{
-        .id = @constCast("child-compaction"),
-        .origin_workspace_root = @constCast(root),
-        .workspace_root = @constCast(root),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-    };
-    var writable = try store.startWritableSession(alloc, state);
-    defer writable.deinit(alloc);
-    var turn = try TurnContext.init(alloc, &writable, 0);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const child = try parent.openChild("child-compaction", &.{});
+    defer child.close();
+    var turn = try TurnContext.init(alloc, child, 0);
     defer turn.deinit();
     turn.active_work_id = "work-checkpoint";
+    try turn.beginTurn();
     try turn.commitContextCompaction(.{
         .summary = @constCast("<context_handoff>continue child work</context_handoff>"),
         .removed_turn_count = 0,
         .compaction_count = 1,
-    }, .{ .user = .{ .text = @constCast("child request") }, .assistant = @constCast("") }, null, 2);
+    }, .{ .user = .{ .text = @constCast("child request") }, .assistant = @constCast("") }, null);
     try std.testing.expect(!turn.committed);
-    try turn.setRecoveryCheckpoint(.{
-        .turn_id = 7,
-        .user = .{ .text = @constCast("child request") },
-        .assistant_source = @constCast("partial"),
-        .cause = .network_interrupted,
-        .action = .paused,
-        .authority = .{ .provider = .gateway, .model = @constCast("test") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    }, 2);
-    try std.testing.expectEqualStrings("work-checkpoint", writable.state.recovery_checkpoint.?.user.work_id.?);
     try turn.commit("work-checkpoint", .{ .assistant = .{
         .user = .{ .text = @constCast("child request") },
         .assistant = @constCast("child done"),
-    } }, 10, 5, 3);
+    } });
     try std.testing.expect(turn.committed);
-    const bytes = try writable.conversation_writer.readAllForTest(alloc);
-    defer alloc.free(bytes);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "child request"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "work-checkpoint"));
-    try std.testing.expect(std.mem.find(u8, bytes, "child done") != null);
-}
-
-test "child recovery admission distinguishes work identity from repeated prompt text" {
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{ "old-work", "new-work" }) |work_id| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(root);
-        var store = try session_store.Store.initFromHome(alloc, root, root);
-        defer store.deinit(alloc);
-        const session_id = "child-recovery-admission";
-        const user = types.UserTurn{ .text = @constCast("same prompt"), .work_id = @constCast("old-work") };
-        {
-            var writable = try store.startWritableSession(alloc, .{
-                .id = @constCast(session_id),
-                .origin_workspace_root = @constCast(root),
-                .workspace_root = @constCast(root),
-                .created_at_ms = 1,
-                .updated_at_ms = 1,
-                .conversation_language = session.ConversationLanguage.literal("en"),
-                .history = &.{},
-                .total_input_tokens = 0,
-                .total_output_tokens = 0,
-                .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-            });
-            defer writable.deinit(alloc);
-            _ = try writable.commitContextCompaction(alloc, .{
-                .summary = @constCast("<context_handoff>old work checkpoint</context_handoff>"),
-                .removed_turn_count = 0,
-                .compaction_count = 1,
-            }, .{ .user = user, .assistant = @constCast("") }, null, 2);
-            _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = .{
-                .turn_id = 7,
-                .user = user,
-                .assistant_source = @constCast("old partial answer"),
-                .cause = .network_interrupted,
-                .action = .paused,
-                .authority = .{ .provider = .gateway, .model = @constCast("test") },
-                .requested_fast_mode = false,
-                .fast_mode = false,
-                .max_provider_attempts = 3,
-                .consumed_provider_attempts = 1,
-            } } }, 3);
-        }
-        const same_work = std.mem.eql(u8, work_id, "old-work");
-        {
-            var writable = try store.resumeForWrite(alloc, session_id);
-            defer writable.deinit(alloc);
-            var turn = try TurnContext.init(alloc, &writable, 0);
-            defer turn.deinit();
-            turn.active_work_id = work_id;
-            var recovery = try turn.prepareRecoveryForActiveWork(alloc);
-            defer if (recovery) |*checkpoint| checkpoint.deinit(alloc);
-            try std.testing.expectEqual(same_work, recovery != null);
-            try std.testing.expect(!turn.committed);
-            try std.testing.expectEqual(same_work, writable.conversation_writer.turn_open);
-            try turn.commit(work_id, .{ .assistant = .{
-                .user = .{ .text = @constCast("same prompt") },
-                .assistant = @constCast("new answer"),
-            } }, 0, 0, 4);
-            try std.testing.expect(turn.committed);
-        }
-        var restored = try store.loadReadOnly(alloc, session_id);
-        defer restored.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, if (same_work) 2 else 3), restored.history.len);
-        if (!same_work) {
-            try std.testing.expectEqualStrings("old-work", restored.history[1].interrupted.user.work_id.?);
-            try std.testing.expectEqualStrings("old partial answer", restored.history[1].interrupted.assistant.?);
-        }
-        try std.testing.expectEqualStrings(work_id, restored.history[restored.history.len - 1].assistant.user.work_id.?);
-        try std.testing.expectEqualStrings(work_id, restored.last_subagent_work_id.?);
-    }
+    // The compaction's active prefix and the final turn are one request.
+    const history = try parent.store.childHistory(alloc, "child-compaction");
+    defer types.freeHistoryTurnSlice(alloc, history);
+    var requests: usize = 0;
+    for (history) |entry| switch (entry) {
+        .assistant => |done| if (std.mem.eql(u8, done.user.text, "child request")) {
+            requests += 1;
+            try std.testing.expectEqualStrings("work-checkpoint", done.user.work_id.?);
+            try std.testing.expectEqualStrings("child done", done.assistant);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), requests);
 }
 
 pub const TurnPreferences = struct {
@@ -219,19 +127,13 @@ pub const CommitError = error{
     SessionCommitFailed,
 };
 
-/// The child session a turn writes: v1's loaded session, or a v2 child
-/// through the adapter (D22).
-pub const ChildSession = union(enum) {
-    v1: *session_store.LoadedWritableSession,
-    v2: *session_adapter.Session,
-};
-
 pub const TurnContext = struct {
     alloc: Allocator,
     runtime: session.SessionRuntime,
     worker: worker_runtime.WorkerRuntime = .{},
     managed_executions: managed_execution.Runtime,
-    loaded: ChildSession,
+    /// The child session the turn writes, through the adapter (D22).
+    child: *session_adapter.Session,
     live_authority: ?*authority_mod.Resolver = null,
     approval_registry: ?*approval_registry_mod.Registry = null,
     approval_worker_route: ?approval_registry_mod.WorkerRoute = null,
@@ -248,30 +150,8 @@ pub const TurnContext = struct {
     failure_diagnostic: ?types.ModelFailureDiagnostic = null,
     committed: bool = false,
 
+    /// A turn over a child, restored from its log.
     pub fn init(
-        alloc: Allocator,
-        loaded: *session_store.LoadedWritableSession,
-        max_history_turns: usize,
-    ) !TurnContext {
-        var runtime = session.SessionRuntime{ .max_history_turns = max_history_turns };
-        errdefer runtime.deinit(alloc);
-        try runtime.restoreWithPermissionState(
-            alloc,
-            loaded.state.conversation_language,
-            loaded.state.history,
-            loaded.state.permission_state,
-        );
-        loaded.releaseHydrationHistory(alloc);
-        return .{
-            .alloc = alloc,
-            .runtime = runtime,
-            .managed_executions = managed_execution.Runtime.init(alloc),
-            .loaded = .{ .v1 = loaded },
-        };
-    }
-
-    /// A turn over a v2 child, restored from its log.
-    pub fn initV2(
         alloc: Allocator,
         child: *session_adapter.Session,
         max_history_turns: usize,
@@ -290,7 +170,7 @@ pub const TurnContext = struct {
             .alloc = alloc,
             .runtime = runtime,
             .managed_executions = managed_execution.Runtime.init(alloc),
-            .loaded = .{ .v2 = child },
+            .child = child,
         };
     }
 
@@ -318,50 +198,16 @@ pub const TurnContext = struct {
         return &self.runtime;
     }
 
-    pub fn prepareRecoveryForActiveWork(
-        self: *TurnContext,
-        alloc: Allocator,
-    ) CommitError!?session_codec.RecoveryCheckpoint {
-        // v2 keeps no paused-response checkpoint (D31).
-        const loaded = switch (self.loaded) {
-            .v1 => |value| value,
-            .v2 => return null,
-        };
-        const checkpoint = loaded.state.recovery_checkpoint orelse return null;
-        if (loaded.conversation_writer.turn_open) {
-            const prior_work_id = checkpoint.user.work_id orelse return error.InvalidWorkId;
-            const work_id = self.active_work_id orelse return error.InvalidWorkId;
-            if (!std.mem.eql(u8, prior_work_id, work_id)) {
-                try self.appendCommittedHistory(
-                    prior_work_id,
-                    checkpoint.interruptedTurn(),
-                    loaded.state.total_input_tokens,
-                    loaded.state.total_output_tokens,
-                    io_mod.milliTimestamp(),
-                );
-                return null;
-            }
-        }
-        return try checkpoint.dupe(alloc);
-    }
-
-    /// Opens a v2 child's turn on disk as its work starts, so a body its
-    /// tools store is a blob of a session on disk (D44). A v1 child keeps
-    /// side files and has nothing to open.
+    /// Opens the child's turn on disk as its work starts, so a body its
+    /// tools store is a blob of a session on disk (D44).
     pub fn beginTurn(self: *TurnContext) !void {
-        switch (self.loaded) {
-            .v1 => {},
-            .v2 => |child| try child.beginTurn(),
-        }
+        try self.child.beginTurn();
     }
 
     pub fn childCapability(
         self: *TurnContext,
     ) !*session_child_store.SessionChildCapability {
-        return switch (self.loaded) {
-            .v1 => |loaded| loaded.childCapability(),
-            .v2 => |child| child.childCapability(),
-        };
+        return self.child.childCapability();
     }
 
     pub fn workerRuntime(self: *TurnContext) *worker_runtime.WorkerRuntime {
@@ -561,27 +407,13 @@ pub const TurnContext = struct {
         };
     }
 
-    pub fn commit(
-        self: *TurnContext,
-        work_id: []const u8,
-        turn: types.HistoryTurn,
-        total_input_tokens: u64,
-        total_output_tokens: u64,
-        timestamp_ms: i64,
-    ) CommitError!void {
+    pub fn commit(self: *TurnContext, work_id: []const u8, turn: types.HistoryTurn) CommitError!void {
         if (self.committed) return error.TurnAlreadyCommitted;
-        try self.appendCommittedHistory(work_id, turn, total_input_tokens, total_output_tokens, timestamp_ms);
+        try self.appendCommittedHistory(work_id, turn);
         self.committed = true;
     }
 
-    fn appendCommittedHistory(
-        self: *TurnContext,
-        work_id: []const u8,
-        turn: types.HistoryTurn,
-        total_input_tokens: u64,
-        total_output_tokens: u64,
-        timestamp_ms: i64,
-    ) CommitError!void {
+    fn appendCommittedHistory(self: *TurnContext, work_id: []const u8, turn: types.HistoryTurn) CommitError!void {
         var committed_turn = session.dupeHistoryTurn(self.alloc, turn) catch
             return error.OutOfMemory;
         defer session.freeHistoryTurn(self.alloc, committed_turn);
@@ -595,38 +427,10 @@ pub const TurnContext = struct {
             return error.OutOfMemory;
         var prepared_owned = true;
         defer if (prepared_owned) session.freeHistoryTurn(self.alloc, prepared);
-        const loaded = switch (self.loaded) {
-            .v1 => |value| value,
-            .v2 => |child| {
-                // The work id rides on the turn; v2 keeps no token totals,
-                // and v1 reloads its own as zero.
-                child.prepareTurn(&prepared) catch |err| return commitFailed(child, work_id, "prepare", err);
-                child.commitTurn(prepared, self.runtime.languageSnapshot()) catch |err| return commitFailed(child, work_id, "commit", err);
-                self.runtime.commitPreparedHistoryEntry(self.alloc, prepared);
-                prepared_owned = false;
-                return;
-            },
-        };
-        loaded.prepareHistoryTurnForCommit(self.alloc, &prepared) catch |err| {
-            return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.SessionCommitFailed,
-            };
-        };
-        _ = loaded.appendEvent(
-            self.alloc,
-            .{ .history_turn_committed = .{
-                .conversation_language = self.runtime.languageSnapshot(),
-                .total_input_tokens = total_input_tokens,
-                .total_output_tokens = total_output_tokens,
-                .work_id = @constCast(work_id),
-                .turn = prepared,
-            } },
-            timestamp_ms,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SessionCommitFailed,
-        };
+        // The work id rides on the turn.
+        const child = self.child;
+        child.prepareTurn(&prepared) catch |err| return commitFailed(child, work_id, "prepare", err);
+        child.commitTurn(prepared, self.runtime.languageSnapshot()) catch |err| return commitFailed(child, work_id, "commit", err);
         self.runtime.commitPreparedHistoryEntry(self.alloc, prepared);
         prepared_owned = false;
     }
@@ -636,7 +440,6 @@ pub const TurnContext = struct {
         summary: types.CompactedSummaryHistoryTurn,
         active_prefix: ?types.AssistantHistoryTurn,
         retained_from: ?types.ContextHistoryCut,
-        timestamp_ms: i64,
     ) !void {
         var prefix: ?types.HistoryTurn = if (active_prefix) |value|
             try session.dupeHistoryTurn(self.alloc, .{ .assistant = value })
@@ -648,68 +451,9 @@ pub const TurnContext = struct {
         }
         const prepared = try session.prepareCompactedHistory(self.alloc, self.runtime.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(self.runtime.agent.history.items) });
         errdefer types.freeHistoryTurnSlice(self.alloc, prepared);
-        switch (self.loaded) {
-            .v1 => |loaded| _ = try loaded.commitContextCompaction(
-                self.alloc,
-                summary,
-                if (prefix) |value| value.assistant else null,
-                retained_from,
-                timestamp_ms,
-            ),
-            // The active prefix reaches the log with the turn's commit.
-            .v2 => |child| try child.commitCompaction(summary, prefix != null, retained_from),
-        }
+        // The active prefix reaches the log with the turn's commit.
+        try self.child.commitCompaction(summary, prefix != null, retained_from);
         self.runtime.commitCompactedHistory(self.alloc, prepared);
-    }
-
-    pub fn setRecoveryCheckpoint(
-        self: *TurnContext,
-        checkpoint: session_codec.RecoveryCheckpoint,
-        timestamp_ms: i64,
-    ) CommitError!void {
-        const work_id = self.active_work_id orelse return error.InvalidWorkId;
-        session.validateWorkId(work_id) catch return error.InvalidWorkId;
-        if (checkpoint.user.work_id) |checkpoint_work_id| {
-            if (!std.mem.eql(u8, checkpoint_work_id, work_id)) return error.InvalidWorkId;
-        }
-        var bound = checkpoint;
-        bound.user.work_id = @constCast(work_id);
-        const loaded = switch (self.loaded) {
-            .v1 => |value| value,
-            // v2 keeps no paused-response checkpoint (D31), as the root
-            // hosts do not; the pause is not claimed as saved.
-            .v2 => |child| {
-                debug_trace.logf("subagent", "child pause not kept child_id={s} work_id={s} cause={s} reason=sessions_v2", .{ child.id(), work_id, @tagName(checkpoint.cause) });
-                return error.SessionCommitFailed;
-            },
-        };
-        _ = loaded.appendEvent(
-            self.alloc,
-            .{ .recovery_checkpoint_set = .{ .checkpoint = bound } },
-            timestamp_ms,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SessionCommitFailed,
-        };
-    }
-
-    pub fn clearRecoveryCheckpoint(
-        self: *TurnContext,
-        timestamp_ms: i64,
-    ) CommitError!void {
-        const loaded = switch (self.loaded) {
-            .v1 => |value| value,
-            .v2 => return,
-        };
-        if (loaded.state.recovery_checkpoint == null) return;
-        _ = loaded.appendEvent(
-            self.alloc,
-            .{ .recovery_checkpoint_cleared = .{} },
-            timestamp_ms,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SessionCommitFailed,
-        };
     }
 };
 

@@ -31,6 +31,9 @@ tests/
 │   ├── conformance/       MCP conformance package, run with npm
 │   └── render-lab/        rendering evidence tool
 ├── evals/                 model-backed evals, run only on request
+├── fixtures/
+│   └── v1-sessions/       sessions the v0.0.14 release saved, which the converter's tests copy;
+│                          generate.ts rebuilds them and manifest.json lists them
 └── tla/                   TLA+ models, their checkers, and their Bun drivers
     ├── session_manager/   one folder per model area, named after the module it describes,
     ├── mcp/               each with a check.sh; tla/README.md lists them all

@@ -7,7 +7,7 @@ const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const sidecar_file = "display.json";
+const sidecar_file = "display.json";
 pub const max_sidecar_bytes: usize = 16 * 1024;
 const max_title_words: usize = 8;
 pub const max_title_bytes: usize = 240;

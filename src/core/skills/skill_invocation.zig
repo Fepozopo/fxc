@@ -1757,7 +1757,7 @@ test "skill invocation preserves hard allocation failures" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     try std.testing.checkAllAllocationFailures(
         testing_allocator.no_resize,
@@ -1789,7 +1789,7 @@ test "skill invocation loads installed skill content" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
@@ -1832,7 +1832,7 @@ test "stale skill catalogs reject mutated candidates before loading" {
         const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
         defer alloc.free(skills_dir);
         try setTestHome(null);
-        defer setTestHome(null) catch {};
+        defer io_mod.resetEnvironForTest();
 
         var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
         defer discovery.deinit(alloc);
@@ -1949,7 +1949,7 @@ test "skill invocation reads validated candidate resources after path replacemen
         const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
         defer alloc.free(skills_dir);
         try setTestHome(null);
-        defer setTestHome(null) catch {};
+        defer io_mod.resetEnvironForTest();
 
         var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
         defer discovery.deinit(alloc);
@@ -2006,7 +2006,7 @@ test "large skills stay discoverable and explicit overrides can continue past de
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
@@ -2047,7 +2047,7 @@ test "explicit invocation reports user byte ceilings without partial success" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
     const catalog = Catalog{ .skills = discovery.skills, .diagnostics = discovery.diagnostics };
@@ -2141,7 +2141,7 @@ test "explicit invocation preserves configured skill content when discovery is i
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
@@ -2200,7 +2200,7 @@ test "explicit prompt section cleans up every allocation failure with both notic
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var limits = context_limits.Values{};
     limits.skill_chunk_bytes = .{ .value = .{ .bytes = 64 }, .source = .command_line };
@@ -2276,7 +2276,7 @@ test "skill resources continue on line-safe UTF-8 boundaries and reject unsafe i
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
     const catalog = Catalog{ .skills = discovery.skills, .diagnostics = discovery.diagnostics };
@@ -2360,7 +2360,7 @@ test "skill invocation encodes loaded paths and preserves the skill body" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, home_root ++ "/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
@@ -2394,7 +2394,7 @@ test "skill invocation encodes hostile missing skill name" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     const result = try loadByIdentity(
         alloc,
@@ -2443,7 +2443,7 @@ test "skill invocation preserves strict discovery diagnostics without a profile 
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "custom-skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
@@ -2585,7 +2585,7 @@ test "exact skill failure bounds a caller-supplied location" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "custom-skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
     var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
     defer discovery.deinit(alloc);
 

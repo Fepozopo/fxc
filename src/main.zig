@@ -578,7 +578,6 @@ const App = struct {
     worker: WorkerRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
-    legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
     upgrader: auto_upgrade.AutoUpgrade = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
@@ -637,10 +636,6 @@ const App = struct {
                 process_provider.unavailable_provider
             else
                 shell_process_provider.provider),
-            .legacy_process_provider = if (comptime host_target.is_wasm)
-                process_provider.unavailable_provider
-            else
-                shell_process_provider.provider,
         };
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
@@ -678,7 +673,6 @@ const App = struct {
             launch.requested_resume = null;
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
-        app.session_persistence.sessions_v2 = launch.modifiers.sessions_v2;
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -734,6 +728,9 @@ const App = struct {
                     return err;
                 };
                 SessionAppRuntime.syncTerminalTitle(&app);
+            } else if (launch.upgrade_relaunch) |relaunch| {
+                SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
+                    debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
             }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
@@ -765,7 +762,7 @@ const App = struct {
     }
 
     pub fn rebindAfterInit(self: *App) void {
-        SessionAppRuntime.rebindSubagentHost(self);
+        SessionAppRuntime.rebindAfterMove(self);
     }
 
     pub fn setNotificationPreferences(
@@ -933,9 +930,8 @@ const App = struct {
         buffer: []u8,
         session_id: []const u8,
         terminal_cols: u16,
-        sessions_v2: bool,
     ) ![]const u8 {
-        return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols, sessions_v2);
+        return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
     }
 
     /// Full teardown for hosts that keep running after the shell ends, such as
@@ -1214,6 +1210,7 @@ const App = struct {
         defer if (context_targets.len > 0) self.alloc.free(context_targets);
 
         try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.noteModelCatalogActivity();
         self.session.setConversationLanguageFromUserMessage(prompt);
 
         debug_trace.logf(
@@ -1237,6 +1234,15 @@ const App = struct {
         return true;
     }
 
+    /// A prompt the user submitted is activity, so a stale or failed model
+    /// catalog refetches in the background. Only these submission paths call
+    /// it: a recovery continuation can queue during startup, before the App
+    /// reaches the address a fetch thread may hold. Cooperative hosts fetch
+    /// inline and skip it.
+    fn noteModelCatalogActivity(self: *App) void {
+        if (comptime !host_profile.cooperative_agent) self.startModelCacheWarmup();
+    }
+
     pub fn adoptPendingUserPrompt(
         self: *App,
         draft: *const input_submit_runtime.PendingPromptDraft,
@@ -1258,6 +1264,7 @@ const App = struct {
             &.{};
         defer if (context_targets.len > 0) self.alloc.free(context_targets);
         try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.noteModelCatalogActivity();
         self.session.setConversationLanguageFromUserMessage(draft.prompt);
 
         const skill_tokens = try promptCardSkillTokensFromDisplaySpans(
@@ -1372,10 +1379,6 @@ const App = struct {
         return SessionAppRuntime.forkBeforeSelectedPrompt(self);
     }
 
-    pub fn startSessionCatalogPreload(self: *App) void {
-        SessionAppRuntime.preloadSessionCatalog(self);
-    }
-
     pub fn loadMoreSessionPicker(self: *App) !bool {
         return SessionAppRuntime.loadMoreSessionPicker(self);
     }
@@ -1437,26 +1440,6 @@ const App = struct {
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
-        return true;
-    }
-
-    pub fn queueRecoveryCheckpoint(
-        self: *App,
-        checkpoint: *const session_codec.RecoveryCheckpoint,
-    ) !bool {
-        if (!try self.snapshotAndQueuePrompt(
-            checkpoint.user.text,
-            &.{},
-            checkpoint,
-            null,
-            checkpoint.turn_id,
-            false,
-        )) return false;
-        WorkerAppRuntime.beginRecoveryPresentation(self);
-        WorkerAppRuntime.syncState(
-            self,
-            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
-        );
         return true;
     }
 
@@ -2294,7 +2277,18 @@ const App = struct {
     }
 
     pub fn startModelCacheWarmup(self: *App) void {
+        self.loadModelCatalog(.activity);
+    }
+
+    /// Opening the model picker revalidates the catalog in the background;
+    /// the picker lists the cached models until the refresh lands.
+    pub fn revalidateModelCache(self: *App) void {
+        self.loadModelCatalog(.picker_open);
+    }
+
+    fn loadModelCatalog(self: *App, trigger: model_cache_runtime.LoadTrigger) void {
         if (comptime host_profile.cooperative_agent) {
+            // Cooperative hosts fetch inline, so only stale catalogs reload there.
             if (self.auth.credentialNeedsRefresh()) {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=credential_refresh_required", .{});
                 return;
@@ -2313,6 +2307,7 @@ const App = struct {
             self.model_cache.startWarmup(
                 self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
+                trigger,
             );
         }
     }
@@ -3502,10 +3497,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_native_session.isControlModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = environBlockFromRaw(raw_env) },
-            });
+            var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
             defer threaded.deinit();
             io_mod.setIo(threaded.io());
             try terminal_native_session.runControlMarker(raw_args);
@@ -3514,10 +3506,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_native_session.isLauncherModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = environBlockFromRaw(raw_env) },
-            });
+            var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
             defer threaded.deinit();
             io_mod.setIo(threaded.io());
             try terminal_native_session.runLauncher(processAllocator());
@@ -3537,10 +3526,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     if (command_runner.isForegroundSessionInvocation(cli_args)) {
         io_mod.setRawEnviron(raw_env);
         const process_args = argsFromRaw(raw_args);
-        var threaded = std.Io.Threaded.init(processAllocator(), .{
-            .argv0 = .init(process_args),
-            .environ = .{ .block = environBlockFromRaw(raw_env) },
-        });
+        var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
         defer threaded.deinit();
         io_mod.setIo(threaded.io());
         try command_runner.runForegroundSessionBootstrap(cli_args);
@@ -3588,10 +3574,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     if (needsEarlyThreadedIo(cli_args)) {
         const env_block = environBlockFromRaw(raw_env);
         const process_args = argsFromRaw(raw_args);
-        early_threaded = std.Io.Threaded.init(alloc, .{
-            .argv0 = .init(process_args),
-            .environ = .{ .block = env_block },
-        });
+        early_threaded = std.Io.Threaded.init(alloc, processIoOptions(process_args, env_block));
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
 
@@ -3600,10 +3583,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         .interactive => |launch| {
             const env_block = environBlockFromRaw(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(alloc, .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = env_block },
-            });
+            var threaded = std.Io.Threaded.init(alloc, processIoOptions(process_args, env_block));
             io_mod.setIo(threaded.io());
 
             var owned_launch = launch;
@@ -3632,6 +3612,19 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
     return .{ .vector = raw_args };
+}
+
+/// Options for every process Io. fx starts its own tasks with `io.concurrent`,
+/// and they count against the capacity that limits `io.async`. Once fx holds
+/// that many tasks, std runs each `io.async` call inline, so
+/// `HostName.connect` tries a host's addresses one at a time and waits on an
+/// unreachable address instead of returning the reachable one.
+fn processIoOptions(process_args: std.process.Args, env_block: std.process.Environ.Block) std.Io.Threaded.InitOptions {
+    return .{
+        .argv0 = .init(process_args),
+        .environ = .{ .block = env_block },
+        .async_limit = .unlimited,
+    };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
@@ -3916,6 +3909,113 @@ test "lightweight local commands do not request early threaded io" {
     try std.testing.expect(!needsEarlyThreadedIo(&.{}));
     for ([_][:0]const u8{ "help", "sessions", "tasks", "permissions" }) |command| {
         try std.testing.expect(!needsEarlyThreadedIo(&.{command}));
+    }
+}
+
+test "process io connects through a reachable address while fx tasks hold every async slot" {
+    // This test builds the process Io from processIoOptions instead of using
+    // std.testing.io, because those options are what it checks. Only name
+    // lookup and the unreachable address are faked. std's HostName.connect,
+    // Io.Threaded, and the loopback socket are real.
+    const Fake = struct {
+        var base: std.Io.VTable = undefined;
+        var vtable: std.Io.VTable = undefined;
+        var port: u16 = 0;
+
+        // A connect to this address never completes, like a black-holed IPv6
+        // route, until std cancels the losing attempt.
+        fn blackHoleAt(port_number: u16) std.Io.net.IpAddress {
+            return .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = port_number } };
+        }
+
+        fn lookup(
+            userdata: ?*anyopaque,
+            _: std.Io.net.HostName,
+            resolved: *std.Io.Queue(std.Io.net.HostName.LookupResult),
+            options: std.Io.net.HostName.LookupOptions,
+        ) std.Io.net.HostName.LookupError!void {
+            const io: std.Io = .{ .userdata = userdata, .vtable = &vtable };
+            defer resolved.close(io);
+            resolved.putAll(io, &.{
+                .{ .address = blackHoleAt(options.port) },
+                .{ .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = options.port } } },
+            }) catch return error.UnknownHostName;
+        }
+
+        fn connect(
+            userdata: ?*anyopaque,
+            address: *const std.Io.net.IpAddress,
+            options: std.Io.net.IpAddress.ConnectOptions,
+        ) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
+            if (address.eql(&blackHoleAt(address.getPort()))) {
+                const io: std.Io = .{ .userdata = userdata, .vtable = &vtable };
+                var never: std.Io.Event = .unset;
+                try never.wait(io);
+                unreachable;
+            }
+            return base.netConnectIp(userdata, address, options);
+        }
+
+        fn hold(gate: *std.Io.Event, io: std.Io) void {
+            gate.wait(io) catch {};
+        }
+
+        fn dial(io: std.Io) !std.Io.net.Stream {
+            const name = try std.Io.net.HostName.init("gateway.test");
+            return name.connect(io, port, .{ .mode = .stream });
+        }
+
+        fn expire(io: std.Io) std.Io.Cancelable!void {
+            try io.sleep(.fromMilliseconds(5000), .awake);
+        }
+    };
+
+    const argv = [_][*:0]const u8{"fx"};
+    const environ = [_:null]?[*:0]const u8{};
+    var threaded = std.Io.Threaded.init(std.testing.allocator, processIoOptions(.{ .vector = &argv }, .{ .slice = &environ }));
+    defer threaded.deinit();
+    const real = threaded.io();
+    Fake.base = real.vtable.*;
+    Fake.vtable = Fake.base;
+    Fake.vtable.netLookup = Fake.lookup;
+    Fake.vtable.netConnectIp = Fake.connect;
+    const io: std.Io = .{ .userdata = real.userdata, .vtable = &Fake.vtable };
+
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    Fake.port = server.socket.address.getPort();
+
+    // Hold more tasks than there are CPUs, as running MCP servers, request
+    // watches, and requests do.
+    var gate: std.Io.Event = .unset;
+    var holders: std.Io.Group = .init;
+    defer {
+        gate.set(io);
+        holders.await(io) catch {};
+    }
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    for (0..cpu_count + 1) |_| try holders.concurrent(io, Fake.hold, .{ &gate, io });
+
+    const Event = union(enum) {
+        dial: anyerror!std.Io.net.Stream,
+        expire: std.Io.Cancelable!void,
+    };
+    var buffer: [2]Event = undefined;
+    var select: std.Io.Select(Event) = .init(io, &buffer);
+    defer while (select.cancel()) |event| switch (event) {
+        .dial => |result| if (result) |stream| stream.close(io) else |_| {},
+        .expire => {},
+    };
+    try select.concurrent(.dial, Fake.dial, .{io});
+    try select.concurrent(.expire, Fake.expire, .{io});
+    switch (try select.await()) {
+        .dial => |result| {
+            const stream = try result;
+            defer stream.close(io);
+            const accepted = try server.accept(io);
+            accepted.close(io);
+        },
+        .expire => return error.ConnectWaitedOnUnreachableAddress,
     }
 }
 
@@ -4833,6 +4933,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("core/agent/runtime/journal.zig");
+    _ = @import("acp/libfx_journal.zig");
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("napi_fetch_state.zig");
@@ -4978,8 +5080,9 @@ test {
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
     _ = @import("core/session/session_adapter.zig");
+    _ = @import("core/session/v1_conversion.zig");
+    _ = @import("core/session/session_catalog_cache.zig");
     _ = @import("core/session/session_layout.zig");
-    _ = @import("core/session/legacy_background_migration.zig");
     _ = @import("core/session/prompt_history_store.zig");
     _ = @import("core/app/prompt_history_runtime.zig");
     _ = @import("core/session/web_fetch_artifacts.zig");
@@ -4987,7 +5090,6 @@ test {
     _ = @import("core/subagent/domain.zig");
     _ = @import("core/subagent/child_state.zig");
     _ = @import("core/subagent/managed_owner.zig");
-    _ = @import("core/subagent/resume_admission.zig");
     _ = @import("core/subagent/execution.zig");
     _ = @import("core/subagent/agent_adapter.zig");
     _ = @import("core/subagent/tool_host.zig");

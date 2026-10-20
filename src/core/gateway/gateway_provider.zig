@@ -4,7 +4,6 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const model_catalog = @import("model_catalog.zig");
 const model_catalog_metadata = @import("model_catalog_metadata.zig");
@@ -170,7 +169,7 @@ pub const CapabilityResolver = struct {
         provider: model_catalog.Provider,
         input: model_catalog.FetchInput,
     ) model_capabilities.ResolveError!void {
-        const now = io_mod.milliTimestamp();
+        const now = model_catalog.clockMs();
         const requested = model_catalog.AccessMetadata.init(input.access);
         const access_changed = !std.meta.eql(self.provider_id, provider.provider_id) or
             self.requested_access == null or !std.meta.eql(self.requested_access.?, requested);
@@ -281,7 +280,7 @@ pub const CapabilityResolver = struct {
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
         self.state = .ready;
-        self.last_attempt_ms = io_mod.milliTimestamp();
+        self.last_attempt_ms = model_catalog.clockMs();
         self.requested_access = .init(access);
         self.provider_id = provider.provider_id;
     }

@@ -303,10 +303,13 @@ pub fn streamPrepared(
     );
     var http_request = opened.take();
     defer http_request.deinit();
-    var cancel_watch: gateway_client.CancelWatch = .{};
-    defer cancel_watch.stop();
+    var watch: gateway_client.ConnectionWatch = .init(.{
+        .patient = true,
+        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
+    defer watch.stop();
     if (http_request.connection) |connection|
-        try cancel_watch.start(request.cancel_flag, null, connection.stream_writer.stream);
+        try watch.start(request.cancel_flag, null, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -318,7 +321,9 @@ pub fn streamPrepared(
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var response = try http_request.receiveHead(&.{});
+    if (watch.armHead()) |err| return err;
+    var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
@@ -334,7 +339,12 @@ pub fn streamPrepared(
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    return completeFromStream(alloc, request, response.reader(&transfer_buffer));
+    var result = completeFromStream(alloc, request, response.reader(&transfer_buffer), watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        result.deinit(alloc);
+        return err;
+    }
+    return result;
 }
 
 /// Parses one successful Codex event stream into a completion with its
@@ -343,6 +353,7 @@ pub fn completeFromStream(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     reader: *std.Io.Reader,
+    progress: ?sse_stream.Progress,
 ) !stream_provider.Result {
     var events = request.events;
     const completion = try consumeSse(
@@ -356,6 +367,7 @@ pub fn completeFromStream(
         request.cancel_flag,
         request.content_capture_limit,
         .{},
+        progress,
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -418,10 +430,11 @@ fn consumeSse(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     limits: CodexLimits,
+    progress: ?sse_stream.Progress,
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes };
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .progress = progress };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -732,6 +745,7 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         &cancelled,
         null,
         .{},
+        null,
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -768,6 +782,7 @@ fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.M
         &cancelled,
         null,
         limits,
+        null,
     );
 }
 

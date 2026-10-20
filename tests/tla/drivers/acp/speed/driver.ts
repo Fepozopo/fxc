@@ -165,10 +165,9 @@ async function runPlan(plan: Plan, worktree: string, helpers: Helpers, dir: stri
     // FX_PROVIDER and FX_MODEL are process overrides: fx then resumes every
     // chat on the process's model instead of the chat's saved one, which no
     // real ACP host (fx-plus included) does. The Gateway is already the default.
-    if (["VERCEL_OIDC_TOKEN", "FX_PROVIDER", "FX_MODEL", "FX_FAST", "FX_ULTRAFAST", "FX_SESSIONS_V2", "FX_PERMISSION_MODE", "FX_DEBUG_RECORD"].includes(key)) continue;
+    if (["VERCEL_OIDC_TOKEN", "FX_PROVIDER", "FX_MODEL", "FX_FAST", "FX_ULTRAFAST", "FX_PERMISSION_MODE", "FX_DEBUG_RECORD"].includes(key)) continue;
     env[key] = value;
   }
-  if (SESSIONS_V2 !== undefined) env.FX_SESSIONS_V2 = SESSIONS_V2;
 
   const processes: Array<{ exit: number; stderr: string }> = [];
   const spawn = () => new Acp(
@@ -286,9 +285,6 @@ function argValue(name: string): string | undefined {
   return index === -1 ? undefined : process.argv[index + 1];
 }
 
-// Session store backend under test ("0" = v1 event log, "1" = v2); unset uses fx's default.
-const SESSIONS_V2 = argValue("--sessions-v2");
-
 function git(worktree: string, ...args: string[]): string {
   const result = Bun.spawnSync(["git", "-C", worktree, ...args], { stdout: "pipe", stderr: "pipe" });
   return new TextDecoder().decode(result.stdout).trim();
@@ -319,7 +315,6 @@ async function main() {
     seed,
     randomCount,
     steps,
-    sessionsV2: SESSIONS_V2 ?? "default",
     argv: process.argv.slice(1),
   };
   writeJson(join(reportDir, "manifest.json"), manifest);

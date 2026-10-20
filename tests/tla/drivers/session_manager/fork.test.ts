@@ -31,21 +31,21 @@ function fixture(label: string) {
   const gateway = startDynamicFakeGateway(body => reply(body));
   const processes: Process[] = [];
   const apps: App[] = [];
-  const env = (v2: boolean) => testEnvironment({
+  const env = () => testEnvironment({
     HOME: home, AI_GATEWAY_API_KEY: "synthetic-fork-fixture", FX_SKIP_ONBOARDING: "1",
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_MODEL: FAKE_GATEWAY_MODEL, FX_PERMISSION_MODE: "full-access", NO_COLOR: "1",
-    FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "wiring", ...(v2 ? { FX_SESSIONS_V2: "1" } : {}),
+    FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "wiring",
   });
   return {
     root, trace, sessionsRoot, processes,
     script(next: Reply) { reply = next; },
-    async app(args: string[] = [], v2 = true): Promise<App> {
+    async app(args: string[] = []): Promise<App> {
       const stderr = join(root, `app-${apps.length + 1}.stderr`);
       writeFileSync(stderr, "");
       const command = [binary, ...args].map(shellQuote).join(" ");
-      const session = await TmuxSession.create({ cmd: command, cwd: workspace, env: env(v2), stderrPath: stderr, width: 100, height: 40 });
+      const session = await TmuxSession.create({ cmd: command, cwd: workspace, env: env(), stderrPath: stderr, width: 100, height: 40 });
       await session.waitForStableComposer(TIMEOUT);
       const app = { session, pid: session.processPid(), stderr };
       apps.push(app);
@@ -282,19 +282,6 @@ scenario("/fork with no prompt yet says so and saves nothing", async f => {
   await f.quit(app);
   expect(f.sessions()).toHaveLength(0);
   requireAccepted(await f.judge(["wiring"], []));
-});
-
-// Without --sessions-v2 fx never opens the session manager, so there is no
-// trace for TLC to judge: the check is that none was written.
-scenario("/fork without --sessions-v2 says it needs it and never opens the session manager", async f => {
-  f.script(byLatestPrompt(ANSWERS));
-  const app = await f.app([], false);
-  await prompts(app, ANSWERS, ["Fork prompt one."]);
-  await app.session.sendText("/fork");
-  await app.session.waitForText("forking needs --sessions-v2", TIMEOUT);
-  await f.quit(app);
-  expect(f.sessions()).toHaveLength(0);
-  expect(existsSync(f.trace) ? readFileSync(f.trace, "utf8") : "").toBe("");
 });
 
 // Planted faults, made from the first scenario's kept run: each copy changes

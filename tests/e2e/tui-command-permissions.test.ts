@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
 import {
   canonicalSubagentIdForStore,
   fakeGatewayPermissionDecision,
@@ -213,12 +214,7 @@ function twoEffectfulCommandBatch(first: string, second: string) {
 }
 
 function sessionIdFromHome(root: IsolatedRoot): string {
-  const sessions = join(root.home, ".fx", "sessions");
-  const ids = readdirSync(sessions, { withFileTypes: true })
-    .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-    .map((entry) => entry.name);
-  expect(ids).toHaveLength(1);
-  return ids[0]!;
+  return onlySessionId(root.home);
 }
 
 function latestTraceReportPath(root: IsolatedRoot): string {
@@ -740,21 +736,15 @@ function expectNoCommandArtifacts(root: IsolatedRoot) {
     stdout: "pipe",
     stderr: "pipe",
   }).stdout.toString().trim().split("\n").filter(Boolean);
-  const legacyArtifacts = files.filter((path) =>
-    path.includes("/logs/commands/") && path.endsWith(".log")
-  );
-  expect(legacyArtifacts).toEqual([]);
+  // A command's own log files stay outside the session store (D44).
+  expect(files.filter((path) => path.endsWith(".log"))).toEqual([]);
 }
 
+/// The command replays the saved sessions keep: each is a blob, named by its
+/// handle wherever a result refers to it (D44).
 function commandReplayFiles(root: IsolatedRoot): string[] {
-  const sessions = join(root.home, ".fx", "sessions");
-  if (!existsSync(sessions)) return [];
-  const result = Bun.spawnSync(
-    ["find", sessions, "-type", "f", "-name", "fx-command-replay-*"],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  expect(result.exitCode).toBe(0);
-  return result.stdout.toString().trim().split("\n").filter(Boolean);
+  if (!existsSync(storeRoot(root.home))) return [];
+  return savedSessionIds(root.home).flatMap((id) => commandReplays(root.home, id).map((replay) => replay.name));
 }
 
 function expectNoHostileExecutables(root: IsolatedRoot) {
@@ -893,10 +883,7 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
 
       const sessionId = sessionIdFromHome(root);
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
+      const events = savedText(root.home, sessionId);
       expect(events).toContain(feedback);
 
       const cliResumeGateway = startFakeGateway([

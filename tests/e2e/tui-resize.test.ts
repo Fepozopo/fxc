@@ -39,6 +39,7 @@ import {
   type FooterBlock,
 } from "./tui-render-assertions";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
+import { logLines, onlySessionId, sessionDir } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -2168,11 +2169,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           const traceOffset = readFileSync(tracePath, "utf8").length;
           writeFileSync(releasePath, "go");
           if (viewerCols) {
-            const sessionsRoot = join(home, ".fx", "sessions");
-            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
-              .filter(entry => entry.isDirectory()).map(entry => entry.name);
-            expect(ids).toHaveLength(1);
-            const eventsPath = join(sessionsRoot, ids[0]!, "events.jsonl");
+            const eventsPath = join(sessionDir(home, onlySessionId(home)), "log.jsonl");
             // The main composer and text tail are hidden. Wait for the actual saved
             // assistant and its following completion record, not a viewer repaint.
             await session.waitForPane((pane) => {
@@ -2182,10 +2179,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
               // A concurrent append may end mid-record; only parse terminated lines.
               const records = text.split("\n").slice(0, -1).map(line => JSON.parse(line));
               const assistantIndex = records.findIndex(record =>
-                record.event.assistant?.text === laterResponse
+                record.kind === "item" && record.type === "assistant" && record.data?.text === laterResponse
               );
               const completed = assistantIndex >= 0 && records.slice(assistantIndex + 1)
-                .some(record => record.event.turn_completed !== undefined);
+                .some(record => record.kind === "turn_committed");
               return completed && requestCount === 4 &&
                 existsSync(join(workspace, "finished")) &&
                 existsSync(join(workspace, "sibling-finished")) &&
@@ -2252,14 +2249,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
             expectEmptyStderr(stderrPath);
           });
           check("persisted assistant paragraphs", () => {
-            const sessionsRoot = join(home, ".fx", "sessions");
-            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
-              .filter(entry => entry.isDirectory()).map(entry => entry.name);
-            expect(ids).toHaveLength(1);
-            const events = readFileSync(join(sessionsRoot, ids[0]!, "events.jsonl"), "utf8")
-              .trim().split("\n").map(line => JSON.parse(line));
-            const responses = events.filter(record => record.event.assistant !== undefined)
-              .map(record => record.event.assistant.text);
+            const responses = logLines(home, onlySessionId(home))
+              .filter((line: any) => line.kind === "item" && line.type === "assistant")
+              .map((line: any) => line.data.text);
             expect(responses).toEqual([oldResponse, laterResponse]);
           });
           check("recording replay", () => {

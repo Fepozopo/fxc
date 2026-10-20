@@ -20,7 +20,6 @@ const session_store = @import("../core/session/session_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 const session_store_paths = @import("../core/session/session_store_paths.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
-const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
@@ -44,7 +43,6 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
-const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -456,103 +454,19 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     const session_host = mcp_preparation.takeHost();
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
-    switch (server.sessionsBackend(state)) {
-        .v1 => {},
-        .v2 => |v2_store| {
-            session_mcp_owned = false;
-            session_host_owned = false;
-            return startV2Session(state, alloc, msg, v2_store, .{
-                .observer_hooks = observer_hooks,
-                .mcp = session_mcp,
-                .mcp_host = session_host,
-                .workspace = if (workspace) |*binding| binding else null,
-                .client_system_prompt = &client_system_prompt,
-            });
-        },
-        .v2_unavailable => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Session store not available",
-        }),
-    }
-
-    var store = (if (state.cfg.home_override) |home|
-        session_store.Store.initFromHome(alloc, home, workspace_root)
-    else
-        session_store.Store.init(alloc, workspace_root)) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Session store not available",
-        });
-    var store_owned = true;
-    defer if (store_owned) store.deinit(alloc);
-
-    var initial = try freshAcpState(state, alloc, workspace_root);
-    defer initial.deinit(alloc);
-    var writable = store.startWritableSessionWithOptions(
-        alloc,
-        initial,
-        .{},
-    ) catch
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Failed to create session" });
-    var writable_owned = true;
-    defer if (writable_owned) writable.deinit(alloc);
-    if (client_system_prompt) |text| {
-        persistClientSystemPrompt(alloc, .{ .v1 = &writable }, text) catch |err| {
-            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
-            _ = store.discardPristineStartedSession(alloc, &writable);
-            writable_owned = false;
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.internal_error,
-                .message = "Failed to save the client system prompt",
-            });
-        };
-    }
-
-    const session_id = try alloc.dupe(u8, writable.active_id);
-    var session_id_owned = true;
-    defer if (session_id_owned) alloc.free(session_id);
-    const model_copy = try alloc.dupe(u8, state.selected_model);
-    var model_owned = true;
-    defer if (model_owned) alloc.free(model_copy);
-    const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, writable.active_id);
-    defer alloc.free(session_dir);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns);
-    var session_rt_owned = true;
-    defer if (session_rt_owned) session_rt.deinit(alloc);
-    writable.releaseHydrationHistory(alloc);
-    session_rt.configureWebFetchArtifacts(alloc, session_dir);
-    server.cancelAndReapActivePrompt(state);
-    activateSession(state, store, .{
-        .session_id = session_id,
-        .writable = writable,
-        .model = model_copy,
-        .provider = state.provider,
-        .fast_mode = state.fast_mode,
-        .ultrafast_mode = state.ultrafast_mode,
-        .effort = state.effort,
-        .session_rt = session_rt,
-        .mcp = session_mcp,
-        .mcp_host = session_host,
-        .client_system_prompt = client_system_prompt,
-        .workspace = if (workspace) |*binding| binding else null,
-    }) catch {
-        _ = store.discardPristineStartedSession(alloc, &writable);
-        writable_owned = false;
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Failed to save active session",
-        });
-    };
-    client_system_prompt = null;
-    writable_owned = false;
-    store_owned = false;
-    session_id_owned = false;
-    model_owned = false;
-    session_rt_owned = false;
+    const v2_store = server.sessionsStore(state) orelse return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.internal_error,
+        .message = "Session store not available",
+    });
     session_mcp_owned = false;
     session_host_owned = false;
-
-    try writeNewSessionResponse(state, alloc, msg, session_id, observer_hooks);
+    return startV2Session(state, alloc, msg, v2_store, .{
+        .observer_hooks = observer_hooks,
+        .mcp = session_mcp,
+        .mcp_host = session_host,
+        .workspace = if (workspace) |*binding| binding else null,
+        .client_system_prompt = &client_system_prompt,
+    });
 }
 
 /// What `session/new` hands `startV2Session`.
@@ -606,7 +520,7 @@ fn startV2Session(
     var v2_owned = true;
     defer if (v2_owned) v2.close();
     if (start.client_system_prompt.*) |text| {
-        persistClientSystemPrompt(alloc, .{ .v2 = v2 }, text) catch |err| {
+        v2.setClientPrompt(text) catch |err| {
             debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.internal_error,
@@ -625,7 +539,7 @@ fn startV2Session(
     defer if (session_rt_owned) session_rt.deinit(alloc);
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
     server.cancelAndReapActivePrompt(state);
-    activateSession(state, null, .{
+    activateSession(state, .{
         .session_id = session_id,
         .v2 = v2,
         .model = model_copy,
@@ -983,13 +897,6 @@ fn handleRestoreSession(
             if (kind.replaysHistory()) {
                 try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
             }
-            try sendPendingRecoveryUpdate(
-                state,
-                alloc,
-                session_id,
-                &sources,
-                if (active.writable) |*writable| writable.state.recovery_checkpoint else null,
-            );
             try sendActiveSessionInfoUpdate(state, alloc);
             return writeLoadSessionResponse(
                 state,
@@ -1001,61 +908,26 @@ fn handleRestoreSession(
         }
     }
 
-    // One backend per process: the saved state comes from v2 when this
-    // connection keeps sessions there, else from v1.
-    var store: ?session_store.Store = null;
-    var store_owned = true;
-    defer if (store_owned) if (store) |*value| value.deinit(alloc);
-    var writable: ?session_store.LoadedWritableSession = null;
-    var writable_owned = true;
-    defer if (writable_owned) if (writable) |*value| value.deinit(alloc);
     var v2: ?*session_adapter.Session = null;
     var v2_owned = true;
     defer if (v2_owned) if (v2) |value| value.close();
     var v2_resumed: ?session_adapter.Resumed = null;
     defer if (v2_resumed) |*value| value.deinit(alloc);
-    const backend = server.sessionsBackend(state);
-    if (backend == .v2_unavailable) return state.writer.writeError(alloc, msg.id, .{
+    const v2_store = server.sessionsStore(state) orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.internal_error,
         .message = "Session store not available",
     });
-    if (backend == .v2) {
+    {
         // Converting a v1 session can be slow; the client is told why (D61).
         var notice: ConversionNotice = .{ .state = state, .alloc = alloc, .session_id = session_id };
-        backend.v2.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
-        defer backend.v2.notice = null;
-        v2 = session_adapter.Session.resumeSession(alloc, backend.v2, .{ .id = session_id }, workspace_root, .acp) catch |err|
+        v2_store.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
+        defer v2_store.notice = null;
+        v2 = session_adapter.Session.resumeSession(alloc, v2_store, .{ .id = session_id }, workspace_root, .acp) catch |err|
             return handleLoadFailure(state, alloc, msg, err);
         v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
             return handleLoadFailure(state, alloc, msg, err);
-    } else {
-        store = (if (state.cfg.home_override) |home|
-            session_store.Store.initFromHome(alloc, home, workspace_root)
-        else
-            session_store.Store.init(alloc, workspace_root)) catch
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.internal_error,
-                .message = "Session store not available",
-            });
-        const seed_preferences = session_codec.DurableSessionPreferences{
-            .provider = state.provider,
-            .model = state.configured_model,
-            .effort = state.effort,
-            .fast_mode = state.fast_mode,
-            .ultrafast_mode = state.configured_ultrafast_mode,
-        };
-        writable = subagent_resume_admission.resumeForExternalPrompt(
-            store.?,
-            alloc,
-            .{ .id = session_id },
-            workspace_root,
-            .{
-                .seed_preferences = seed_preferences,
-                .log = .{},
-            },
-        ) catch |err| return handleLoadFailure(state, alloc, msg, err);
     }
-    const durable: *const session_codec.DurableSessionState = if (v2_resumed) |*value| &value.state else &writable.?.state;
+    const durable: *const session_codec.DurableSessionState = &v2_resumed.?.state;
 
     const sid_copy = try alloc.dupe(u8, durable.id);
     var sid_owned = true;
@@ -1096,15 +968,10 @@ fn handleRestoreSession(
         durable.history,
         durable.permission_state,
     );
-    // A v2 session's downloads are its blobs (D44); v1 keeps them in its folder.
-    const session_dir: ?[]u8 = if (v2 != null) null else try session_store.sessionDirPath(alloc, store.?.sessions_dir, session_id);
-    defer if (session_dir) |path| alloc.free(path);
-
     // Read before the active session is released, so an unreadable prompt
     // fails this restore without replacing a different active session. A
     // same-session `cwd` rebind has already released it above.
-    const saved_files: SavedFiles = if (v2) |value| .{ .v2 = value } else .{ .v1 = &writable.? };
-    var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, saved_files) catch |err| switch (err) {
+    var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, v2.?) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ClientSystemPromptUnreadable => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
@@ -1112,16 +979,12 @@ fn handleRestoreSession(
         }),
     };
     defer if (client_system_prompt) |text| state.alloc.free(text);
-    if (writable) |*value| value.releaseHydrationHistory(alloc);
-    if (v2) |value|
-        session_rt.configureWebFetchArtifactBlobs(alloc, try value.childCapability(), value.id())
-    else
-        session_rt.configureWebFetchArtifacts(alloc, session_dir.?);
+    // The session's downloads are its blobs (D44).
+    session_rt.configureWebFetchArtifactBlobs(alloc, try v2.?.childCapability(), v2.?.id());
     server.cancelAndReapActivePrompt(state);
-    activateSession(state, store, .{
+    activateSession(state, .{
         .session_id = sid_copy,
-        .writable = writable,
-        .v2 = v2,
+        .v2 = v2.?,
         .model = model_copy,
         .provider = effective_provider,
         .credential = if (staged_credential) |*credential| credential else null,
@@ -1139,9 +1002,7 @@ fn handleRestoreSession(
             .message = "Failed to save active session",
         });
     client_system_prompt = null;
-    writable_owned = false;
     v2_owned = false;
-    store_owned = false;
     sid_owned = false;
     model_owned = false;
     session_rt_owned = false;
@@ -1153,13 +1014,6 @@ fn handleRestoreSession(
     if (kind.replaysHistory()) {
         try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
-    try sendPendingRecoveryUpdate(
-        state,
-        alloc,
-        session_id,
-        &sources,
-        if (state.active_session.?.writable) |*value| value.state.recovery_checkpoint else null,
-    );
     try sendActiveSessionInfoUpdate(state, alloc);
 
     try writeLoadSessionResponse(
@@ -1300,45 +1154,6 @@ fn appendProjectMcpConfigs(
     );
 }
 
-fn sendPendingRecoveryUpdate(
-    state: *server.ServerState,
-    alloc: Allocator,
-    session_id: []const u8,
-    sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
-    checkpoint: ?session_codec.RecoveryCheckpoint,
-) !void {
-    const recovery = checkpoint orelse return;
-    try sendUserHistoryTurn(state, alloc, session_id, recovery.user);
-    try sendExecutionHistory(state, alloc, session_id, sources, recovery.execution);
-    if (recovery.assistant_source.len > 0) {
-        try sendAgentHistoryChunk(state, alloc, session_id, recovery.assistant_source);
-    }
-    const attempt = recovery.consumed_provider_attempts +| @intFromBool(recovery.outstanding_reservation);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(session_id, &out.writer);
-    try out.writer.writeAll(",\"update\":");
-    try acp_types.writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = attempt,
-        .attempt_limit = recovery.max_provider_attempts,
-        .cause = recovery.cause,
-        .action = .paused,
-        .required_action = if (recovery.tool_state == .uncertain)
-            .inspect_uncertain_tool
-        else
-            .continue_later,
-        .diagnostic = types.ModelFailureDiagnostic.forCause(recovery.cause),
-    }, true);
-    try out.writer.writeByte('}');
-    try state.writer.writeNotification(
-        alloc,
-        "session/update",
-        out.writer.buffered(),
-    );
-}
-
 fn sameSessionId(active_session_id: []const u8, requested_session_id: []const u8) bool {
     return std.mem.eql(u8, active_session_id, requested_session_id);
 }
@@ -1435,9 +1250,7 @@ fn restoredUltrafastMode(state: *const server.ServerState, preference: bool) boo
 
 const SessionActivation = struct {
     session_id: []u8,
-    /// Exactly one of `writable` (with the store) and `v2` is set.
-    writable: ?session_store.LoadedWritableSession = null,
-    v2: ?*session_adapter.Session = null,
+    v2: *session_adapter.Session,
     model: []u8,
     provider: model_provider.ProviderId,
     credential: ?*credentials.Credential = null,
@@ -1455,60 +1268,21 @@ const SessionActivation = struct {
     workspace: ?*workspace_binding.Binding = null,
 };
 
-/// The session that keeps its client prompt and tool identities, on either
-/// backend: a v1 session's side files, or a v2 session's settings (D46).
-/// Borrowed for the call.
-const SavedFiles = union(enum) {
-    v1: *session_store.LoadedWritableSession,
-    v2: *session_adapter.Session,
-
-    fn id(self: SavedFiles) []const u8 {
-        return switch (self) {
-            .v1 => |writable| writable.active_id,
-            .v2 => |session| session.id(),
-        };
-    }
-};
-
-fn persistClientSystemPrompt(
-    alloc: Allocator,
-    files: SavedFiles,
-    text: []const u8,
-) !void {
-    switch (files) {
-        .v1 => |writable| try client_instructions.persist(alloc, try writable.childCapability(), text),
-        .v2 => |session| try session.setClientPrompt(text),
-    }
-}
-
 /// Returns the owned persisted client prompt of a restored session, or an
-/// empty slice when it has none. A session without a child store cannot have
-/// stored one. A stored prompt that cannot be read fails the restore instead
-/// of running the session without the client's instructions.
+/// empty slice when it has none. A stored prompt that cannot be read fails
+/// the restore instead of running the session without the client's
+/// instructions.
 fn restoredClientSystemPrompt(
     alloc: Allocator,
-    files: SavedFiles,
+    session: *session_adapter.Session,
 ) error{ OutOfMemory, ClientSystemPromptUnreadable }![]u8 {
-    const text = switch (files) {
-        .v1 => |writable| blk: {
-            const capability = writable.childCapability() catch |err| {
-                debug_trace.logf(
-                    "acp",
-                    "no client system prompt to restore session={s} err={s}",
-                    .{ files.id(), @errorName(err) },
-                );
-                return &.{};
-            };
-            break :blk client_instructions.load(alloc, capability);
-        },
-        .v2 => |session| session.clientPrompt(alloc),
-    } catch |err| switch (err) {
+    const text = session.clientPrompt(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf(
                 "acp",
                 "client system prompt unreadable session={s} err={s}",
-                .{ files.id(), @errorName(err) },
+                .{ session.id(), @errorName(err) },
             );
             return error.ClientSystemPromptUnreadable;
         },
@@ -1520,26 +1294,13 @@ fn restoredClientSystemPrompt(
 /// cannot be read is reported in the trace and replaced by an empty one.
 fn restoredToolIdentities(
     alloc: Allocator,
-    files: SavedFiles,
+    session: *session_adapter.Session,
 ) Allocator.Error!tool_call_identities.Record {
-    const record = switch (files) {
-        .v1 => |writable| blk: {
-            const capability = writable.childCapability() catch |err| {
-                debug_trace.logf(
-                    "acp",
-                    "no tool identity record to restore session={s} err={s}",
-                    .{ files.id(), @errorName(err) },
-                );
-                return .{};
-            };
-            break :blk tool_call_identities.load(alloc, capability);
-        },
-        .v2 => |session| blk: {
-            const stored = session.toolIdentities(alloc) catch |err| break :blk err;
-            const bytes = stored orelse return .{};
-            defer alloc.free(bytes);
-            break :blk tool_call_identities.parse(alloc, bytes);
-        },
+    const record = blk: {
+        const stored = session.toolIdentities(alloc) catch |err| break :blk err;
+        const bytes = stored orelse return .{};
+        defer alloc.free(bytes);
+        break :blk tool_call_identities.parse(alloc, bytes);
     };
     return record catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1547,32 +1308,23 @@ fn restoredToolIdentities(
             debug_trace.logf(
                 "acp",
                 "dropped unreadable tool identity record session={s} err={s}",
-                .{ files.id(), @errorName(err) },
+                .{ session.id(), @errorName(err) },
             );
             return .{};
         },
     };
 }
 
-fn activateSession(
-    state: *server.ServerState,
-    store: ?session_store.Store,
-    activation: SessionActivation,
-) !void {
-    std.debug.assert((activation.writable != null) != (activation.v2 != null));
+fn activateSession(state: *server.ServerState, activation: SessionActivation) !void {
     try server.releaseActiveSession(state);
-    var restored_writable = activation.writable;
     const client_system_prompt: []u8 = activation.client_system_prompt orelse &.{};
     if (activation.workspace) |binding| try workspace_binding.commit(state, binding);
     if (activation.credential) |credential| server.adoptServerCredential(state, credential);
     const start = server.loadStartingMode(state, state.alloc);
     // Nothing after this load can fail before the session takes ownership.
-    const files: SavedFiles = if (restored_writable) |*writable| .{ .v1 = writable } else .{ .v2 = activation.v2.? };
-    const tool_identities = try restoredToolIdentities(state.alloc, files);
+    const tool_identities = try restoredToolIdentities(state.alloc, activation.v2);
     state.active_session = .{
         .session_id = activation.session_id,
-        .store = store,
-        .writable = restored_writable,
         .v2 = activation.v2,
         .client_system_prompt = client_system_prompt,
         .tool_identities = tool_identities,
@@ -1599,27 +1351,6 @@ fn activateSession(
         .pending_prompt_id = null,
     };
     server.enableSubagentHost(state);
-    if (state.active_session.?.writable) |*writable| {
-        if (writable.childCapability()) |capability| {
-            _ = legacy_background_migration.migrate(
-                state.alloc,
-                capability,
-                state.cfg.process_provider,
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "legacy process migration deferred session={s} err={s}",
-                    .{ writable.active_id, @errorName(err) },
-                );
-            };
-        } else |err| {
-            debug_trace.logf(
-                "session",
-                "legacy process migration unavailable session={s} err={s}",
-                .{ writable.active_id, @errorName(err) },
-            );
-        }
-    }
 }
 
 /// A v2 storage fault as one sentence after `what`, such as "Session could
@@ -1732,33 +1463,9 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
             .code = ErrorCode.invalid_params,
             .message = "Invalid params",
         });
-    switch (server.sessionsBackend(state)) {
-        .v1 => {},
-        .v2 => |v2_store| return listV2Sessions(state, alloc, msg, v2_store, params),
-        // As v1 answers when its store cannot open.
-        .v2_unavailable => return state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}"),
-    }
-    var store = (if (state.cfg.home_override) |home|
-        session_store.Store.initReadOnlyFromHome(alloc, home, params.cwd orelse state.workspace_root)
-    else
-        session_store.Store.initReadOnly(alloc, params.cwd orelse state.workspace_root)) catch {
-        try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
-        return;
-    };
-    defer store.deinit(alloc);
-
-    var page = subagent_resume_admission.listVisiblePage(
-        store,
-        alloc,
-        if (params.cwd != null) .current_workspace else .all_workspaces,
-        params.continuation,
-        session_store.session_list_default_limit,
-    ) catch {
-        try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
-        return;
-    };
-    defer page.deinit(alloc);
-    try writeSessionPage(state, alloc, msg, page.summaries.items, page.has_more);
+    // No store lists as no sessions.
+    const v2_store = server.sessionsStore(state) orelse return state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
+    return listV2Sessions(state, alloc, msg, v2_store, params);
 }
 
 /// `session/list` on v2, paged as v1 pages it: newest first, one
@@ -1901,21 +1608,7 @@ fn sendActiveHistoryUpdates(
     sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
 ) !void {
     const active = &state.active_session.?;
-    if (active.store) |store| {
-        const Visitor = struct {
-            state: *server.ServerState,
-            alloc: Allocator,
-            session_id: []const u8,
-            sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
-
-            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, self.sources, turn);
-            }
-        };
-        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id, .sources = sources };
-        return store.visitConversationHistory(alloc, session_id, &visitor);
-    }
-    // Every saved turn, as v1 replays it, not only those in memory.
+    // Every saved turn, not only those in memory.
     if (active.v2) |v2| {
         const Visitor = struct {
             state: *server.ServerState,
@@ -2164,7 +1857,8 @@ fn planToolCallFrame(
         // contract as the live path; only arguments are masked for display
         // (redactToolArgumentsJson).
         .content_text = if (result) |r| if (r.output.len > 0)
-            tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
+            try tool_call_presentation.shellUpdateContentText(arena, call.name, r.output) orelse
+                tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
         else
             null else null,
     };
@@ -2328,20 +2022,12 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
         active.session_rt.agent.history.items,
     );
     defer metadata.deinit(alloc);
-    if (active.writable) |*writable| {
-        if (try writable.conversationTitle(alloc)) |title| {
-            metadata.deinit(alloc);
-            metadata = .{ .present = true, .title = title };
-        }
-    }
     const v2_info: ?session_adapter.Session.Info = if (active.v2) |v2| try v2.info(alloc) else null;
     if (v2_info) |info| if (info.title) |title| {
         metadata.deinit(alloc);
         metadata = .{ .present = true, .title = title };
     };
-    const updated_at_ms = if (active.writable) |*writable|
-        writable.state.updated_at_ms
-    else if (active.wasm_state) |durable|
+    const updated_at_ms = if (active.wasm_state) |durable|
         durable.updated_at_ms
     else if (v2_info) |info|
         // Not saved yet: a new session has no line before its first prompt.
@@ -3076,7 +2762,7 @@ test "execution replay titles reads with the call whose saved output they read" 
     try std.testing.expectEqualStrings("Reading more output from zig build test", later[0].tool_call.title);
 }
 
-test "ACP load titles a recovered read with the call from an earlier turn" {
+test "ACP load titles a read with the call from an earlier turn" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3116,19 +2802,11 @@ test "ACP load titles a recovered read with the call from an earlier turn" {
         .assistant = @constCast("done"),
         .execution = .{ .tool_steps = run_steps[0..] },
     } });
-    try sendPendingRecoveryUpdate(&state, arena, "session-1", &sources, .{
-        .turn_id = 2,
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", &sources, .{ .assistant = .{
         .user = .{ .text = @constCast("find the failure") },
-        .assistant_source = @constCast(""),
+        .assistant = @constCast("found it"),
         .execution = .{ .tool_steps = read_steps[0..] },
-        .cause = .response_interrupted,
-        .action = .paused,
-        .authority = .{ .provider = .gateway, .model = @constCast("test-model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 1,
-        .consumed_provider_attempts = 1,
-    });
+    } });
 
     const captured = try readCaptured(&capture, alloc);
     defer alloc.free(captured);
@@ -3183,25 +2861,11 @@ test "ACP load maps one-off child denial to invalid params" {
     ) != null);
 }
 
-var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableAcpSessionTestEnviron() !*const std.process.Environ.Map {
-    if (acp_session_stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    acp_session_stable_test_environ = map;
-    return map;
-}
-
 const AcpSessionTestHome = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, home: []const u8) !*AcpSessionTestHome {
-        _ = try stableAcpSessionTestEnviron();
-
         const self = try alloc.create(AcpSessionTestHome);
         errdefer alloc.destroy(self);
 
@@ -3216,9 +2880,7 @@ const AcpSessionTestHome = struct {
     }
 
     fn deinit(self: *AcpSessionTestHome) void {
-        if (acp_session_stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -3343,7 +3005,7 @@ test "ACP project MCP loading expands workspace environment templates" {
     try std.testing.expectEqualStrings("secret-value", config.env[0].value);
 }
 
-test "ACP ultrafast new load and resume preserve configured baselines on both backends" {
+test "ACP ultrafast new load and resume preserve configured baselines" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3357,57 +3019,46 @@ test "ACP ultrafast new load and resume preserve configured baselines on both ba
     defer env.deinit();
     var capture = try tmp.dir.createFile(io_mod.getIo(), "ultrafast.jsonl", .{ .read = true });
     defer capture.close(io_mod.getIo());
-    for ([_]bool{ false, true }) |v2_backend| {
-        for ([_]bool{ false, true }) |baseline| {
-            for ([_]?bool{ null, false, true }) |process| {
-                var arena_state = std.heap.ArenaAllocator.init(alloc);
-                defer arena_state.deinit();
-                const arena = arena_state.allocator();
-                var state = try initAcpSessionTestState(arena, workspace_path, capture);
-                defer state.deinit();
-                state.cfg.auth_mode = .host_managed;
-                state.credential_source = .host_managed;
-                state.cfg.minimal_kernel = true;
-                state.cfg.allow_acp_mcp = false;
-                state.cfg.home_override = home_path;
-                state.configured_ultrafast_mode = baseline;
-                state.process_ultrafast_override = process;
-                state.ultrafast_mode = process orelse baseline;
-                if (v2_backend) {
-                    state.sessions_v2_requested = true;
-                    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
-                }
-                var msg = jsonrpc.Message{
-                    .id = .{ .integer = 1 },
-                    .method = "session/new",
-                    .params_raw = "{\"mcpServers\":[]}",
-                };
-                try handleNewSession(&state, arena, &msg);
-                const active = &state.active_session.?;
-                try std.testing.expectEqual(process orelse baseline, active.ultrafast_mode);
-                if (active.v2) |v2| {
-                    const preferences = try v2.currentPreferences(arena);
-                    try std.testing.expectEqual(baseline, preferences.ultrafast_mode);
-                    try v2.commitTurn(.{ .assistant = .{
-                        .user = .{ .text = @constCast("saved request") },
-                        .assistant = @constCast("saved answer"),
-                    } }, types.ConversationLanguage.default());
-                } else {
-                    try std.testing.expectEqual(baseline, active.writable.?.state.preferences.ultrafast_mode);
-                }
-                const id = try arena.dupe(u8, active.session_id);
-                inline for (.{ handleLoadSession, handleResumeSession }) |restore| {
-                    try server.releaseActiveSession(&state);
-                    msg.params_raw = try arena.print("{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{id});
-                    try restore(&state, arena, &msg);
-                    const resumed = &state.active_session.?;
-                    try std.testing.expectEqual(process orelse baseline, resumed.ultrafast_mode);
-                    const saved = if (resumed.v2) |v2|
-                        (try v2.currentPreferences(arena)).ultrafast_mode
-                    else
-                        resumed.writable.?.state.preferences.ultrafast_mode;
-                    try std.testing.expectEqual(baseline, saved);
-                }
+    for ([_]bool{ false, true }) |baseline| {
+        for ([_]?bool{ null, false, true }) |process| {
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var state = try initAcpSessionTestState(arena, workspace_path, capture);
+            defer state.deinit();
+            state.cfg.auth_mode = .host_managed;
+            state.credential_source = .host_managed;
+            state.cfg.minimal_kernel = true;
+            state.cfg.allow_acp_mcp = false;
+            state.cfg.home_override = home_path;
+            state.configured_ultrafast_mode = baseline;
+            state.process_ultrafast_override = process;
+            state.ultrafast_mode = process orelse baseline;
+            state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
+            var msg = jsonrpc.Message{
+                .id = .{ .integer = 1 },
+                .method = "session/new",
+                .params_raw = "{\"mcpServers\":[]}",
+            };
+            try handleNewSession(&state, arena, &msg);
+            const active = &state.active_session.?;
+            try std.testing.expectEqual(process orelse baseline, active.ultrafast_mode);
+            const v2 = active.v2.?;
+            const preferences = try v2.currentPreferences(arena);
+            try std.testing.expectEqual(baseline, preferences.ultrafast_mode);
+            try v2.commitTurn(.{ .assistant = .{
+                .user = .{ .text = @constCast("saved request") },
+                .assistant = @constCast("saved answer"),
+            } }, types.ConversationLanguage.default());
+            const id = try arena.dupe(u8, active.session_id);
+            inline for (.{ handleLoadSession, handleResumeSession }) |restore| {
+                try server.releaseActiveSession(&state);
+                msg.params_raw = try arena.print("{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}", .{id});
+                try restore(&state, arena, &msg);
+                const resumed = &state.active_session.?;
+                try std.testing.expectEqual(process orelse baseline, resumed.ultrafast_mode);
+                const saved = (try resumed.v2.?.currentPreferences(arena)).ultrafast_mode;
+                try std.testing.expectEqual(baseline, saved);
             }
         }
     }
@@ -3460,6 +3111,7 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
     defer capture.close(io_mod.getIo());
     var state = try initAcpSessionTestState(arena, workspace_path, capture);
     defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
     state.cfg.allow_acp_mcp = false;
 
     var new_msg = jsonrpc.Message{
@@ -3574,6 +3226,7 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     {
         var state = try initAcpSessionTestState(arena, workspace_path, capture);
         defer state.deinit();
+        state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
 
         var new_msg = jsonrpc.Message{
             .id = .{ .integer = 1 },
@@ -3583,7 +3236,7 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try handleNewSession(&state, arena, &new_msg);
 
         const new_active = &state.active_session.?;
-        const new_writable = &new_active.writable.?;
+        const new_v2 = new_active.v2.?;
         try std.testing.expectEqualStrings(
             test_session_mode_registry.default_mode_id,
             new_active.mode,
@@ -3594,23 +3247,16 @@ test "ACP new and loaded sessions provide a writable subagent host" {
             "review",
         );
         try std.testing.expectEqualStrings("review", new_active.mode);
-        try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
 
-        _ = try new_writable.appendEvent(arena, .{ .history_turn_committed = .{
-            .conversation_language = .literal("en"),
-            .total_input_tokens = 0,
-            .total_output_tokens = 0,
-            .turn = .{ .assistant = .{
-                .user = .{ .text = @constCast("remember this") },
-                .assistant = @constCast("retained answer"),
-            } },
-        } }, io_mod.milliTimestamp());
+        try new_v2.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast("remember this") },
+            .assistant = @constCast("retained answer"),
+        } }, .literal("en"));
         const session_id = try alloc.dupe(u8, new_active.session_id);
         defer alloc.free(session_id);
         try server.releaseActiveSession(&state);
         try std.testing.expect(state.active_session == null);
-        try std.testing.expect(state.subagent_store == null);
         try std.testing.expect(state.subagent_host == null);
 
         var load_params: std.Io.Writer.Allocating = .init(arena);
@@ -3626,14 +3272,12 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try handleLoadSession(&state, arena, &load_msg);
 
         const loaded_active = &state.active_session.?;
-        const loaded_writable = &loaded_active.writable.?;
+        try std.testing.expect(loaded_active.v2 != null);
         try std.testing.expectEqual(@as(usize, 1), loaded_active.session_rt.historyLen());
-        try std.testing.expectEqual(@as(usize, 0), loaded_writable.state.history.len);
         try std.testing.expectEqualStrings(
             test_session_mode_registry.default_mode_id,
             loaded_active.mode,
         );
-        try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
 
         try capture.sync(io_mod.getIo());
@@ -3683,6 +3327,7 @@ test "ACP same-session restore retires the replaced MCP runtime after active use
     defer capture.close(io_mod.getIo());
     var state = try initAcpSessionTestState(arena, workspace_path, capture);
     defer state.deinit();
+    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
 
     var new_msg = jsonrpc.Message{
         .id = .{ .integer = 1 },

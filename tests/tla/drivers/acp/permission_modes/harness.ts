@@ -193,7 +193,7 @@ export async function loadHelpers(worktree: string): Promise<Helpers> {
 // Process overrides that would mask what the profile and ACP decide.
 const STRIPPED_ENV = [
   "VERCEL_OIDC_TOKEN", "FX_PROVIDER", "FX_MODEL", "FX_FAST", "FX_ULTRAFAST",
-  "FX_PERMISSION_MODE", "FX_DEBUG_RECORD", "FX_SESSIONS_V2",
+  "FX_PERMISSION_MODE", "FX_DEBUG_RECORD",
 ];
 
 /// An isolated fx home, workspace and fake Gateway for one run. `profile` is

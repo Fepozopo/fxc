@@ -30,7 +30,6 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const session_runtime = @import("../session/session.zig");
-const session_codec = @import("../session/session_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const result_store = @import("../session/result_store.zig");
@@ -333,18 +332,12 @@ pub fn Bindings(comptime App: type) type {
                     .running = runCompactionActivity,
                     .settle = settleCompactionActivity,
                 } else null,
-                .recovery_checkpoint = if (comptime @hasField(App, "session_persistence"))
-                    if (app.session_persistence.writable != null)
-                        .{
-                            .set = agentSetRecoveryCheckpoint,
-                            .clear = agentClearRecoveryCheckpoint,
-                        }
-                    else
-                        null
-                else
-                    null,
                 .append_turn_piece = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
+                else
+                    null,
+                .image_blob_dir = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2) |v2| v2.blobsPath() else null
                 else
                     null,
                 .propagate_grant = agentPropagateGrant,
@@ -380,11 +373,6 @@ pub fn Bindings(comptime App: type) type {
                     .removed = ui_render.diff_removed_marker_style,
                 },
             };
-            if (comptime @hasField(App, "session_persistence") and
-                @hasField(@TypeOf(app.session_persistence), "writable"))
-            {
-                deps.confirm_session_writer = agentConfirmSessionWriter;
-            }
             if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
@@ -471,7 +459,6 @@ pub fn Bindings(comptime App: type) type {
                 .command_output_complete = workerBridgeCommandOutputComplete,
                 .diff_block = workerBridgeDiffBlock,
                 .context_compaction = workerBridgeContextCompaction,
-                .prepare_fresh_prompt = workerBridgePrepareFreshPrompt,
                 .append_history_turn = workerBridgeAppendHistoryTurn,
                 .session_grant = workerBridgeSessionGrant,
                 .error_text = workerBridgeErrorText,
@@ -1201,27 +1188,9 @@ pub fn Bindings(comptime App: type) type {
             );
         }
 
-        fn agentSetRecoveryCheckpoint(
-            ctx: *anyopaque,
-            checkpoint: session_codec.RecoveryCheckpoint,
-        ) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).setRecoveryCheckpoint(app, checkpoint);
-        }
-
-        fn agentClearRecoveryCheckpoint(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).clearRecoveryCheckpoint(app);
-        }
-
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
-        }
-
-        fn agentConfirmSessionWriter(ctx: *anyopaque) anyerror!void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).confirmSessionWriter(app);
         }
 
         fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
@@ -1575,19 +1544,6 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeContextCompaction(ctx: *anyopaque, value: worker_runtime.ContextCompaction) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).commitContextCompaction(app, value.summary, value.active_prefix, value.retained_from);
-        }
-
-        fn workerBridgePrepareFreshPrompt(ctx: *anyopaque, value: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return app_session_runtime.Runtime(App).prepareFreshPrompt(app, value);
-        }
-
-        pub fn prepareFreshPrompt(app: *App, value: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
-            if (comptime runtime_profile.allows(App, .cooperative_agent)) {
-                const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
-                return app.worker.publishFreshPrompt(std.heap.c_allocator, current, app, workerBridgePrepareFreshPrompt);
-            }
-            return app.worker.prepareFreshPrompt(std.heap.c_allocator, value);
         }
 
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {

@@ -1,10 +1,11 @@
-//! The one door between fx and the session manager (sessions v2).
+//! The one door between fx and the session manager (sessions v2), fx's only
+//! session store.
 //!
-//! Behind `--sessions-v2` or FX_SESSIONS_V2=1, with one backend per process.
 //! Hosts call this file; it is the only fx file that imports
 //! `session_manager`, and the boundary test at the bottom keeps it so. v1
 //! code is never called from here except for its encoders and its turn
-//! builder, so both backends store the same bytes for the same history.
+//! builder, so a session converted from v1 holds the same bytes for the same
+//! history as one fx started here.
 //!
 //! What goes where:
 //! - each completed piece of a turn is one `item` whose `type` is the v1
@@ -57,6 +58,7 @@ const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const history_range = @import("../shared/history_range.zig");
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -77,14 +79,6 @@ fn openHome(home: []const u8) !io_mod.VerifiedDir {
 const max_inline_piece_bytes: usize = 256 * 1024;
 /// Lines per page when replaying history.
 const replay_page_lines: usize = 256;
-
-/// Whether this process keeps its sessions in v2: the flag, or
-/// FX_SESSIONS_V2 set to `1` or `true`.
-pub fn enabled(flag: bool) bool {
-    if (flag) return true;
-    const value = io_mod.getenv("FX_SESSIONS_V2") orelse return false;
-    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
-}
 
 pub const Host = sm.Host;
 pub const ChildOutcome = sm.Outcome;
@@ -175,6 +169,7 @@ pub const Store = struct {
             break :blk try alloc.dupe(u8, home);
         };
         errdefer alloc.free(owned_home);
+        try checkSessionsPath(owned_home);
         const root = try std.Io.Dir.path.join(alloc, &.{
             home,
             profile_paths.root_dir_name,
@@ -189,6 +184,26 @@ pub const Store = struct {
         const pid = processId();
         traceWiring("StoreOpen", "-", "", pid);
         return .{ .manager = manager, .home = owned_home, .pid = pid };
+    }
+
+    /// Refuses, before any session is asked for, a `~/.fx`, `~/.fx/sessions`
+    /// or `v2` folder that is not a real folder, such as a file or a symlink
+    /// (D67): every write would fail on it. One that is missing is made by
+    /// the first write; one that others can read converts (D61).
+    fn checkSessionsPath(home: []const u8) !void {
+        var parent = openHome(home) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer parent.close();
+        for ([_][]const u8{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, session_layout.sessions_v2_dir }) |name| {
+            const next = (io_mod.openRealDirIfPresent(&parent, name) catch |err| switch (err) {
+                error.DurablePathUnsafe => return error.SessionPathUnsafe,
+                else => return err,
+            }) orelse return;
+            parent.close();
+            parent = next;
+        }
     }
 
     /// `$HOME` from the environment.
@@ -276,7 +291,7 @@ pub const Store = struct {
                 continue;
             };
             defer target.close();
-            if (!copyTree(&source, &target, 0)) complete = false;
+            if (!copyTree(io_mod.openVerifiedPrivateDirIfPresent, &source, &target, 0)) complete = false;
         }
         return complete;
     }
@@ -379,6 +394,7 @@ pub const CommandError = error{
     InvalidSessionFormat,
     UnsupportedSessionSchema,
     SessionRecoveryBoundaryInvalid,
+    SessionRecoveryNotNeeded,
     SessionStoreUnavailable,
     DurablePathUnsafe,
     HomeNotSet,
@@ -397,6 +413,11 @@ pub fn commandError(err: anyerror) CommandError {
         error.Corrupt => error.InvalidSessionFormat,
         // `recover` of a session whose first turn never ended whole (D15).
         error.InvalidForkPoint => error.SessionRecoveryBoundaryInvalid,
+        // v1's own recovery, salvaging a v1 session (D64). An older format
+        // it reads whole needs none; one it cannot read has no boundary.
+        error.SessionRecoveryNotNeeded => error.SessionRecoveryNotNeeded,
+        error.SessionRecoveryBoundaryInvalid, error.SessionRecoveryRequiresCurrentSchema => error.SessionRecoveryBoundaryInvalid,
+        error.SessionRecoveryUnsupportedSchema => error.UnsupportedSessionSchema,
         error.DurablePathUnsafe, error.SessionPathUnsafe => error.DurablePathUnsafe,
         error.HomeNotSet => error.HomeNotSet,
         error.OutOfMemory => error.OutOfMemory,
@@ -434,11 +455,35 @@ pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
 /// A v1 root v2 does not hold yet, read by v1's reader without converting
 /// it (D61). Caller owns the result.
 fn readV1Session(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
-    var detail = (try v1_conversion.readDetail(alloc, store.home, id)) orelse return error.SessionNotFound;
+    store.problem = .{};
+    var detail = (v1_conversion.readDetail(alloc, store.home, id) catch |err| switch (err) {
+        error.OutOfMemory, error.SessionNotFound => return err,
+        else => return v1Unreadable(store, alloc, id, err),
+    }) orelse return error.SessionNotFound;
     defer detail.summary.deinit(alloc);
     errdefer detail.state.deinit(alloc);
     const title = if (detail.summary.title) |value| try alloc.dupe(u8, value) else null;
     return .{ .state = detail.state, .title = title };
+}
+
+/// A v1 root v1's reader refuses, however it fails: damage, with the file
+/// and the reason in `store.problem` when the converter's read names them
+/// (D78).
+fn v1Unreadable(store: *Store, alloc: Allocator, id: []const u8, err: anyerror) error{ OutOfMemory, InvalidSessionFormat } {
+    debug_trace.logf("session", "event=v1_detail_unreadable session={s} err={s}", .{ id, @errorName(err) });
+    const stuck = (checkV1(store, alloc, id) catch |check_err| switch (check_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    }) orelse {
+        store.problem = .{};
+        return error.InvalidSessionFormat;
+    };
+    defer {
+        alloc.free(stuck.id);
+        alloc.free(stuck.reason);
+    }
+    store.problem = .{};
+    return store.problem.set("{s}", .{stuck.reason});
 }
 
 /// A page of saved root sessions as v1 pages them: newest first, one
@@ -478,7 +523,16 @@ pub fn listPage(
         added += 1;
     }
     session_summary_codec.sortSummariesNewestFirst(candidates.items);
-    return session_summary_codec.sessionListPageFromSummaries(alloc, candidates.items, workspace, continuation, limit);
+    var page = try session_summary_codec.sessionListPageFromSummaries(alloc, candidates.items, workspace, continuation, limit);
+    // A workspace's page leaves out v1's roots that can't be read, whose
+    // workspace is unknown, and counts them as v1 did; the profile-wide
+    // listing shows them instead (D61).
+    if (workspace != null and continuation == null) {
+        for (v1_roots.summaries.items) |summary| {
+            if (summary.workspace_root == null) page.skipped_invalid += 1;
+        }
+    }
+    return page;
 }
 
 /// Appends v2's roots that follow `continuation` in v1's order to `out`,
@@ -535,6 +589,9 @@ pub const Recovered = struct {
     history_len: usize,
     /// False when a side file could not be copied.
     files_complete: bool,
+    /// True when the source's saved permission rules could not be read, so
+    /// the copy has none (D72).
+    permission_rules_dropped: bool = false,
 
     pub fn deinit(recovered: *Recovered, alloc: Allocator) void {
         alloc.free(recovered.id);
@@ -545,14 +602,15 @@ pub const Recovered = struct {
 /// `fx session recover` (D15): a new root session copied from `id` up to
 /// its last turn that ended before any damage, with a copy of its side
 /// files. The source is never changed, and may be held by another process.
-/// Caller owns the result.
+/// A v1 session is salvaged as v1's recover salvaged it (D64). Caller owns
+/// the result.
 pub fn recover(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const sa = scratch.allocator();
     // Line 1 names the session's kind and workspace, however damaged the rest is.
     var first = store.manager.read(sa, id, .start, .forward, 1) catch |err| return switch (err) {
-        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        error.NotFound, error.InvalidArgument => salvageV1(store, alloc, id),
         else => err,
     };
     defer first.deinit();
@@ -575,6 +633,14 @@ pub fn recover(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
     return .{ .id = copy_id, .history_len = restored.history.len, .files_complete = store.copyFiles(id, copy_id) };
 }
 
+/// `fx session recover` on a session only v1 holds (D64). Caller owns the
+/// result.
+fn salvageV1(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
+    var conversion: Conversion = .{ .store = store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
+    defer conversion.deinit();
+    return conversion.salvage(id);
+}
+
 pub const Doctor = struct {
     /// Saved root sessions.
     sessions: usize = 0,
@@ -588,11 +654,35 @@ pub const Doctor = struct {
     removed: usize = 0,
     /// Side folders with no session that could not be removed.
     kept: usize = 0,
+    /// Roots an older fx saved that v2 does not hold yet; each converts
+    /// when it is first opened (D73).
+    unconverted: usize = 0,
+    /// v1 folders of converted sessions and subagents, kept subagents among
+    /// them, that keep something their copy left out (D56, D62).
+    keeps_left_out: usize = 0,
+    /// Those of them that can't be converted, among the checked ones.
+    stuck: std.ArrayList(Stuck) = .empty,
+    /// Each v1 subagent no conversion takes, kept as it is (D88).
+    kept_children: []KeptChild = &.{},
+
+    pub const Stuck = struct {
+        id: []u8,
+        /// The file and the reason the conversion refuses it.
+        reason: []u8,
+        /// What `fx session recover` copies of it.
+        recover: enum { without_rules, good_turns, nothing },
+    };
 
     pub fn deinit(report: *Doctor, alloc: Allocator) void {
         if (report.latest) |id| alloc.free(id);
         for (report.damaged.items) |id| alloc.free(id);
         report.damaged.deinit(alloc);
+        for (report.stuck.items) |stuck| {
+            alloc.free(stuck.id);
+            alloc.free(stuck.reason);
+        }
+        report.stuck.deinit(alloc);
+        freeKeptChildren(alloc, report.kept_children);
         report.* = undefined;
     }
 };
@@ -635,8 +725,126 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Docto
         }
         cursor = page.next orelse break;
     }
+    try doctorV1(store, alloc, &report, limit);
+    report.kept_children = try keptChildren(store, alloc);
+    for (report.kept_children) |child| report.keeps_left_out += @intFromBool(child.keeps);
     try store.sweepFiles(alloc, &report, now_ms);
     return report;
+}
+
+/// Counts the roots an older fx saved that v2 does not hold yet, and names
+/// each checked one that can't be converted with what `fx session recover`
+/// copies of it (D73). Reads only; a busy family is left out.
+fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !void {
+    const roots = v1_conversion.rootIds(alloc, store.home) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("session", "event=doctor_v1_unlisted err={s}", .{@errorName(err)});
+            return;
+        },
+    };
+    defer {
+        for (roots) |root| root.deinit(alloc);
+        alloc.free(roots);
+    }
+    for (roots) |root| {
+        if (store.manager.peek(alloc, root.id)) |peeked_value| {
+            var peeked = peeked_value;
+            defer peeked.deinit(alloc);
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            if (parseV1Source(a, peeked.state.v1_source)) |source| {
+                if (source.keeps()) report.keeps_left_out += 1;
+            }
+            for (peeked.state.children.items) |child| {
+                const present = v1_conversion.hasFolder(store.home, child.id) catch |err| {
+                    debug_trace.logf("session", "event=doctor_v1_child_unread session={s} err={s}", .{ child.id, @errorName(err) });
+                    continue;
+                };
+                if (!present) continue;
+                const child_state_value = store.manager.peek(a, child.id) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        debug_trace.logf("session", "event=doctor_v1_child_unread session={s} err={s}", .{ child.id, @errorName(err) });
+                        continue;
+                    },
+                };
+                if (parseV1Source(a, child_state_value.state.v1_source)) |source| {
+                    if (source.keeps()) report.keeps_left_out += 1;
+                }
+            }
+            continue;
+        } else |err| switch (err) {
+            error.NotFound, error.InvalidArgument => {},
+            error.OutOfMemory => return err,
+            else => continue,
+        }
+        report.unconverted += 1;
+        if (report.checked == limit) continue;
+        report.checked += 1;
+        try report.stuck.ensureUnusedCapacity(alloc, 1);
+        if (root.unreadable) |why| {
+            report.stuck.appendAssumeCapacity(try stuckRoot(alloc, root.id, why, .nothing));
+            continue;
+        }
+        if (try checkV1(store, alloc, root.id)) |stuck| report.stuck.appendAssumeCapacity(stuck);
+    }
+}
+
+fn stuckRoot(alloc: Allocator, id: []const u8, reason: []const u8, recover_kind: @FieldType(Doctor.Stuck, "recover")) !Doctor.Stuck {
+    const owned_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(owned_id);
+    return .{ .id = owned_id, .reason = try alloc.dupe(u8, reason), .recover = recover_kind };
+}
+
+/// Null when `root_id`'s family converts, or is busy.
+fn checkV1(store: *Store, alloc: Allocator, root_id: []const u8) !?Doctor.Stuck {
+    store.problem = .{};
+    var v1 = try session_store.Store.initReadOnlyFromHome(alloc, store.home, "/");
+    defer v1.deinit(alloc);
+    var locks = v1_conversion.lockFamily(alloc, &v1, root_id, 0, &store.problem) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.SessionBusy, error.SessionNotFound => return null,
+        error.InvalidSessionFormat => return try stuckRoot(alloc, root_id, store.problem.text(), .nothing),
+        else => return try stuckRoot(alloc, root_id, @errorName(err), .nothing),
+    };
+    defer locks.release();
+    for (locks.members.items) |*locked| {
+        var member = v1_conversion.readMember(alloc, &v1, locked, &store.problem, .required) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => break,
+        };
+        member.deinit();
+    } else return null;
+    var reason: [v1_conversion.Problem.capacity]u8 = undefined;
+    const why = if (store.problem.len > 0) store.problem.text() else "its folder can't be read";
+    @memcpy(reason[0..why.len], why);
+    // What `recover` would copy, read in the order its salvage reads: a
+    // root that reads whole is not salvaged at all.
+    const root = &locks.members.items[0];
+    const recover_kind: @FieldType(Doctor.Stuck, "recover") = kind: {
+        store.problem = .{};
+        if (v1_conversion.readMember(alloc, &v1, root, &store.problem, .required)) |whole| {
+            var read = whole;
+            read.deinit();
+            break :kind .nothing;
+        } else |err| if (err == error.OutOfMemory) return err;
+        store.problem = .{};
+        if (v1_conversion.readMember(alloc, &v1, root, &store.problem, .drop_unreadable)) |whole| {
+            var read = whole;
+            read.deinit();
+            break :kind .without_rules;
+        } else |err| if (err == error.OutOfMemory) return err;
+        store.problem = .{};
+        if (v1_conversion.readSalvage(alloc, &v1, root, &store.problem)) |salvaged| {
+            var read = salvaged;
+            read.deinit();
+            break :kind .good_turns;
+        } else |err| if (err == error.OutOfMemory) return err;
+        break :kind .nothing;
+    };
+    return try stuckRoot(alloc, root_id, reason[0..why.len], recover_kind);
 }
 
 // ---------------------------------------------------------------------------
@@ -999,6 +1207,10 @@ pub const Session = struct {
     /// `~/.fx/session-files/{id}`, owned: where an older session kept its
     /// side files, read once by the move (D47).
     files_path: []u8,
+    /// The folder of this session's blobs once it is published, owned, as
+    /// `Manager.blobPath` joins it: each prompt image is the file named by
+    /// its hash there (D79).
+    blobs_path: []u8,
     /// The session's blobs, shared with every capability over it (D44).
     host: *BlobHost,
     capability: ?session_child_store.SessionChildCapability = null,
@@ -1017,6 +1229,8 @@ pub const Session = struct {
     /// The v2 turn behind each of fx's history turns, in order; null for a
     /// compacted summary.
     turn_numbers: std.ArrayList(?u64) = .empty,
+    /// What fx's history leaves out of its first kept turn (D87).
+    trim: Trim = .{},
     /// The language tag last written, owned.
     language: ?[]u8 = null,
     /// Started in this process: its first commit may name it.
@@ -1165,7 +1379,7 @@ pub const Session = struct {
             // The newest of the listing, which holds v1's unconverted roots
             // too (D61).
             .last => {
-                const newest = (try newestListed(store, alloc, workspace)) orelse return error.NoSavedSessions;
+                const newest = (try newestListed(store, alloc, workspace)) orelse return noLatestError(store, alloc);
                 defer alloc.free(newest);
                 return openOrConvert(alloc, store, newest, workspace, host, lock_wait_ms, started);
             },
@@ -1227,15 +1441,23 @@ pub const Session = struct {
     fn init(alloc: Allocator, store: *Store, handle: sm.Session, fresh: bool) !*Session {
         const files_path = try std.Io.Dir.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
         errdefer alloc.free(files_path);
+        const blobs_path = try std.Io.Dir.path.join(alloc, &.{ store.manager.root_path, handle.id(), "blobs" });
+        errdefer alloc.free(blobs_path);
         const host = try BlobHost.create(alloc, store, handle);
         errdefer BlobHost.release(host);
         const self = try alloc.create(Session);
-        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh };
+        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .blobs_path = blobs_path, .host = host, .fresh = fresh };
         return self;
     }
 
     pub fn id(self: *const Session) []const u8 {
         return self.handle.id();
+    }
+
+    /// Where requests say a prompt image is saved (D79): the blob a turn's
+    /// user item keeps it as, written before any of the turn's tools run.
+    pub fn blobsPath(self: *const Session) []const u8 {
+        return self.blobs_path;
     }
 
     /// Appends through the manager; a host session also traces the turn and
@@ -1347,6 +1569,7 @@ pub const Session = struct {
         if (self.instructions) |value| alloc.free(value);
         if (self.first_title) |value| alloc.free(value);
         alloc.free(self.files_path);
+        alloc.free(self.blobs_path);
         alloc.destroy(self);
     }
 
@@ -1387,6 +1610,35 @@ pub const Session = struct {
 
     /// Opens the turn on disk if it is not open yet, so a body stored for it
     /// is a blob of a session on disk (D44). Caller holds the mutex.
+    /// Keeps each inline prompt image as one of the session's blobs too and
+    /// saves the prompt naming that file, which every request names for the
+    /// model and an image too large to send names in its notice (D79). The
+    /// bytes stay in the item (D44), and `promptImageBlobs` lists the blob
+    /// on it. Storing the same bytes again costs one stat, so a streamed
+    /// prompt encodes the same each time. The path
+    /// is the one `blobPath` gives once the session is published, so an
+    /// import's staged blobs (D59) get theirs too. The caller holds the
+    /// mutex.
+    fn keepPromptImages(self: *Session, a: Allocator, events: []Event) !void {
+        for (events) |*event| switch (event.*) {
+            .user => |*user| {
+                var kept: ?[]types.ImageAttachment = null;
+                for (user.images, 0..) |image, index| {
+                    const bytes = image.inline_data orelse continue;
+                    if (kept == null) {
+                        // A blob needs the turn on disk first (D44).
+                        try self.openTurnLocked();
+                        kept = try a.dupe(types.ImageAttachment, user.images);
+                    }
+                    const hash = try self.handle.putBlob(bytes);
+                    kept.?[index].snapshot_path = try std.Io.Dir.path.join(a, &.{ self.blobs_path, &hash });
+                }
+                if (kept) |list| user.images = list;
+            },
+            else => {},
+        };
+    }
+
     fn openTurnLocked(self: *Session) !void {
         if (self.turn_open) return;
         _ = try self.write(&.{.turn_started});
@@ -1456,6 +1708,7 @@ pub const Session = struct {
         var events: std.ArrayList(Event) = .empty;
         try session_event.appendHistoryTurnConversationEvents(a, &events, turn);
         if (events.items.len < 2) return error.InvalidConversationFrame;
+        try self.keepPromptImages(a, events.items);
         const pieces = events.items[0 .. events.items.len - 1];
         const end = events.items[events.items.len - 1];
 
@@ -1523,6 +1776,7 @@ pub const Session = struct {
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
+        try self.keepPromptImages(a, events.items);
         // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked();
         // On a missing handle the list keeps the pieces before it.
@@ -1622,11 +1876,33 @@ pub const Session = struct {
                 batch.clearRetainingCapacity();
             }
         }
-        for (events, encoded) |event, bytes| try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
+        for (events, encoded) |event, bytes| {
+            var piece = try self.item(a, std.meta.activeTag(event), bytes);
+            if (event == .user) piece.blobs = try self.promptImageBlobs(a, piece.blobs, event.user.images);
+            try batch.append(a, .{ .item = piece });
+        }
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
         _ = try self.write(batch.items);
         if (!self.turn_open) self.startedTurn();
+    }
+
+    /// `blobs` and the blob each kept prompt image names, so every blob is
+    /// listed on an item of the turn that stored it (D44, D79).
+    fn promptImageBlobs(self: *Session, a: Allocator, blobs: []const []const u8, images: []const types.ImageAttachment) ![]const []const u8 {
+        const folder = self.blobs_path;
+        var list: std.ArrayList([]const u8) = .empty;
+        for (images) |image| {
+            const path = image.snapshot_path orelse continue;
+            if (path.len != folder.len + 1 + @sizeOf(sm.BlobHash) or !std.mem.startsWith(u8, path, folder) or path[folder.len] != '/') continue;
+            const hash = path[folder.len + 1 ..];
+            if (list.items.len == 0) try list.appendSlice(a, blobs);
+            const listed = for (list.items) |ref| {
+                if (std.mem.eql(u8, ref, hash)) break true;
+            } else false;
+            if (!listed) try list.append(a, hash);
+        }
+        return if (list.items.len == 0) blobs else list.items;
     }
 
     fn startedTurn(self: *Session) void {
@@ -1662,8 +1938,10 @@ pub const Session = struct {
     }
 
     /// `events`, a turn's pieces, ended by the last one.
-    fn importTurn(self: *Session, a: Allocator, events: []const Event) !void {
-        if (events.len < 2) return error.InvalidConversationFrame;
+    fn importTurn(self: *Session, a: Allocator, turn_events: []const Event) !void {
+        if (turn_events.len < 2) return error.InvalidConversationFrame;
+        const events = try a.dupe(Event, turn_events);
+        try self.keepPromptImages(a, events);
         const encoded = try a.alloc([]u8, events.len);
         for (events, encoded) |event, *bytes| bytes.* = try encodePiece(a, event);
         const end: sm.Event = switch (events[events.len - 1]) {
@@ -1741,23 +2019,39 @@ pub const Session = struct {
         const cut = retained_from orelse types.ContextHistoryCut{ .turns = self.turn_numbers.items.len };
         const first_kept = turnSlot(self.turn_numbers.items, cut.turns);
         var keep_from: ?u64 = null;
-        for (self.turn_numbers.items[first_kept..]) |number| {
+        // Whether `keep_from` is the turn the cut falls in.
+        var cut_turn = false;
+        for (self.turn_numbers.items[first_kept..], 0..) |number, slot| {
             if (number) |n| {
                 keep_from = n;
+                cut_turn = slot == 0;
                 break;
             }
         }
-        if (keep_from == null and active_prefix and self.turn_open) keep_from = self.last_turn;
-        if (cut.tool_steps != 0 or cut.steering != 0) {
-            debug_trace.logf("session", "event=sessions_v2_compaction_cut session={s} kept=whole_turn tool_steps={d} steering={d}", .{ self.id(), cut.tool_steps, cut.steering });
+        if (keep_from == null and active_prefix and self.turn_open) {
+            keep_from = self.last_turn;
+            cut_turn = true;
+        }
+        // A cut inside a turn counts from where fx's view of that turn starts,
+        // past what an earlier compaction inside it covered (D87).
+        const trim: Trim = if (!cut_turn) .{} else if (self.trim.turn == keep_from) .{
+            .turn = keep_from,
+            .tool_steps = self.trim.tool_steps + cut.tool_steps,
+            .steering = self.trim.steering + cut.steering,
+        } else .{ .turn = keep_from, .tool_steps = cut.tool_steps, .steering = cut.steering };
+        if (trim.tool_steps != 0 or trim.steering != 0) {
+            debug_trace.logf("session", "event=sessions_v2_compaction_cut session={s} turn={?d} tool_steps={d} steering={d}", .{ self.id(), trim.turn, trim.tool_steps, trim.steering });
         }
         const data: CompactedData = .{
             .summary = summary.summary,
             .removed_turn_count = summary.removed_turn_count,
             .compaction_count = summary.compaction_count,
             .keep_from_turn = keep_from,
+            .keep_tool_steps = trim.tool_steps,
+            .keep_steering = trim.steering,
         };
         _ = try self.write(&.{.{ .compacted = try jsonValue(arena.allocator(), data) }});
+        self.trim = if (trim.tool_steps != 0 or trim.steering != 0) trim else .{};
         // fx's history is now the summary, then the retained turns.
         var kept: std.ArrayList(?u64) = .empty;
         errdefer kept.deinit(self.alloc);
@@ -1942,7 +2236,7 @@ pub const Session = struct {
         const state = try self.handle.state(sa);
         self.last_turn = state.last_turn;
         self.turn_numbers.clearRetainingCapacity();
-        var restored = try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers });
+        var restored = try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers, .trim = &self.trim });
         errdefer restored.deinit(alloc);
         if (self.first_title) |value| self.alloc.free(value);
         self.first_title = null;
@@ -2236,6 +2530,15 @@ const SideFileLines = struct {
 /// and each of `stored` (results an older format kept inline), put as a
 /// blob and named in the moved map, which is one more blob, and the ACP
 /// client's files. In `a`.
+/// Whether `stored` holds the result body named `handle`.
+fn storedInline(stored: []const v1_conversion.Stored, handle: []const u8) bool {
+    const prefix = "tool-results/";
+    for (stored) |entry| {
+        if (entry.key.len == prefix.len + handle.len and std.mem.startsWith(u8, entry.key, prefix) and std.mem.endsWith(u8, entry.key, handle)) return true;
+    }
+    return false;
+}
+
 fn sideFileLines(a: Allocator, handle: sm.Session, side: *io_mod.VerifiedDir, folders: []const []const u8, stored: []const v1_conversion.Stored, left_out: []const []const u8) !SideFileLines {
     const io = io_mod.getIo();
     var bodies: std.ArrayList(Body) = .empty;
@@ -2317,7 +2620,9 @@ fn listFolder(a: Allocator, handle: sm.Session, side: *io_mod.VerifiedDir, folde
     }
 }
 
-const PutBodyError = sm.AppendError || std.Io.File.OpenError || std.Io.File.StatError;
+const PutBodyError = sm.AppendError || OpenRegularError || std.Io.File.StatError;
+/// What `io_mod.openExistingReadOnlyRegularFile` can return.
+const OpenRegularError = @typeInfo(@typeInfo(@TypeOf(io_mod.openExistingReadOnlyRegularFile)).@"fn".return_type.?).error_union.error_set;
 
 /// Puts `bodies` as blobs, a few at a time: each waits on its own syncs
 /// (D44), which then overlap.
@@ -2345,7 +2650,7 @@ fn putBodies(handle: sm.Session, bodies: []Body) PutBodyError!void {
 
         fn put(putter: *@This(), body: *Body) PutBodyError!void {
             const io = io_mod.getIo();
-            var file = try body.dir.openFile(io, body.name, .{ .follow_symlinks = false });
+            var file = try io_mod.openExistingReadOnlyRegularFile(body.dir, body.name, .no_follow);
             defer file.close(io);
             body.hash = try putter.handle.putBlobFile(file, (try file.stat(io)).size);
         }
@@ -2373,7 +2678,8 @@ const moved_refs_per_line = 4096;
 
 /// A side file's bytes, or null when it is missing; at most `max_bytes`.
 fn readSideFile(a: Allocator, side: *io_mod.VerifiedDir, name: []const u8, max_bytes: usize) !?[]u8 {
-    var file = side.dir.openFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    // Never waits on a FIFO or other special file put in its place.
+    var file = io_mod.openExistingReadOnlyRegularFile(side.dir, name, .no_follow) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -2446,6 +2752,9 @@ const Source = struct {
             };
             if (images == null) images = try pa.dupe(types.ImageAttachment, user.images);
             images.?[index].inline_data = bytes;
+            // The v1 file went with its folder; the blob is the original now
+            // (D79).
+            images.?[index].snapshot_path = try src.store.manager.blobPath(pa, src.id, &hash);
         }
         const list = images orelse return user;
         return .{ .text = user.text, .images = list, .work_id = user.work_id };
@@ -2480,18 +2789,57 @@ const slow_conversion_ns: i128 = 150 * std.time.ns_per_ms;
 const slow_conversion_text = "Converting this session from the previous session format…";
 
 /// What v2 keeps of a converted member's v1 source (`set v1_source`): the
-/// fingerprint its removal checks (D60).
+/// fingerprint its removal checks (D60), and what its copy left out (D56,
+/// D62), the first `max_records` files by name and how many in all, which
+/// its v1 folder keeps and no removal then takes. The fingerprint is empty
+/// then, so an older fx, which removes a v1 folder whose fingerprint
+/// matches, never takes that folder either.
 const V1Source = struct {
-    fingerprint: []const u8,
+    fingerprint: []const u8 = "",
+    left_out: []const Record = &.{},
+    left_out_total: usize = 0,
+
+    const Record = struct { file: []const u8, cause: LeftOut.Cause, bytes: u64 = 0 };
+    /// The most files a copy names, which keeps its line far below the
+    /// log's limit; the v1 folder keeps every file.
+    const max_records = 32;
+
+    fn leftOutCount(source: V1Source) usize {
+        return @max(source.left_out_total, source.left_out.len);
+    }
+
+    fn keeps(source: V1Source) bool {
+        return source.leftOutCount() > 0;
+    }
 };
 
-/// A side file a conversion leaves out (D62): larger than one v2 blob.
+/// A file a conversion leaves out, which the member's v1 folder keeps: a
+/// side file larger than one v2 blob (D62), hosted terminal state the copy
+/// can't take (D56), or, in salvage, a side file a kept result names that
+/// is not what it records (D74).
 pub const LeftOut = struct {
     /// The family member that kept it in v1.
     member: []u8,
-    /// `{folder}/{name}` in that member's v1 folder.
+    /// Its path in that member's v1 folder.
     file: []u8,
+    /// Its size, for `too_large`.
     bytes: u64,
+    cause: Cause,
+
+    pub const Cause = enum {
+        /// A side file larger than one v2 blob (D62).
+        too_large,
+        /// Hosted terminal state that is not a folder or a regular file,
+        /// such as a link or a FIFO (D56).
+        not_regular,
+        /// Hosted terminal state that does not open (D56).
+        unreadable,
+        /// Hosted terminal state nested deeper than the copy goes (D56).
+        too_deep,
+        /// A side file a kept result names that is missing or not what the
+        /// result records, which salvage does not copy (D74).
+        unavailable,
+    };
 
     fn deinit(entry: LeftOut, alloc: Allocator) void {
         alloc.free(entry.member);
@@ -2500,9 +2848,22 @@ pub const LeftOut = struct {
 
     /// What a host tells the user about it.
     fn note(entry: LeftOut, alloc: Allocator, root_id: []const u8) ![]u8 {
+        const why = try entry.reason(alloc);
+        defer alloc.free(why);
         if (std.mem.eql(u8, entry.member, root_id))
-            return alloc.print("This session was converted without {s}, which is {d} bytes, more than the {d} the new store keeps in one file.", .{ entry.file, entry.bytes, sm.max_blob_bytes });
-        return alloc.print("This session was converted without {s} of its subagent {s}, which is {d} bytes, more than the {d} the new store keeps in one file.", .{ entry.file, entry.member, entry.bytes, sm.max_blob_bytes });
+            return alloc.print("This session was converted without {s} because {s}. Its earlier folder ~/.fx/sessions/{s} keeps it.", .{ entry.file, why, entry.member });
+        return alloc.print("This session was converted without {s} of its subagent {s} because {s}. Its earlier folder ~/.fx/sessions/{s} keeps it.", .{ entry.file, entry.member, why, entry.member });
+    }
+
+    /// Why the copy left it out, as a clause. Caller owns it.
+    pub fn reason(entry: LeftOut, alloc: Allocator) ![]u8 {
+        return switch (entry.cause) {
+            .too_large => alloc.print("it is {d} bytes, more than the {d} the new store keeps in one file", .{ entry.bytes, sm.max_blob_bytes }),
+            .not_regular => alloc.dupe(u8, "it is not a file or folder"),
+            .unreadable => alloc.dupe(u8, "it can't be read"),
+            .too_deep => alloc.dupe(u8, "it is nested deeper than the copy goes"),
+            .unavailable => alloc.dupe(u8, "it is missing or not what its result records"),
+        };
     }
 };
 
@@ -2523,7 +2884,7 @@ const Conversion = struct {
     members: usize = 0,
     turns: usize = 0,
     files: usize = 0,
-    /// The side files the first pass found too large to keep (D62).
+    /// Every file this conversion left out, of every member (D56, D62).
     left_out: std.ArrayList(LeftOut) = .empty,
 
     const Outcome = enum { converted, held };
@@ -2542,6 +2903,9 @@ const Conversion = struct {
         /// `Unchanged`): copied in this run, or reused while its v1 copy is
         /// the one converted.
         unchanged: bool = true,
+        /// Whether its v1 folder keeps something its copy left out (TLA
+        /// `keeps`), which then stays.
+        keeps: bool = false,
     };
 
     /// A member the first pass checked (D62): a child an earlier try
@@ -2624,16 +2988,158 @@ const Conversion = struct {
         return .converted;
     }
 
+    /// A salvage of a v1 root (D64; `tests/tla/session_manager/V1Conversion.tla`
+    /// SBegin, SFinish): under the family's locks, v1's own recovery reads
+    /// the start of the root it keeps, which is written under a fresh id as
+    /// a root of its own and published. No v1 file is written.
+    fn salvage(c: *Conversion, root_id: []const u8) !Recovered {
+        const store = c.store;
+        store.problem = .{};
+        var v1 = try session_store.Store.initReadOnlyFromHome(c.alloc, store.home, "/");
+        defer v1.deinit(c.alloc);
+        if (try v1_conversion.kindOf(&v1, c.alloc, root_id) != .root) return error.SessionNotFound;
+        var locks = try v1_conversion.lockFamily(c.alloc, &v1, root_id, 0, &store.problem);
+        defer locks.release();
+        const locked = &locks.members.items[0];
+        // A session the converter reads whole needs no salvage, as v1's
+        // recover finds once it has brought an older format up to date.
+        if (v1_conversion.readMember(c.alloc, &v1, locked, &store.problem, .required)) |whole| {
+            var read = whole;
+            read.deinit();
+            return error.SessionRecoveryNotNeeded;
+        } else |err| if (err == error.OutOfMemory) return err;
+        store.problem = .{};
+        // A conversation that only its saved rules keep from converting is
+        // copied whole without them (D72); anything else is salvaged as v1
+        // salvaged it.
+        var member = v1_conversion.readMember(c.alloc, &v1, locked, &store.problem, .drop_unreadable) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => salvaged: {
+                store.problem = .{};
+                break :salvaged try v1_conversion.readSalvage(c.alloc, &v1, locked, &store.problem);
+            },
+        };
+        defer member.deinit();
+        try c.findLeftOut(root_id, locked);
+        try c.checkKeptFiles(root_id, locked, &member);
+        var id: [sm.new_id_len]u8 = undefined;
+        sm.newId(io_mod.getIo(), &id);
+        const handle = store.manager.openImport(.{ .id = &id, .workspace = member.workspace, .host = c.host, .created_ms = member.created_ms }) catch |err|
+            return conversionStorageFailed("salvage", err);
+        const session = Session.init(c.alloc, store, handle, false) catch |err| {
+            handle.release();
+            c.discardStaging(&id);
+            return err;
+        };
+        session.root = false;
+        defer session.dropImport();
+        errdefer c.discardStaging(&id);
+        var arena = std.heap.ArenaAllocator.init(c.alloc);
+        defer arena.deinit();
+        var registry = try child_state.Registry.init(arena.allocator(), &id);
+        try c.writeMember(session, &member, locked, .{ .root = .{ .registry = &registry, .has_log = &.{} } }, &.{}, 0);
+        try session.handle.publishImport();
+        debug_trace.logf("convert", "action=Salvaged session={s} copy={s} turns={d} rules_dropped={}", .{ root_id, &id, member.turns, member.rules_dropped });
+        return .{
+            .id = try c.alloc.dupe(u8, &id),
+            .history_len = member.steps.len,
+            .files_complete = c.left_out.items.len == 0,
+            .permission_rules_dropped = member.rules_dropped,
+        };
+    }
+
+    /// Copies `<v1>/terminal` to `~/.fx/terminal/{id}/terminal` (D45), over
+    /// what a crashed try left there, whatever its folders' modes, as v1
+    /// opened them (it made each private). An entry the copy can't take is
+    /// left out, and the member's v1 folder keeps it (D56, D62). A copy, not
+    /// a move: a conversion that stops leaves v1 whole.
+    fn copyTerminalState(c: *Conversion, root_id: []const u8, locked: *v1_conversion.Locked) !void {
+        const io = io_mod.getIo();
+        var source = (io_mod.openRealDirIfPresent(&locked.dir, terminal_dir_name) catch |err|
+            return c.leaveOut(root_id, locked.id, terminal_dir_name, .unreadable, err)) orelse return;
+        defer source.close();
+        var root = try c.store.makeProfileFolder(terminal_dir_name);
+        defer root.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, locked.id);
+        defer owner.close();
+        try owner.dir.deleteTree(io, terminal_dir_name);
+        var target = try io_mod.openOrCreateVerifiedPrivateDir(&owner, terminal_dir_name);
+        defer target.close();
+        try c.copyTerminalTree(root_id, locked.id, &source, &target, terminal_dir_name, 0);
+    }
+
+    /// Copies the folders and regular files below `source`, at `path` in
+    /// the member's v1 folder. An entry that is neither, one that does not
+    /// open, or one nested deeper than `max_copy_depth` is left out. A write
+    /// that fails fails the copy.
+    fn copyTerminalTree(
+        c: *Conversion,
+        root_id: []const u8,
+        member_id: []const u8,
+        source: *io_mod.VerifiedDir,
+        target: *io_mod.VerifiedDir,
+        path: []const u8,
+        depth: usize,
+    ) (ConversionStorageError || Allocator.Error)!void {
+        const io = io_mod.getIo();
+        var it = source.dir.iterate();
+        while (it.next(io) catch |err| return c.leaveOut(root_id, member_id, path, .unreadable, err)) |entry| {
+            var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const sub = std.mem.print(&buffer, "{s}/{s}", .{ path, entry.name }) catch return conversionStorageFailed("terminal", error.NameTooLong);
+            switch (entry.kind) {
+                .directory => {
+                    if (depth + 1 == max_copy_depth) {
+                        try c.leaveOut(root_id, member_id, sub, .too_deep, null);
+                        continue;
+                    }
+                    var from = (io_mod.openRealDirIfPresent(source, entry.name) catch |err| {
+                        try c.leaveOut(root_id, member_id, sub, .unreadable, err);
+                        continue;
+                    }) orelse continue;
+                    defer from.close();
+                    var to = io_mod.openOrCreateVerifiedPrivateDir(target, entry.name) catch |err| return conversionStorageFailed("terminal", err);
+                    defer to.close();
+                    try c.copyTerminalTree(root_id, member_id, &from, &to, sub, depth + 1);
+                },
+                .file => {
+                    var file = io_mod.openExistingReadOnlyRegularFile(source.dir, entry.name, .no_follow) catch |err| {
+                        try c.leaveOut(root_id, member_id, sub, .unreadable, err);
+                        continue;
+                    };
+                    defer file.close(io);
+                    copyOpenedFile(&file, target.dir, entry.name) catch |err| return conversionStorageFailed("terminal", err);
+                },
+                else => try c.leaveOut(root_id, member_id, sub, .not_regular, null),
+            }
+        }
+    }
+
+    /// Records `file`, which it takes, in `member_id`'s v1 folder as left
+    /// out of its copy. `file` is freed when that fails.
+    fn addLeftOut(c: *Conversion, member_id: []const u8, file: []u8, bytes: u64, cause: LeftOut.Cause) Allocator.Error!void {
+        errdefer c.alloc.free(file);
+        try c.left_out.ensureUnusedCapacity(c.alloc, 1);
+        const member = try c.alloc.dupe(u8, member_id);
+        c.left_out.appendAssumeCapacity(.{ .member = member, .file = file, .bytes = bytes, .cause = cause });
+    }
+
+    /// `addLeftOut` for hosted terminal state, naming it in the trace.
+    fn leaveOut(c: *Conversion, root_id: []const u8, member_id: []const u8, file: []const u8, cause: LeftOut.Cause, err: ?anyerror) Allocator.Error!void {
+        try c.addLeftOut(member_id, try c.alloc.dupe(u8, file), 0, cause);
+        debug_trace.logf("convert", "action=LeftOut session={s} member={s} file={s} cause={s} err={s}", .{ root_id, member_id, file, @tagName(cause), if (err) |value| @errorName(value) else "none" });
+    }
+
     fn traceHeld(root_id: []const u8) Outcome {
         debug_trace.logf("convert", "action=Held session={s}", .{root_id});
         return .held;
     }
 
     /// Removes a published member's v1 folder while it is the copy converted
-    /// (CDelete).
+    /// (CDelete), unless it keeps something its copy left out (D56, D62),
+    /// which then stays only there.
     fn removeMember(v1: *session_store.Store, root_id: []const u8, member: Staged) void {
-        if (!member.unchanged) {
-            debug_trace.logf("convert", "action=KeptV1 session={s} member={s}", .{ root_id, member.id });
+        if (!member.unchanged or member.keeps) {
+            debug_trace.logf("convert", "action=KeptV1 session={s} member={s} reason={s}", .{ root_id, member.id, if (member.keeps) "left_out" else "changed" });
             return;
         }
         _ = v1_conversion.removeFolder(v1, member.id, "converted");
@@ -2676,7 +3182,7 @@ const Conversion = struct {
     }
 
     fn load(c: *Conversion, v1: *session_store.Store, locked: *v1_conversion.Locked, root_id: []const u8) !v1_conversion.Member {
-        return v1_conversion.readMember(c.alloc, v1, locked, &c.store.problem) catch |err| {
+        return v1_conversion.readMember(c.alloc, v1, locked, &c.store.problem, .required) catch |err| {
             if (err == error.InvalidSessionFormat) c.traceUnreadable(root_id, locked.id);
             return err;
         };
@@ -2699,14 +3205,75 @@ const Conversion = struct {
                 const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err|
                     return c.refuse(root_id, locked.id, "{s}/{s} can't be read ({s})", .{ folder, entry.name, @errorName(err) });
                 if (stat.size <= sm.max_blob_bytes) continue;
-                try c.left_out.ensureUnusedCapacity(c.alloc, 1);
-                const member = try c.alloc.dupe(u8, locked.id);
-                errdefer c.alloc.free(member);
                 const file = try c.alloc.print("{s}/{s}", .{ folder, entry.name });
-                c.left_out.appendAssumeCapacity(.{ .member = member, .file = file, .bytes = stat.size });
+                try c.addLeftOut(locked.id, file, stat.size, .too_large);
                 debug_trace.logf("convert", "action=LeftOut session={s} member={s} file={s} bytes={d} limit={d}", .{ root_id, locked.id, file, stat.size, sm.max_blob_bytes });
             }
         }
+    }
+
+    /// Leaves out each side file a kept result names that is missing, not
+    /// the size its record gives, or not the bytes the digest in its name
+    /// gives, which v1's recover would not copy (D74). The copy's result
+    /// then says its content is unavailable, and the recovery says so.
+    fn checkKeptFiles(c: *Conversion, root_id: []const u8, locked: *v1_conversion.Locked, member: *const v1_conversion.Member) !void {
+        for (member.steps) |step| switch (step) {
+            .framed => |framed| for (framed.events) |event| switch (event) {
+                .tool_result => |result| {
+                    try c.checkKeptFile(root_id, locked, "tool-results", result.artifact_ref, ".txt", result.stored_bytes);
+                    if (result.command_replay_ref) |ref| try c.checkKeptFile(root_id, locked, "logs/commands", ref, ".bin", result.command_replay_bytes);
+                },
+                else => {},
+            },
+            .whole => |whole| {
+                const execution = switch (whole.turn) {
+                    .assistant => |entry| entry.execution,
+                    .interrupted => |entry| entry.execution,
+                    .compacted_summary => continue,
+                };
+                for (execution.tool_steps) |tool_step| for (tool_step.tool_results) |result| {
+                    const handle = result.output_handle orelse continue;
+                    // An older format's inline result, which the conversion
+                    // writes itself.
+                    if (storedInline(member.stored, handle)) continue;
+                    try c.checkKeptFile(root_id, locked, "tool-results", handle, ".txt", result.stored_output_bytes);
+                };
+            },
+            .compacted => {},
+        };
+    }
+
+    fn checkKeptFile(c: *Conversion, root_id: []const u8, locked: *v1_conversion.Locked, folder: []const u8, name: []const u8, suffix: []const u8, expected_bytes: ?u64) !void {
+        if (name.len == 0) return;
+        for (c.left_out.items) |entry| {
+            if (std.mem.eql(u8, entry.member, locked.id) and entry.file.len == folder.len + 1 + name.len and
+                std.mem.startsWith(u8, entry.file, folder) and std.mem.endsWith(u8, entry.file, name)) return;
+        }
+        const io = io_mod.getIo();
+        const why: []const u8 = why: {
+            var dir = locked.dir.dir.openDir(io, folder, .{ .follow_symlinks = false }) catch break :why "missing";
+            defer dir.close(io);
+            var file = io_mod.openExistingReadOnlyRegularFile(dir, name, .no_follow) catch break :why "missing";
+            defer file.close(io);
+            const stat = file.stat(io) catch break :why "unreadable";
+            if (expected_bytes) |bytes| if (stat.size != bytes) break :why "not the size its result records";
+            if (!artifact_digest.hasContentDigest(name, suffix)) return;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            var buffer: [16 * 1024]u8 = undefined;
+            var offset: u64 = 0;
+            while (offset < stat.size) {
+                const count: usize = @intCast(@min(buffer.len, stat.size - offset));
+                const read = file.readPositionalAll(io, buffer[0..count], offset) catch break :why "unreadable";
+                if (read != count) break :why "unreadable";
+                hash.update(buffer[0..count]);
+                offset += count;
+            }
+            if (artifact_digest.handleMatchesContentDigest(name, suffix, hash.finalResult())) return;
+            break :why "not the bytes its name records";
+        };
+        const file = try c.alloc.print("{s}/{s}", .{ folder, name });
+        try c.addLeftOut(locked.id, file, 0, .unavailable);
+        debug_trace.logf("convert", "action=LeftOut session={s} member={s} file={s} reason=\"{s}\"", .{ root_id, locked.id, file, why });
     }
 
     /// Reads a checked member again unless its read was kept, and writes it
@@ -2745,8 +3312,18 @@ const Conversion = struct {
             session.dropImport();
             c.discardStaging(locked.id);
         }
-        try c.writeMember(session, member, locked, role);
-        return .{ .id = locked.id, .session = session };
+        try c.copyTerminalState(rootOf(role, locked.id), locked);
+        var records: std.ArrayList(V1Source.Record) = .empty;
+        defer records.deinit(c.alloc);
+        var total: usize = 0;
+        for (c.left_out.items) |entry| {
+            if (!std.mem.eql(u8, entry.member, locked.id)) continue;
+            total += 1;
+            if (records.items.len < V1Source.max_records) try records.append(c.alloc, .{ .file = entry.file, .cause = entry.cause, .bytes = entry.bytes });
+        }
+        if (total > records.items.len) debug_trace.logf("convert", "action=LeftOutUnnamed member={s} named={d} total={d}", .{ locked.id, records.items.len, total });
+        try c.writeMember(session, member, locked, role, records.items, total);
+        return .{ .id = locked.id, .session = session, .keeps = total > 0 };
     }
 
     /// A child an earlier try published before it stopped (TLA `Orphan`):
@@ -2765,18 +3342,24 @@ const Conversion = struct {
         const a = scratch.allocator();
         const source = parseV1Source(a, peeked.state.v1_source);
         const unchanged = if (source) |known| std.mem.eql(u8, known.fingerprint, &(try v1_conversion.fingerprintOf(a, &locked.dir))) else false;
-        debug_trace.logf("convert", "action=Reused member={s} v1={s}", .{ locked.id, if (unchanged) "unchanged" else "kept" });
+        const named: []const V1Source.Record = if (source) |known| known.left_out else &.{};
+        const total = if (source) |known| known.leftOutCount() else 0;
+        // What the earlier try left out, told now as this run tells its own.
+        for (named) |record| try c.addLeftOut(locked.id, try c.alloc.dupe(u8, record.file), record.bytes, record.cause);
+        debug_trace.logf("convert", "action=Reused member={s} v1={s} left_out={d} named={d}", .{ locked.id, if (unchanged) "unchanged" else "kept", total, named.len });
         return .{
             .id = locked.id,
             .session = null,
             .unchanged = unchanged,
+            .keeps = total > 0,
         };
     }
 
     /// Writes `member` into `session`, each batch at its original time
     /// (D59): its turns and compactions, then its settings at the time v1
-    /// lists it.
-    fn writeMember(c: *Conversion, session: *Session, member: *const v1_conversion.Member, locked: *v1_conversion.Locked, role: Role) !void {
+    /// lists it, among them what its copy left out: `left_out_total` files,
+    /// the first of them named in `records`.
+    fn writeMember(c: *Conversion, session: *Session, member: *const v1_conversion.Member, locked: *v1_conversion.Locked, role: Role, records: []const V1Source.Record, left_out_total: usize) !void {
         var arena = std.heap.ArenaAllocator.init(c.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -2805,6 +3388,8 @@ const Conversion = struct {
                         .removed_turn_count = compacted.removed_turn_count,
                         .compaction_count = compacted.compaction_count,
                         .keep_from_turn = if (compacted.keep_from) |index| turns.items[index] else null,
+                        .keep_tool_steps = compacted.keep_tool_steps,
+                        .keep_steering = compacted.keep_steering,
                     };
                     _ = try session.write(&.{.{ .compacted = try jsonValue(sa, data) }});
                     continue;
@@ -2823,7 +3408,8 @@ const Conversion = struct {
         for (c.left_out.items) |entry| if (std.mem.eql(u8, entry.member, locked.id)) try left_out.append(a, entry.file);
         const side = try sideFileLines(a, session.handle, &locked.dir, &body_folders, member.stored, left_out.items);
         try settings.appendSlice(a, side.events);
-        try settings.append(a, .{ .set = .{ .key = .v1_source, .value = try jsonValue(a, V1Source{ .fingerprint = &member.fingerprint }) } });
+        const source: V1Source = .{ .fingerprint = if (left_out_total > 0) "" else &member.fingerprint, .left_out = records, .left_out_total = left_out_total };
+        try settings.append(a, .{ .set = .{ .key = .v1_source, .value = try jsonValue(a, source) } });
         if (role == .root) {
             for (try child_state.v1ImportLines(a, role.root.registry.*, role.root.has_log)) |line| try settings.append(a, switch (line) {
                 .spawned => |spawned| .{ .child_spawned = .{ .child = spawned.child, .work_id = spawned.work_id, .data = spawned.data } },
@@ -2832,12 +3418,11 @@ const Conversion = struct {
         }
         session.import_ts = @max(newest, member.listed_ms);
         _ = try session.write(settings.items);
-        try copyTerminalState(c.store, locked);
         c.turns += member.turns;
         c.files += side.bodies;
     }
 
-    /// Tells the host about each side file the conversion left out (D62),
+    /// Tells the host about each file the conversion left out (D56, D62),
     /// as it tells it the open is slow.
     fn tellLeftOut(c: *Conversion, root_id: []const u8) void {
         const notice = c.store.notice orelse return;
@@ -2892,23 +3477,6 @@ fn childInstructionsOf(registry: child_state.Registry, id: []const u8) ?[]const 
     return null;
 }
 
-/// Copies `<v1>/terminal` to `~/.fx/terminal/{id}/terminal` (D45), over
-/// what a crashed try left there. A copy, not a move: a conversion that
-/// stops leaves v1 whole.
-fn copyTerminalState(store: *Store, locked: *v1_conversion.Locked) !void {
-    const io = io_mod.getIo();
-    var source = (try io_mod.openRealDirIfPresent(&locked.dir, terminal_dir_name)) orelse return;
-    defer source.close();
-    var root = try store.makeProfileFolder(terminal_dir_name);
-    defer root.close();
-    var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, locked.id);
-    defer owner.close();
-    try owner.dir.deleteTree(io, terminal_dir_name);
-    var target = try io_mod.openOrCreateVerifiedPrivateDir(&owner, terminal_dir_name);
-    defer target.close();
-    if (!copyTree(&source, &target, 0)) return error.SessionStoreUnavailable;
-}
-
 /// Whether v2 holds `id`, a damaged copy included: nothing converts over
 /// it, nor over one v2 cannot tell about, and the listing shows v2's.
 fn holdsV2(store: *Store, alloc: Allocator, id: []const u8) bool {
@@ -2926,14 +3494,15 @@ fn holdsV2(store: *Store, alloc: Allocator, id: []const u8) bool {
 fn parseV1Source(a: Allocator, raw: ?[]const u8) ?V1Source {
     const bytes = raw orelse return null;
     const source = std.json.parseFromSliceLeaky(V1Source, a, bytes, .{ .ignore_unknown_fields = true }) catch return null;
-    if (source.fingerprint.len != 64) return null;
+    if (!source.keeps() and source.fingerprint.len != 64) return null;
     return source;
 }
 
 /// Removes what a conversion left in v1 for the converted session
 /// `root_id` and its children: each member's v1 state, while its v1 copy is
-/// what was converted (TLA CClean, D60). A member another process holds,
-/// or that changed, keeps it; nothing here fails the open.
+/// what was converted (TLA CClean, D60). A member whose copy left something
+/// out (D56, D62), one another process holds, or one that changed keeps
+/// it; nothing here fails the open.
 fn cleanLeftovers(store: *Store, alloc: Allocator, root_id: []const u8, state: *const sm.State) void {
     if (state.v1_source == null) return;
     var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -2965,6 +3534,10 @@ fn cleanLeftovers(store: *Store, alloc: Allocator, root_id: []const u8, state: *
             debug_trace.logf("convert", "action=Kept session={s} reason=no_source", .{id});
             continue;
         };
+        if (source.keeps()) {
+            debug_trace.logf("convert", "action=Kept session={s} reason=left_out", .{id});
+            continue;
+        }
         var locked = (v1_conversion.tryLockLeftover(alloc, &v1, id) catch |err| {
             debug_trace.logf("convert", "action=CleanRefused session={s} err={s}", .{ id, @errorName(err) });
             continue;
@@ -2996,6 +3569,16 @@ fn leftFolder(store: *Store, id: []const u8) bool {
 
 /// The newest session of the merged listing in `workspace` (D61). Caller
 /// owns it.
+/// What a latest lookup that finds nothing says: that there are no saved
+/// sessions, or that only ones it can't read are left, as v1 said (D76).
+pub fn noLatestError(store: *Store, alloc: Allocator) error{ OutOfMemory, NoSavedSessions, NoReadableSessions } {
+    const unreadable = v1_conversion.hasUnreadable(alloc, store.home) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => false,
+    };
+    return if (unreadable) error.NoReadableSessions else error.NoSavedSessions;
+}
+
 fn newestListed(store: *Store, alloc: Allocator, workspace: []const u8) !?[]u8 {
     var page = try listPage(store, alloc, workspace, null, 1);
     defer page.deinit(alloc);
@@ -3010,8 +3593,11 @@ pub const ConvertReport = struct {
     unreadable: usize = 0,
     /// One per skipped session, in the order v1 lists its folders.
     skipped: std.ArrayList(Skipped) = .empty,
-    /// Each side file a converted family was converted without (D62).
+    /// Each file a converted family was converted without, which its v1
+    /// folder keeps (D56, D62).
     left_out: std.ArrayList(LeftOutFile) = .empty,
+    /// Each v1 subagent no conversion takes, kept as it is (D88).
+    kept_children: []KeptChild = &.{},
 
     pub const LeftOutFile = struct {
         /// The family's root.
@@ -3041,6 +3627,7 @@ pub const ConvertReport = struct {
             entry.file.deinit(alloc);
         }
         report.left_out.deinit(alloc);
+        freeKeptChildren(alloc, report.kept_children);
         report.* = undefined;
     }
 
@@ -3125,7 +3712,104 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
             conversion.left_out.clearRetainingCapacity();
         }
     }
+    // After every family converted, so a child its root left behind is named.
+    report.kept_children = try keptChildren(store, alloc);
     return report;
+}
+
+/// A session an older fx saved as a subagent that no conversion takes, and
+/// why no fx opens it (D88). Its v1 folder is kept as it is.
+pub const KeptChild = struct {
+    id: []u8,
+    reason: []u8,
+    /// Whether its converted copy left something out that its folder
+    /// keeps (D62).
+    keeps: bool = false,
+};
+
+pub fn freeKeptChildren(alloc: Allocator, kept: []KeptChild) void {
+    for (kept) |child| {
+        alloc.free(child.id);
+        alloc.free(child.reason);
+    }
+    alloc.free(kept);
+}
+
+/// Each v1 child whose parent is not a v1 root, with why no fx opens it
+/// (D88): one v2 already holds, whose folder a cleanup kept (D60), a child
+/// of an earlier subagent, which v1 never let a subagent message, or one
+/// whose parent is gone or does not list it. Reads only. Caller owns the
+/// result; free it with `freeKeptChildren`.
+fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
+    const strays = v1_conversion.strayChildren(alloc, store.home) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("convert", "action=ChildrenUnlisted err={s}", .{@errorName(err)});
+            return &.{};
+        },
+    };
+    defer {
+        for (strays) |stray| stray.deinit(alloc);
+        alloc.free(strays);
+    }
+    var kept: std.ArrayList(KeptChild) = .empty;
+    errdefer {
+        for (kept.items) |child| {
+            alloc.free(child.id);
+            alloc.free(child.reason);
+        }
+        kept.deinit(alloc);
+    }
+    try kept.ensureTotalCapacity(alloc, strays.len);
+    for (strays) |stray| {
+        const verdict = try strayReason(store, alloc, stray);
+        errdefer alloc.free(verdict.reason);
+        debug_trace.logf("convert", "action=KeptChild session={s} reason=\"{s}\"", .{ stray.id, verdict.reason });
+        kept.appendAssumeCapacity(.{ .id = try alloc.dupe(u8, stray.id), .reason = verdict.reason, .keeps = verdict.keeps });
+    }
+    return kept.toOwnedSlice(alloc);
+}
+
+const StrayVerdict = struct { reason: []u8, keeps: bool = false };
+
+/// Why no fx opens `stray`, for `keptChildren`, and whether its folder
+/// keeps something its converted copy left out. Caller owns the reason.
+fn strayReason(store: *Store, alloc: Allocator, stray: v1_conversion.Stray) !StrayVerdict {
+    if (store.manager.peek(alloc, stray.id)) |peeked_value| {
+        var peeked = peeked_value;
+        defer peeked.deinit(alloc);
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const source = parseV1Source(scratch.allocator(), peeked.state.v1_source);
+        return .{ .reason = try convertedReason(alloc, source), .keeps = if (source) |known| known.keeps() else false };
+    } else |err| switch (err) {
+        error.NotFound, error.InvalidArgument => {},
+        error.OutOfMemory => return err,
+        else => return .{ .reason = try alloc.print("fx can't read its converted copy ({s}), so this folder stays as it is", .{@errorName(err)}) },
+    }
+    const parent = stray.parent orelse return .{ .reason = try alloc.dupe(u8, "it names no parent session, so no fx opens it") };
+    return .{ .reason = try switch (stray.parent_kind) {
+        .child => alloc.print("it is a subagent of the earlier subagent {s}, which no fx opens", .{parent}),
+        .unreadable => alloc.print("its parent session {s} can't be read, so it stays with it", .{parent}),
+        .absent => if (store.manager.peek(alloc, parent)) |peeked_value| blk: {
+            var peeked = peeked_value;
+            defer peeked.deinit(alloc);
+            break :blk switch (peeked.role) {
+                .child => alloc.print("it is a subagent of the earlier subagent {s}, which no fx opens", .{parent}),
+                .root => alloc.print("its parent {s} does not list it, so no fx opens it", .{parent}),
+            };
+        } else |_| alloc.print("its parent session {s} is gone, so no fx opens it", .{parent}),
+    } };
+}
+
+/// Why a converted subagent's v1 folder stays, from its copy's `source`
+/// (D62). Caller owns it.
+fn convertedReason(alloc: Allocator, source: ?V1Source) ![]u8 {
+    const known = source orelse V1Source{};
+    const count = known.leftOutCount();
+    if (count == 1 and known.left_out.len == 1) return alloc.print("fx converted it already without {s}, so this folder keeps it", .{known.left_out[0].file});
+    if (count > 0) return alloc.print("fx converted it already without {d} of its files, so this folder keeps them", .{count});
+    return alloc.dupe(u8, "fx converted it already, so anything an older fx added since stays only in this folder");
 }
 
 const ConversionStorageError = error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig, SessionStoreUnavailable };
@@ -3152,7 +3836,8 @@ fn copyFailed(id: []const u8, err: anyerror) bool {
 /// are not fx's and are left out.
 const max_copy_depth = 8;
 
-fn copyTree(source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usize) bool {
+/// `openSource` opens each folder below `source`, never through a symlink.
+fn copyTree(comptime openSource: anytype, source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usize) bool {
     const io = io_mod.getIo();
     var complete = true;
     var it = source.dir.iterate();
@@ -3162,7 +3847,7 @@ fn copyTree(source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usi
                 complete = copyFailed(entry.name, error.TooDeep);
                 continue;
             }
-            var from = (io_mod.openVerifiedPrivateDirIfPresent(source, entry.name) catch |err| {
+            var from = (openSource(source, entry.name) catch |err| {
                 complete = copyFailed(entry.name, err);
                 continue;
             }) orelse continue;
@@ -3172,7 +3857,7 @@ fn copyTree(source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usi
                 continue;
             };
             defer to.close();
-            if (!copyTree(&from, &to, depth + 1)) complete = false;
+            if (!copyTree(openSource, &from, &to, depth + 1)) complete = false;
         },
         .file => copyFile(source.dir, target.dir, entry.name) catch |err| {
             complete = copyFailed(entry.name, err);
@@ -3183,9 +3868,13 @@ fn copyTree(source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usi
 }
 
 fn copyFile(from: std.Io.Dir, to: std.Io.Dir, name: []const u8) !void {
+    var source = try io_mod.openExistingReadOnlyRegularFile(from, name, .no_follow);
+    defer source.close(io_mod.getIo());
+    try copyOpenedFile(&source, to, name);
+}
+
+fn copyOpenedFile(source: *std.Io.File, to: std.Io.Dir, name: []const u8) !void {
     const io = io_mod.getIo();
-    var source = try from.openFile(io, name, .{ .follow_symlinks = false, .resolve_beneath = true, .allow_directory = false });
-    defer source.close(io);
     var target = try to.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600), .resolve_beneath = true });
     defer target.close(io);
     var buffer: [16 * 1024]u8 = undefined;
@@ -3198,10 +3887,12 @@ fn copyFile(from: std.Io.Dir, to: std.Io.Dir, name: []const u8) !void {
     }
 }
 
-/// Where `restoreFrom` puts the number of the turn behind each history entry.
+/// Where `restoreFrom` puts the number of the turn behind each history entry,
+/// and what the history leaves out of its first kept turn.
 const TurnNumbers = struct {
     alloc: Allocator,
     list: *std.ArrayList(?u64),
+    trim: *Trim,
 };
 
 /// Rebuilds fx's history and settings from `state` and its log: the newest
@@ -3220,6 +3911,7 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
     }
     var from: sm.From = .start;
     var skip_offset: ?u64 = null;
+    var covered: types.ContextHistoryCut = .{};
     if (state.compaction_offset) |offset| {
         const cursor: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq.? };
         var page = try src.read(sa, .{ .at = cursor }, 1);
@@ -3241,11 +3933,37 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
         skip_offset = offset;
         from = .{ .at = cursor };
         if (compacted.keep_from_turn) |turn| from = .{ .at = try src.findTurnStart(sa, cursor, turn) };
+        covered = .{ .tool_steps = compacted.keep_tool_steps, .steering = compacted.keep_steering };
     }
     var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers = numbers };
     try replay(src, alloc, sa, from, skip_offset, ReplaySink.init(&sink));
+    if (numbers) |n| n.trim.* = .{};
+    if (covered.tool_steps != 0 or covered.steering != 0) {
+        if (try trimFirstKept(alloc, sa, &history, covered, src.id)) {
+            if (numbers) |n| n.trim.* = .{ .turn = n.list.items[1], .tool_steps = covered.tool_steps, .steering = covered.steering };
+        }
+    }
     restored.history = try history.toOwnedSlice(alloc);
     return restored;
+}
+
+/// Leaves out of the first kept turn the steps and steering messages a
+/// compaction inside it summarized, as fx's history leaves them out when it
+/// compacts (D87). A turn that does not have them stays whole, with a trace
+/// line, so a resume is never refused for it. Returns whether it trimmed.
+fn trimFirstKept(alloc: Allocator, sa: Allocator, history: *std.ArrayList(types.HistoryTurn), covered: types.ContextHistoryCut, id: []const u8) !bool {
+    if (history.items.len < 2) return false;
+    const kept = history_range.contextHistoryRange(sa, history.items[1..2], covered, null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_compaction_cut_kept_whole session={s} tool_steps={d} steering={d} reason={s}", .{ id, covered.tool_steps, covered.steering, @errorName(err) });
+            return false;
+        },
+    };
+    const owned = try types.dupeHistoryTurn(alloc, kept[0]);
+    types.freeHistoryTurn(alloc, history.items[1]);
+    history.items[1] = owned;
+    return true;
 }
 
 /// fx's settings from `state`, with an empty history. Caller owns the result.
@@ -3483,10 +4201,10 @@ noinline fn replay(
                             try represented.append(ta, try ta.dupe(u8, value.call_id));
                         },
                         .steering => |value| try builder.appendSteering(value.text),
-                        .turn_completed => |value| try sink.turn(try presentStoredResults(alloc, try builder.finishAssistant(value)), lastStarted(entry)),
+                        .turn_completed => |value| try sink.turn(try presentStoredResults(src, alloc, try builder.finishAssistant(value)), lastStarted(entry)),
                         .interrupted => |value| {
                             interrupted_item = true;
-                            try sink.turn(try presentStoredResults(alloc, try builder.finishInterrupted(value)), lastStarted(entry));
+                            try sink.turn(try presentStoredResults(src, alloc, try builder.finishInterrupted(value)), lastStarted(entry));
                         },
                         .context_checkpoint => return error.InvalidConversationFrame,
                     }
@@ -3509,7 +4227,7 @@ noinline fn replay(
                         return err;
                     };
                     if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ src.id, ended.turn, answered });
-                    try sink.turn(try presentStoredResults(alloc, turn), ended.turn);
+                    try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
                 .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
@@ -3520,11 +4238,13 @@ noinline fn replay(
     if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{src.id});
 }
 
-/// `turn` with each stored result that kept only a preview shown as v1
-/// shows it (`session_log.zig` `restoreExecutionResultBodies`): the preview
-/// wrapped with its handle and stored size, so the model knows where the
-/// rest is. Takes `turn`, freeing it on failure.
-fn presentStoredResults(alloc: Allocator, turn: types.HistoryTurn) !types.HistoryTurn {
+/// `turn` with each stored result shown as v1 showed it: one the model saw
+/// cut keeps its preview, wrapped with its handle and stored size so the
+/// model knows where the rest is; one it saw whole gets its whole body back
+/// from its blob, or a note that the body is unavailable. A converted
+/// session's result under its old name is left as saved when no open
+/// session can name its blob. Takes `turn`, freeing it on failure.
+fn presentStoredResults(src: Source, alloc: Allocator, turn: types.HistoryTurn) !types.HistoryTurn {
     var shown = turn;
     errdefer types.freeHistoryTurn(alloc, shown);
     const execution = switch (shown) {
@@ -3533,13 +4253,41 @@ fn presentStoredResults(alloc: Allocator, turn: types.HistoryTurn) !types.Histor
         .compacted_summary => return shown,
     };
     for (execution.tool_steps) |*step| for (step.tool_results) |*result| {
-        if (!result.truncated) continue;
         const handle = result.output_handle orelse continue;
-        const body = try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes);
+        if (!result.truncated and result.output.len == result.stored_output_bytes) continue;
+        const body = if (result.truncated)
+            try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes)
+        else
+            (storedBody(src, alloc, handle, result.stored_output_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => blk: {
+                    debug_trace.logf("session", "event=context_result_unavailable session={s} handle={s} err={s}; marking content unavailable", .{ src.id, handle, @errorName(err) });
+                    result.truncated = true;
+                    break :blk try alloc.dupe(u8, "Saved tool-result content is unavailable. The complete output could not be restored.");
+                },
+            }) orelse continue;
         alloc.free(result.output);
         result.output = body;
     };
     return shown;
+}
+
+/// A stored result's whole body, from the blob its handle names, or the
+/// blob a converted session's map names for its old handle (D47). Null for
+/// an old handle when no open session holds that map.
+fn storedBody(src: Source, alloc: Allocator, handle: []const u8, len: usize) !?[]u8 {
+    const hash: [artifact_digest.blob_hex_bytes]u8 = if (artifact_digest.blobHash(handle)) |named|
+        named[0..artifact_digest.blob_hex_bytes].*
+    else if (src.host) |host|
+        try BlobHost.resolve(host, .tool_results, handle)
+    else
+        return null;
+    const bytes = try src.store.manager.getBlob(alloc, src.id, &hash);
+    if (bytes.len != len) {
+        alloc.free(bytes);
+        return error.StoredSizeMismatch;
+    }
+    return bytes;
 }
 
 /// Whether a streamed piece is the final one. fx stamps a tool result's
@@ -3687,6 +4435,8 @@ pub fn listSummaries(
         } else list.appendAssumeCapacity(summary);
     }
     v1_roots.summaries.shrinkRetainingCapacity(kept);
+    // Newest first across both, as `listPage` orders them (D61).
+    session_summary_codec.sortSummariesNewestFirst(list.items);
     return list;
 }
 
@@ -3726,7 +4476,7 @@ pub fn writeMayHaveLanded(err: anyerror) bool {
     return false;
 }
 
-const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat } || sm.OpenError;
+const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat, OneOffSessionNotResumable } || sm.OpenError;
 
 fn resumeError(err: sm.OpenError, target: Target) ResumeError {
     return switch (err) {
@@ -3735,8 +4485,9 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
             .last => error.NoSavedSessions,
             .last_opened => error.NoRememberedSession,
         },
-        // A child is resumed only through its parent, as in v1.
-        error.ChildSession => error.SessionNotFound,
+        // A child is resumed only through its parent, and fx says so, as v1
+        // did (D71).
+        error.ChildSession => error.OneOffSessionNotResumable,
         error.Busy => error.SessionBusy,
         error.Corrupt => error.InvalidSessionFormat,
         error.UnsupportedVersion => error.UnsupportedSessionFormat,
@@ -3770,6 +4521,20 @@ const CompactedData = struct {
     compaction_count: usize,
     /// The first turn the compaction kept, read back to on resume.
     keep_from_turn: ?u64 = null,
+    /// The steps and steering messages of the first kept turn that the
+    /// summary covers, which fx's history leaves out of that turn, as it
+    /// does when it compacts inside a turn (D87). Older lines have neither,
+    /// and keep the turn whole.
+    keep_tool_steps: usize = 0,
+    keep_steering: usize = 0,
+};
+
+/// What fx's history leaves out of its first kept turn (D87): none, or the
+/// steps and steering messages of `turn` a compaction covers.
+const Trim = struct {
+    turn: ?u64 = null,
+    tool_steps: usize = 0,
+    steering: usize = 0,
 };
 
 /// The compaction line a page read at its cursor starts with, or null when
@@ -4078,10 +4843,6 @@ test "preferences round trip through v1's decoder" {
     try testing.expect(!decoded_off.ultrafast_mode);
 }
 
-test "the switch is the flag or FX_SESSIONS_V2" {
-    try testing.expect(enabled(true));
-}
-
 /// A HOME in a temp folder with an adapter store over it.
 const TestHome = struct {
     tmp: testing.TmpDir,
@@ -4104,6 +4865,26 @@ const TestHome = struct {
         t.tmp.cleanup();
     }
 };
+
+test "the store refuses a sessions folder that is a file or a symlink, and opens a missing one (D67)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+    const home = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
+    defer testing.allocator.free(home);
+    // Missing: the first write makes it.
+    var missing = try Store.open(testing.allocator, home);
+    missing.deinit(testing.allocator);
+
+    try tmp.dir.createDirPath(io, ".fx");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".fx/sessions", .data = "not a folder" });
+    try testing.expectError(error.SessionPathUnsafe, Store.open(testing.allocator, home));
+
+    try tmp.dir.deleteFile(io, ".fx/sessions");
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.symLink(io, "../elsewhere", ".fx/sessions", .{ .is_directory = true });
+    try testing.expectError(error.SessionPathUnsafe, Store.open(testing.allocator, home));
+}
 
 fn testSeed(model: []u8) Seed {
     return .{
@@ -4151,6 +4932,84 @@ test "a new session commits turns, and resume gives them back with its settings"
     var st = try r.handle.state(testing.allocator);
     defer st.deinit(testing.allocator);
     try testing.expectEqualStrings("\"first question\"", st.title.?);
+}
+
+test "a result the model saw whole comes back whole after a resume, or says its body is unavailable" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const whole = try testing.allocator.alloc(u8, 100 * 1024);
+    defer testing.allocator.free(whole);
+    @memset(whole, 'x');
+    @memcpy(whole[whole.len - 4 ..], "TAIL");
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = whole,
+        .output_bytes = whole.len,
+        .stored_output_bytes = whole.len,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const user: types.UserTurn = .{ .text = @constCast("read it") };
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    // As the app saves it: the result's file while the turn runs, then the
+    // commit, which keeps the body in that file and a preview in the turn.
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("read"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer testing.allocator.free(results[0].output_handle.?);
+    defer testing.allocator.free(results[0].preview.?);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    var handle: []u8 = &.{};
+    defer testing.allocator.free(handle);
+    for ([_]bool{ false, true }) |lost| {
+        if (lost) {
+            // Its blob gone, the result says so rather than show a preview.
+            const path = try std.mem.concat(testing.allocator, u8, &.{ ".fx/sessions/v2/", id, "/blobs/", artifact_digest.blobHash(handle).? });
+            defer testing.allocator.free(path);
+            try t.tmp.dir.deleteFile(io_mod.getIo(), path);
+        }
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        const result = restored.history[0].assistant.execution.tool_steps[0].tool_results[0];
+        if (!lost) {
+            handle = try testing.allocator.dupe(u8, result.output_handle.?);
+            try testing.expect(!result.truncated);
+            try testing.expectEqualStrings(whole, result.output);
+        } else {
+            try testing.expect(result.truncated);
+            try testing.expectEqualStrings("Saved tool-result content is unavailable. The complete output could not be restored.", result.output);
+        }
+    }
+}
+
+test "a converted session's whole result comes back whole under its old handle on a resume (D47)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // A command result v1 kept under tool-results/, converted on open.
+    const id = (try v1.fixture("side", 1))[0];
+    (try openConverted(&t, id)).close();
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const result = restored.history[0].assistant.execution.tool_steps[0].tool_results[0];
+    try testing.expect(!result.truncated);
+    try testing.expectEqual(result.stored_output_bytes, result.output.len);
+    try testing.expect(std.mem.find(u8, result.output, "12760") != null);
 }
 
 test "a child's prefs keep its instructions, and v1's decoder still reads the rest (D34)" {
@@ -4930,6 +5789,79 @@ test "each later compaction keeps only the turns after its cut" {
     try testing.expectEqualStrings("five", restored.history[2].assistant.user.text);
 }
 
+test "a compaction inside a turn leaves the steps it covers out of that turn on resume, and a second one counts on (D87)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const result = struct {
+        fn ok(id: []const u8, handle: []const u8) types.PersistedToolResult {
+            return .{ .tool_call_id = @constCast(id), .tool_name = @constCast("shell"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .output_handle = @constCast(handle), .stored_output_bytes = 2 };
+        }
+    };
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-2", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-3", .name = "shell", .arguments_json = "{}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        result.ok("call-1", "result-shell-1.txt"),
+        result.ok("call-2", "result-shell-2.txt"),
+        result.ok("call-3", "result-shell-3.txt"),
+    };
+    var steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = calls[0..1], .tool_results = results[0..1] },
+        .{ .tool_calls = calls[1..2], .tool_results = results[1..2] },
+        .{ .tool_calls = calls[2..3], .tool_results = results[2..3] },
+    };
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("after one"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after two"), .after_tool_step_count = 2 },
+    };
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("three steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+    } }, types.ConversationLanguage.default());
+    var first = "steps one and two".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 0, .compaction_count = 1 }, false, .{ .tool_steps = 2, .steering = 1 });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // As fx's history after the compaction: the summary, then the turn's
+    // prompt and what came after the cut.
+    {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 2), restored.history.len);
+        const kept = restored.history[1].assistant;
+        try testing.expectEqualStrings("three steps", kept.user.text);
+        try testing.expectEqualStrings("done", kept.assistant);
+        try testing.expectEqual(@as(usize, 1), kept.execution.tool_steps.len);
+        try testing.expectEqualStrings("call-3", kept.execution.tool_steps[0].tool_calls[0].id);
+        try testing.expectEqual(@as(usize, 1), kept.execution.steering.len);
+        try testing.expectEqualStrings("after two", kept.execution.steering[0].text);
+        try testing.expectEqual(@as(usize, 0), kept.execution.steering[0].after_tool_step_count);
+        // fx's cut counts from the turn as its history now shows it.
+        var second = "all three steps".*;
+        try r.commitCompaction(.{ .summary = &second, .removed_turn_count = 0, .compaction_count = 2 }, false, .{ .tool_steps = 1, .steering = 1 });
+    }
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("all three steps", restored.history[0].compacted_summary.summary);
+    const kept = restored.history[1].assistant;
+    try testing.expectEqualStrings("three steps", kept.user.text);
+    try testing.expectEqual(@as(usize, 0), kept.execution.tool_steps.len);
+    try testing.expectEqual(@as(usize, 0), kept.execution.steering.len);
+}
+
 test "resume refuses a session whose compaction line is damaged" {
     var t: TestHome = undefined;
     try t.init();
@@ -5039,7 +5971,7 @@ test "a failed resume reports v1's error names" {
     try testing.expectError(error.NoSavedSessions, Session.resumeSession(testing.allocator, &t.store, .last, "/w", .ask));
     try testing.expectError(error.SessionNotFound, Session.resumeSession(testing.allocator, &t.store, .{ .id = "AAAAAAAAAAAA" }, "/w", .ask));
     try testing.expectEqual(error.SessionBusy, resumeError(error.Busy, .last));
-    try testing.expectEqual(error.SessionNotFound, resumeError(error.ChildSession, .{ .id = "AAAAAAAAAAAA" }));
+    try testing.expectEqual(error.OneOffSessionNotResumable, resumeError(error.ChildSession, .{ .id = "AAAAAAAAAAAA" }));
     try testing.expectEqual(error.InvalidSessionFormat, resumeError(error.Corrupt, .last));
     try testing.expectEqual(error.UnsupportedSessionFormat, resumeError(error.UnsupportedVersion, .last));
     try testing.expectEqual(error.Io, resumeError(error.Io, .last));
@@ -5629,7 +6561,20 @@ test "an ACP client's prompt and tool identities are settings, written only when
     try testing.expectEqual(@as(usize, 2), try countSettings(t.store.manager, id, .client_prompt));
 }
 
-test "a prompt image's bytes ride inside the user's item, and an image without them encodes as v1's (D44)" {
+/// Whether session `id`'s first user item lists blob `hash`.
+fn userItemLists(t: *TestHome, id: []const u8, hash: []const u8) !bool {
+    var page = try t.store.manager.read(testing.allocator, id, .start, .forward, 64);
+    defer page.deinit();
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body != .item or !std.mem.eql(u8, body.item.type, "user")) continue;
+        for (body.item.blobs) |ref| if (std.mem.eql(u8, ref, hash)) return true;
+        return false;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "a prompt image's bytes ride inside the user's item, its saved path names its blob, and an image without them encodes as v1's (D44, D79)" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
@@ -5668,7 +6613,16 @@ test "a prompt image's bytes ride inside the user's item, and an image without t
         try testing.expectEqualSlices(u8, &bytes, image.inline_data.?);
         try testing.expectEqualStrings(&digest_hex, image.snapshot_sha256.?);
         try testing.expectEqualStrings(images[0].path, image.path);
-        try testing.expectEqualStrings(images[0].snapshot_path.?, image.snapshot_path.?);
+        // The saved prompt names the session's blob of the image, which the
+        // notice for an image too large to send names after a resume (D79).
+        const blob_path = try t.store.manager.blobPath(testing.allocator, id, &digest_hex);
+        defer testing.allocator.free(blob_path);
+        try testing.expectEqualStrings(blob_path, image.snapshot_path.?);
+        const kept = try t.store.manager.getBlob(testing.allocator, id, &digest_hex);
+        defer testing.allocator.free(kept);
+        try testing.expectEqualSlices(u8, &bytes, kept);
+        // Every blob is listed on an item of its turn (D44).
+        try testing.expect(try userItemLists(&t, id, &digest_hex));
         if (source_ref) |value| {
             try testing.expectEqualStrings(value, image.source_ref.?);
         } else try testing.expectEqual(@as(?[]u8, null), image.source_ref);
@@ -5713,56 +6667,161 @@ test "v2 image source refs reject malformed metadata" {
 
 /// v1's own store over a test home, which writes the v1 sessions the
 /// conversion tests convert.
+/// A test home's v1 sessions: copies of what the real v0.0.14 release saved
+/// (`tests/fixtures/v1-sessions/generate.ts`), and raw files a test writes
+/// over them.
 const V1Home = struct {
-    store: session_store.Store,
+    t: *TestHome,
+    arena: std.heap.ArenaAllocator,
+    /// Where the fixtures were saved, which v1 recorded; set by `fixture`.
+    workspace: []const u8 = "",
 
     fn init(t: *TestHome) !V1Home {
-        return .{ .store = try session_store.Store.initFromHome(testing.allocator, t.home, "/w") };
+        return .{ .t = t, .arena = .init(testing.allocator) };
     }
 
     fn deinit(v1: *V1Home) void {
-        v1.store.deinit(testing.allocator);
+        v1.arena.deinit();
     }
 
-    /// A new v1 session `id`, open for writing. Close it with `deinit`.
-    fn start(v1: *V1Home, id: []const u8) !session_log.LoadedWritableSession {
-        return v1.startAs(id, false);
-    }
-
-    fn startAs(v1: *V1Home, id: []const u8, child: bool) !session_log.LoadedWritableSession {
-        const alloc = testing.allocator;
-        var state: session_codec.DurableSessionState = .{
-            .subagent_child = child,
-            .id = try alloc.dupe(u8, id),
-            .origin_workspace_root = try alloc.dupe(u8, "/w"),
-            .workspace_root = try alloc.dupe(u8, "/w"),
-            .created_at_ms = 1_000,
-            .updated_at_ms = 1_000,
-            .conversation_language = types.ConversationLanguage.default(),
-            .preferences = .{ .model = try alloc.dupe(u8, "v1/model"), .effort = .auto, .fast_mode = false },
-            .history = &.{},
-            .total_input_tokens = 0,
-            .total_output_tokens = 0,
-        };
-        defer state.deinit(alloc);
-        return v1.store.startWritableSession(alloc, state);
-    }
-
-    /// Writes `turns` to a new v1 session `id`, one second apart.
-    fn session(v1: *V1Home, id: []const u8, turns: []const types.HistoryTurn) !void {
-        var writer = try v1.start(id);
-        defer writer.deinit(testing.allocator);
-        for (turns, 0..) |turn, index| try writer.conversation_writer.appendHistoryTurn(testing.allocator, @intCast(2_000 + 1_000 * index), turn);
+    /// Copies the first `count` sessions of the fixture `kind`, root first,
+    /// into the home's `~/.fx`, private as v1 left them, with what the kind
+    /// keeps outside its sessions, and returns their ids.
+    fn fixture(v1: *V1Home, kind: []const u8, count: usize) ![]const []const u8 {
+        const io = io_mod.getIo();
+        const a = v1.arena.allocator();
+        const root = try std.Io.Dir.path.join(a, &.{ @import("test_paths").source_root, "..", "tests", "fixtures", "v1-sessions" });
+        // `source_root` is relative to the build root, where tests run.
+        var fixtures = try std.Io.Dir.cwd().openDir(io, root, .{});
+        defer fixtures.close(io);
+        const manifest = try fixtures.readFileAlloc(io, "manifest.json", a, .limited(1 << 16));
+        const Manifest = struct { workspace: []const u8, kinds: std.json.ArrayHashMap([]const []const u8) };
+        const parsed = try std.json.parseFromSliceLeaky(Manifest, a, manifest, .{ .ignore_unknown_fields = true });
+        v1.workspace = parsed.workspace;
+        const all = parsed.kinds.map.get(kind) orelse return error.FileNotFound;
+        if (count > all.len) return error.TestUnexpectedResult;
+        const ids = all[0..count];
+        var source = try fixtures.openDir(io, kind, .{ .iterate = true });
+        defer source.close(io);
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(v1.t.tmp.dir, profile_paths.root_dir_name);
+        defer fx.close();
+        var walker = try source.walk(a);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            // Leave out the sessions past `count`.
+            var parts = std.mem.splitScalar(u8, entry.path, std.Io.Dir.path.sep);
+            if (std.mem.eql(u8, parts.first(), profile_paths.sessions_dir_name)) if (parts.next()) |id| {
+                const left_out = for (all[count..]) |other| {
+                    if (std.mem.eql(u8, id, other)) break true;
+                } else false;
+                if (left_out) continue;
+            };
+            switch (entry.kind) {
+                // Another kind may have made it.
+                .directory => fx.dir.createDir(io, entry.path, .fromMode(0o700)) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                },
+                .file => try fx.dir.writeFile(io, .{
+                    .sub_path = entry.path,
+                    .data = try source.readFileAlloc(io, entry.path, a, .limited(1 << 24)),
+                    .flags = .{ .permissions = .fromMode(0o600) },
+                }),
+                else => return error.UnexpectedFixtureEntry,
+            }
+        }
+        // A copy's log gets the time v1 left on it, its `session.json`'s:
+        // v1 lists a session by the later of the two, and a copy's own time
+        // would order the copies by when they were made.
+        for (ids) |id| {
+            const folder = try std.Io.Dir.path.join(a, &.{ profile_paths.sessions_dir_name, id });
+            const saved_json = try fx.dir.readFileAlloc(io, try std.Io.Dir.path.join(a, &.{ folder, "session.json" }), a, .limited(1 << 20));
+            const Saved = struct { updated_at_ms: ?i64 = null };
+            const saved = (try std.json.parseFromSliceLeaky(Saved, a, saved_json, .{ .ignore_unknown_fields = true })).updated_at_ms orelse continue;
+            const at: std.Io.Timestamp = .{ .nanoseconds = @as(i96, saved) * std.time.ns_per_ms };
+            const log = try std.Io.Dir.path.join(a, &.{ folder, "events.jsonl" });
+            _ = fx.dir.statFile(io, log, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            try fx.dir.setTimestamps(io, log, .{ .modify_timestamp = .{ .new = at } });
+        }
+        return ids;
     }
 
     /// Writes `bytes` to `{folder}/{name}` in v1's folder of `id`, the
-    /// folder and the file private as v1 makes them.
+    /// folders and the file private as v1 makes them.
     fn put(v1: *V1Home, id: []const u8, folder: ?[]const u8, name: []const u8, bytes: []const u8) !void {
-        var dir = (try io_mod.openVerifiedPrivateDirIfPresent(&v1.store.canonical_root.sessions.?, id)).?;
+        var fx = try io_mod.openOrCreateVerifiedPrivateDirFromDir(v1.t.tmp.dir, profile_paths.root_dir_name);
+        defer fx.close();
+        var sessions = try io_mod.openOrCreateVerifiedPrivateDir(&fx, profile_paths.sessions_dir_name);
+        defer sessions.close();
+        var dir = try io_mod.openOrCreateVerifiedPrivateDir(&sessions, id);
         defer dir.close();
         var target = if (folder) |sub| try io_mod.openOrCreateVerifiedPrivateDir(&dir, sub) else null;
         defer if (target) |*value| value.close();
         try (if (target) |value| value.dir else dir.dir).writeFile(io_mod.getIo(), .{ .sub_path = name, .data = bytes, .flags = .{ .permissions = .fromMode(0o600) } });
+    }
+
+    /// v1's `session.json` of `id`. The arena's.
+    fn metadata(v1: *V1Home, id: []const u8) !std.json.ObjectMap {
+        const a = v1.arena.allocator();
+        const path = try std.Io.Dir.path.join(a, &.{ ".fx", "sessions", id, "session.json" });
+        const bytes = try v1.t.tmp.dir.readFileAlloc(io_mod.getIo(), path, a, .limited(1 << 20));
+        return (try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{})).object;
+    }
+
+    /// When v1 logged each prompt of `id`: the times its turns start.
+    fn promptTimes(v1: *V1Home, id: []const u8) ![]const u64 {
+        const a = v1.arena.allocator();
+        const path = try std.Io.Dir.path.join(a, &.{ ".fx", "sessions", id, "events.jsonl" });
+        const bytes = try v1.t.tmp.dir.readFileAlloc(io_mod.getIo(), path, a, .limited(1 << 24));
+        var times: std.ArrayList(u64) = .empty;
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const event = (try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{})).object;
+            if (event.get("event").?.object.get("user") != null) try times.append(a, @intCast(event.get("timestamp_ms").?.integer));
+        }
+        return times.items;
+    }
+
+    /// The one file in `folder` of v1's `id`. The arena's.
+    fn only(v1: *V1Home, id: []const u8, folder: []const u8) ![]const u8 {
+        const a = v1.arena.allocator();
+        var dir = try v1.t.tmp.dir.openDir(io_mod.getIo(), try std.Io.Dir.path.join(a, &.{ ".fx", "sessions", id, folder }), .{ .iterate = true });
+        defer dir.close(io_mod.getIo());
+        var entries = dir.iterate();
+        const first = (try entries.next(io_mod.getIo())) orelse return error.FileNotFound;
+        if (try entries.next(io_mod.getIo())) |_| return error.TestUnexpectedResult;
+        return a.dupe(u8, first.name);
+    }
+
+    /// The bytes of `{folder}/{name}` in v1's `id`. The arena's.
+    fn file(v1: *V1Home, id: []const u8, folder: []const u8, name: []const u8) ![]const u8 {
+        const a = v1.arena.allocator();
+        return v1.t.tmp.dir.readFileAlloc(io_mod.getIo(), try std.Io.Dir.path.join(a, &.{ ".fx", "sessions", id, folder, name }), a, .limited(1 << 24));
+    }
+
+    /// Every file under `folder` of v1's `id`, by its path there, with its
+    /// bytes. The arena's.
+    fn tree(v1: *V1Home, id: []const u8, folder: []const u8) !std.array_hash_map.String([]const u8) {
+        const io = io_mod.getIo();
+        const a = v1.arena.allocator();
+        var dir = try v1.t.tmp.dir.openDir(io, try std.Io.Dir.path.join(a, &.{ ".fx", "sessions", id, folder }), .{ .iterate = true });
+        defer dir.close(io);
+        var files: std.array_hash_map.String([]const u8) = .empty;
+        var walker = try dir.walk(a);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| if (entry.kind == .file) {
+            try files.put(a, try a.dupe(u8, entry.path), try dir.readFileAlloc(io, entry.path, a, .limited(1 << 24)));
+        };
+        return files;
+    }
+
+    /// `.fx/sessions/{id}/{rest}`, relative to the home. The arena's.
+    fn sessionPath(v1: *V1Home, id: []const u8, rest: []const u8) ![]const u8 {
+        return std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", id, rest });
     }
 
     fn exists(t: *TestHome, id: []const u8) bool {
@@ -5804,8 +6863,6 @@ const V1Copy = struct {
     }
 
     fn restore(copy: *const V1Copy, v1: *V1Home, id: []const u8) !void {
-        var dir = try io_mod.openOrCreateVerifiedPrivateDir(&v1.store.canonical_root.sessions.?, id);
-        dir.close();
         for (copy.names.items, copy.bytes.items) |name, bytes| try v1.put(id, null, name, bytes);
     }
 
@@ -5825,29 +6882,30 @@ test "a v1 session converts on its first open, and its v1 folder goes (D55, D60)
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-basic", &.{
-        assistantTurn("first question", "first answer"),
-        .{ .interrupted = .{ .user = .{ .text = @constCast("second question") }, .assistant = @constCast("partial"), .terminal_reason = .cancelled } },
-    });
+    // A finished turn, then one the user cancelled while its reply streamed.
+    const id = (try v1.fixture("cancelled", 1))[0];
+    const saved = try v1.metadata(id);
+    const prompts = try v1.promptTimes(id);
 
-    const s = try Session.resumeSession(testing.allocator, &t.store, .{ .id = "v1-basic" }, "/w", .ask);
+    const s = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
     defer s.close();
     var restored = try s.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), restored.history.len);
-    try testing.expectEqualStrings("first answer", restored.history[0].assistant.assistant);
-    try testing.expectEqualStrings("partial", restored.history[1].interrupted.assistant.?);
+    try testing.expectEqualStrings("CONV_FIRST_ANSWER", restored.history[0].assistant.assistant);
+    try testing.expectEqualStrings("CONV_PARTIAL", restored.history[1].interrupted.assistant.?);
     try testing.expectEqual(types.InterruptedTerminalReason.cancelled, restored.history[1].interrupted.terminal_reason);
-    try testing.expectEqualStrings("v1/model", restored.preferences.?.model);
-    try testing.expectEqual(@as(i64, 1_000), restored.created_at_ms);
-    try testing.expect(!V1Home.exists(&t, "v1-basic"));
+    try testing.expectEqualStrings(saved.get("model").?.string, restored.preferences.?.model);
+    try testing.expectEqual(saved.get("created_at_ms").?.integer, restored.created_at_ms);
+    try testing.expectEqualStrings(saved.get("conversation_language").?.string, restored.language.bytes[0..restored.language.len]);
+    try testing.expect(!V1Home.exists(&t, id));
     // Its turns kept their times.
-    var page = try t.store.manager.read(testing.allocator, "v1-basic", .start, .forward, 64);
+    var page = try t.store.manager.read(testing.allocator, id, .start, .forward, 64);
     defer page.deinit();
     var starts: std.ArrayList(u64) = .empty;
     defer starts.deinit(testing.allocator);
     for (page.entries) |entry| if (entry.body) |body| if (body == .turn_started) try starts.append(testing.allocator, entry.ts_ms);
-    try testing.expectEqualSlices(u64, &.{ 2_000, 3_000 }, starts.items);
+    try testing.expectEqualSlices(u64, prompts, starts.items);
 }
 
 test "a converted v1 session keeps its title, permission rules and preferences (D56)" {
@@ -5857,60 +6915,56 @@ test "a converted v1 session keeps its title, permission rules and preferences (
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    const key = try session_permission_state.RuleKey.init(.command, "command\x00/w\x00zig build");
-    {
-        var writer = try v1.start("v1-settings");
-        defer writer.deinit(alloc);
-        try writer.conversation_writer.appendHistoryTurn(alloc, 2_000, assistantTurn("q", "a"));
-        _ = try writer.renameConversation(alloc, "Named by hand");
-        var applied = try session_permission_state.apply(alloc, .{}, .{ .set = .{ .key = key, .display_identity = "zig build", .decision = .deny, .expected_generation = null } });
-        var permissions = applied.takeApplied() orelse return error.TestUnexpectedResult;
-        defer permissions.deinit(alloc);
-        try writer.replacePermissionState(alloc, permissions, 2_500);
-    }
+    // A saved-session allow rule the v1 app remembered.
+    const id = (try v1.fixture("rules", 1))[0];
+    const saved = try v1.metadata(id);
 
-    const s = try openConverted(&t, "v1-settings");
+    const s = try openConverted(&t, id);
     defer s.close();
     var st = try s.handle.state(alloc);
     defer st.deinit(alloc);
-    try testing.expectEqualStrings("\"Named by hand\"", st.title.?);
+    const title = try std.json.parseFromSliceLeaky([]const u8, v1.arena.allocator(), st.title.?, .{});
+    try testing.expectEqualStrings(saved.get("title").?.string, title);
     var restored = try s.restore(alloc);
     defer restored.deinit(alloc);
-    try testing.expectEqual(session_permission_state.StateDecision.deny, session_permission_state.decide(restored.permission_state.?, key));
-    try testing.expectEqualStrings("v1/model", restored.preferences.?.model);
+    const rules = restored.permission_state.?.rules.items;
+    try testing.expectEqual(@as(usize, 1), rules.len);
+    try testing.expectEqualStrings("shell.run touch conv-allowed", rules[0].display_identity);
+    try testing.expect(rules[0].decision == .allow);
+    try testing.expectEqualStrings(saved.get("model").?.string, restored.preferences.?.model);
 }
 
-test "a converted v1 session's side files keep their old names, and its prompt images ride inside the prompt (D44, D47)" {
+test "a converted v1 session's side files keep their old names, and its prompt images ride inside the prompt and name their blob (D44, D47, D79)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    // As v1's log names a prompt image: by its folder and digest.
-    const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    var images = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("shot.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast("images/image-1-" ++ digest[0..16] ++ ".bin"),
-        .snapshot_sha256 = @constCast(digest),
-    }};
-    try v1.session("v1-side", &.{.{ .assistant = .{ .user = .{ .text = @constCast("look"), .images = &images }, .assistant = @constCast("seen") } }});
-    try v1.put("v1-side", "tool-results", "call-1.txt", "the full tool output");
-    try v1.put("v1-side", "images", "image-1-" ++ digest[0..16] ++ ".bin", "PNG bytes");
+    // A prompt image, and the vision tool's result in a side file.
+    const id = (try v1.fixture("image", 1))[0];
+    const result_name = try v1.only(id, "tool-results");
+    const result = try v1.file(id, "tool-results", result_name);
+    const image_bytes = try v1.file(id, "images", try v1.only(id, "images"));
 
-    const s = try openConverted(&t, "v1-side");
+    const s = try openConverted(&t, id);
     defer s.close();
-    const hash = s.host.moved.get("tool-results/call-1.txt") orelse return error.TestUnexpectedResult;
-    const body = try t.store.manager.getBlob(alloc, "v1-side", &hash);
+    const moved = try std.mem.concat(v1.arena.allocator(), u8, &.{ "tool-results/", result_name });
+    const hash = s.host.moved.get(moved) orelse return error.TestUnexpectedResult;
+    const body = try t.store.manager.getBlob(alloc, id, &hash);
     defer alloc.free(body);
-    try testing.expectEqualStrings("the full tool output", body);
+    try testing.expectEqualStrings(result, body);
     var restored = try s.restore(alloc);
     defer restored.deinit(alloc);
     const image = restored.history[0].assistant.user.images[0];
-    try testing.expectEqualStrings("PNG bytes", image.inline_data.?);
-    try testing.expect(image.snapshot_path == null);
+    try testing.expectEqualSlices(u8, image_bytes, image.inline_data.?);
+    // Its v1 file went with the folder; it names its blob (D79).
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(image_bytes, &digest, .{});
+    const image_hash = std.fmt.bytesToHex(digest, .lower);
+    const blob_path = try t.store.manager.blobPath(alloc, id, &image_hash);
+    defer alloc.free(blob_path);
+    try testing.expectEqualStrings(blob_path, image.snapshot_path.?);
 }
 
 test "a converted v1 session keeps its ACP client's prompt and tool identities (D46)" {
@@ -5920,19 +6974,19 @@ test "a converted v1 session keeps its ACP client's prompt and tool identities (
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-acp", &.{assistantTurn("q", "a")});
-    const record = "{\"mcp_mini_read\":{\"server\":\"mini\",\"tool\":\"read\",\"title\":null}}";
-    try v1.put("v1-acp", "client", "system-prompt.txt", "You run inside Mini.");
-    try v1.put("v1-acp", "client", "mcp-tool-identities.json", record);
+    // A v1 ACP session with a client system prompt and an MCP tool.
+    const id = (try v1.fixture("acp", 1))[0];
+    const saved_prompt = try v1.file(id, "client", "system-prompt.txt");
+    const saved_identities = try v1.file(id, "client", "mcp-tool-identities.json");
 
-    const s = try openConverted(&t, "v1-acp");
+    const s = try openConverted(&t, id);
     defer s.close();
     const prompt = (try s.clientPrompt(alloc)).?;
     defer alloc.free(prompt);
-    try testing.expectEqualStrings("You run inside Mini.", prompt);
+    try testing.expectEqualStrings(saved_prompt, prompt);
     const identities = (try s.toolIdentities(alloc)).?;
     defer alloc.free(identities);
-    try testing.expectEqualStrings(record, identities);
+    try testing.expectEqualStrings(saved_identities, identities);
 }
 
 test "a converted v1 session's hosted terminal state lands where v2 keeps it (D45)" {
@@ -5942,14 +6996,96 @@ test "a converted v1 session's hosted terminal state lands where v2 keeps it (D4
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-term", &.{assistantTurn("q", "a")});
-    try v1.put("v1-term", terminal_dir_name, "state.json", "{\"sessions\":[]}");
+    // A hosted terminal a v1 turn started, which ended with that process.
+    const id = (try v1.fixture("terminal", 1))[0];
+    const saved = try v1.tree(id, terminal_dir_name);
+    try testing.expect(saved.count() > 0);
 
-    const s = try openConverted(&t, "v1-term");
+    const s = try openConverted(&t, id);
     defer s.close();
-    const state = try V1Home.read(&t, ".fx/" ++ terminal_dir_name ++ "/v1-term/" ++ terminal_dir_name ++ "/state.json");
-    defer alloc.free(state);
-    try testing.expectEqualStrings("{\"sessions\":[]}", state);
+    for (saved.keys(), saved.values()) |path, bytes| {
+        const moved = try std.Io.Dir.path.join(alloc, &.{ ".fx", terminal_dir_name, id, terminal_dir_name, path });
+        defer alloc.free(moved);
+        const state = try V1Home.read(&t, moved);
+        defer alloc.free(state);
+        try testing.expectEqualSlices(u8, bytes, state);
+    }
+}
+
+test "a v1 session's hosted terminal folders an old fx left readable by others convert, private (D45)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("terminal", 1))[0];
+    const saved = try v1.tree(id, terminal_dir_name);
+    try testing.expect(saved.count() > 0);
+    // v1 opened these at any mode and made each private as it did.
+    for ([_][]const u8{ "", "/state", "/proofs" }) |sub| {
+        const path = try alloc.print("{s}/{s}{s}", .{ try v1.sessionPath(id, ""), terminal_dir_name, sub });
+        defer alloc.free(path);
+        var dir = try t.tmp.dir.openDir(io, path, .{});
+        defer dir.close(io);
+        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+    }
+
+    const s = try openConverted(&t, id);
+    defer s.close();
+    for (saved.keys(), saved.values()) |path, bytes| {
+        const moved = try std.Io.Dir.path.join(alloc, &.{ ".fx", terminal_dir_name, id, terminal_dir_name, path });
+        defer alloc.free(moved);
+        const state = try V1Home.read(&t, moved);
+        defer alloc.free(state);
+        try testing.expectEqualSlices(u8, bytes, state);
+    }
+    const moved = try std.Io.Dir.path.join(alloc, &.{ ".fx", terminal_dir_name, id, terminal_dir_name, "state" });
+    defer alloc.free(moved);
+    const stat = try t.tmp.dir.statFile(io, moved, .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+}
+
+test "a v1 session whose hosted terminal state holds an entry the copy can't take converts without it, and its v1 folder keeps it (D56, D62)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("terminal", 1))[0];
+    var state = try t.tmp.dir.openDir(io, try v1.sessionPath(id, "terminal/state"), .{});
+    defer state.close(io);
+    state.symLink(io, "elsewhere", "stray-link", .{}) catch return error.SkipZigTest;
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.converted);
+    try testing.expectEqual(@as(usize, 0), report.skipped.items.len);
+    try testing.expectEqual(@as(usize, 1), report.left_out.items.len);
+    const left = report.left_out.items[0].file;
+    try testing.expectEqualStrings(id, left.member);
+    try testing.expectEqualStrings("terminal/state/stray-link", left.file);
+    try testing.expectEqual(LeftOut.Cause.not_regular, left.cause);
+    // The rest of its terminal state is copied, the link is not.
+    try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, id, "terminal", "state", "record-shell-P1Rx7ZvNXwWFA8DxO1uT2w.json" }));
+    try testing.expect(!pathExists(&t, &.{ ".fx", terminal_dir_name, id, "terminal", "state", "stray-link" }));
+
+    // Its v1 folder keeps the link, and a later run's cleanup keeps the
+    // folder by what the copy recorded, even once the link is gone.
+    var link: [64]u8 = undefined;
+    try testing.expectEqualStrings("elsewhere", link[0..try state.readLink(io, "stray-link", &link)]);
+    try state.deleteFile(io, "stray-link");
+    var again = try convertAll(&t.store, alloc);
+    defer again.deinit(alloc);
+    try testing.expect(V1Home.exists(&t, id));
+    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    defer doctor_report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), doctor_report.stuck.items.len);
+    try testing.expectEqual(@as(usize, 0), doctor_report.unconverted);
+    try testing.expectEqual(@as(usize, 1), doctor_report.keeps_left_out);
 }
 
 fn writeRecovery(v1: *V1Home, id: []const u8, seq: u64, user: []const u8, partial: []const u8) !void {
@@ -5975,95 +7111,90 @@ fn writeRecovery(v1: *V1Home, id: []const u8, seq: u64, user: []const u8, partia
 
 test "a v1 turn left open comes back unfinished exactly as v1 shows it (D56)" {
     const alloc = testing.allocator;
-    var t: TestHome = undefined;
-    try t.init();
-    defer t.deinit();
-    var v1 = try V1Home.init(&t);
-    defer v1.deinit();
-    // Each turn but the first stops after its prompt, as a crash leaves it.
-    for ([_][]const u8{ "v1-checkpoint", "v1-stale", "v1-open" }) |id| {
-        var writer = try v1.start(id);
-        defer writer.deinit(alloc);
-        try writer.conversation_writer.appendHistoryTurn(alloc, 2_000, assistantTurn("q", "a"));
-        const done = writer.conversation_writer.last_seq;
-        if (!std.mem.eql(u8, id, "v1-stale")) _ = try writer.conversation_writer.append(alloc, 3_000, .{ .user = .{ .text = "stalled" } });
-        if (std.mem.eql(u8, id, "v1-checkpoint")) try writeRecovery(&v1, id, writer.conversation_writer.last_seq, "stalled", "a partial reply");
-        // A checkpoint whose turn the log has since ended: v1 drops it.
-        if (std.mem.eql(u8, id, "v1-stale")) try writeRecovery(&v1, id, done - 1, "q", "never shown");
-    }
+    // A turn v1 left open when fx was killed mid-reply, its unfinished reply
+    // in recovery.json; that turn without the checkpoint; and a finished
+    // session whose checkpoint names a turn the log has since ended.
+    for ([_]enum { checkpoint, open, stale }{ .checkpoint, .open, .stale }) |variant| {
+        var t: TestHome = undefined;
+        try t.init();
+        defer t.deinit();
+        var v1 = try V1Home.init(&t);
+        defer v1.deinit();
+        const id = (try v1.fixture(if (variant == .stale) "plain" else "unfinished", 1))[0];
+        switch (variant) {
+            .checkpoint => {},
+            .open => try t.tmp.dir.deleteFile(io_mod.getIo(), try std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", id, "recovery.json" })),
+            // v1 drops a checkpoint inside a turn that ended at seq 3.
+            .stale => try writeRecovery(&v1, id, 2, "CONV_FIRST 1", "never shown"),
+        }
 
-    {
-        const s = try openConverted(&t, "v1-checkpoint");
+        const s = try openConverted(&t, id);
         defer s.close();
         var restored = try s.restore(alloc);
         defer restored.deinit(alloc);
-        try testing.expectEqual(@as(usize, 2), restored.history.len);
-        try testing.expectEqualStrings("stalled", restored.history[1].interrupted.user.text);
-        try testing.expectEqualStrings("a partial reply", restored.history[1].interrupted.assistant.?);
-        try testing.expectEqual(types.InterruptedTerminalReason.failed, restored.history[1].interrupted.terminal_reason);
-    }
-    {
-        const s = try openConverted(&t, "v1-stale");
-        defer s.close();
-        var restored = try s.restore(alloc);
-        defer restored.deinit(alloc);
-        try testing.expectEqual(@as(usize, 1), restored.history.len);
-    }
-    {
-        // No checkpoint: v1's next writable open fails the turn.
-        const s = try openConverted(&t, "v1-open");
-        defer s.close();
-        var restored = try s.restore(alloc);
-        defer restored.deinit(alloc);
-        try testing.expectEqual(@as(usize, 2), restored.history.len);
-        try testing.expectEqualStrings("stalled", restored.history[1].interrupted.user.text);
-        try testing.expectEqual(types.InterruptedTerminalReason.failed, restored.history[1].interrupted.terminal_reason);
+        const last = restored.history[restored.history.len - 1];
+        switch (variant) {
+            .stale => {
+                try testing.expectEqual(@as(usize, 1), restored.history.len);
+                try testing.expectEqualStrings("CONV_FIRST_ANSWER", last.assistant.assistant);
+            },
+            .checkpoint, .open => {
+                // No checkpoint: v1's next writable open fails the turn.
+                try testing.expectEqualStrings("CONV_STALL", last.interrupted.user.text);
+                try testing.expectEqual(types.InterruptedTerminalReason.failed, last.interrupted.terminal_reason);
+                if (variant == .checkpoint) try testing.expectEqualStrings("CONV_PARTIAL_REPLY", last.interrupted.assistant.?);
+            },
+        }
     }
 }
 
-test "a v1 family converts together: its children first, and one whose folder is gone recorded lost (D33, D61)" {
+test "a compaction inside an open v1 turn that kept an earlier turn leaves out what it covered there (D87)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-parent", &.{assistantTurn("q", "a")});
-    {
-        var writer = try v1.startAs("v1-kid", true);
-        defer writer.deinit(alloc);
-        try writer.conversation_writer.appendHistoryTurn(alloc, 2_000, assistantTurn("child task", "child answer"));
-    }
-    var registry = try child_state.Registry.init(alloc, "v1-parent");
-    defer registry.deinit(alloc);
-    registry.children = try alloc.alloc(child_state.Child, 2);
-    for (registry.children, [_][]const u8{ "v1-kid", "v1-gone" }, [_][]const u8{ "w1", "w2" }) |*child, id, work| child.* = .{
-        .id = try alloc.dupe(u8, id),
-        .kind = .one_off,
-        .phase = .finished,
-        .work_generation = 1,
-        .last_work_id = try alloc.dupe(u8, work),
-        .last_request_fingerprint = @splat(7),
-        .last_outcome = .completed,
+    const a = v1.arena.allocator();
+    const id = (try v1.fixture("unfinished", 1))[0];
+    // The fixture's lines as v1 wrote them: a finished turn (seq 1 to 3), then
+    // an open one with a tool step (4 to 7) that compacted (8), its reply in
+    // recovery.json.
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, try v1.file(id, "", "events.jsonl"), '\n');
+    while (it.next()) |line| if (line.len > 0) try lines.append(a, line);
+    try testing.expectEqual(@as(usize, 8), lines.items.len);
+    // Rebuilt so that the first turn runs two tool steps and the compaction in
+    // the open turn covers only the first: it keeps the first turn from there.
+    const Line = struct { from: usize, call: ?[]const u8 = null };
+    const plan = [_]Line{
+        .{ .from = 0 },               .{ .from = 5, .call = "c1" }, .{ .from = 6, .call = "c1" },
+        .{ .from = 5, .call = "c2" }, .{ .from = 6, .call = "c2" }, .{ .from = 1 },
+        .{ .from = 2 },               .{ .from = 3 },               .{ .from = 4 },
+        .{ .from = 5 },               .{ .from = 6 },               .{ .from = 7 },
     };
-    try (child_state.Store{ .backend = .{ .v1 = &v1.store }, .parent_id = "v1-parent" }).save(alloc, registry);
-
-    // A v1 child opens only through its parent.
-    try testing.expectError(error.SessionNotFound, openConverted(&t, "v1-kid"));
-    const s = try openConverted(&t, "v1-parent");
-    defer s.close();
-    var st = try s.handle.state(alloc);
-    defer st.deinit(alloc);
-    try testing.expectEqual(@as(usize, 2), st.children.items.len);
-    for (st.children.items) |child| {
-        const expected: sm.Outcome = if (std.mem.eql(u8, child.id, "v1-kid")) .ok else .lost;
-        try testing.expectEqual(expected, child.outcome.?);
+    var events: std.Io.Writer.Allocating = .init(a);
+    for (plan, 1..) |line, seq| {
+        var text = try std.mem.replaceOwned(u8, a, lines.items[line.from], try a.print("\"seq\":{d},", .{line.from + 1}), try a.print("\"seq\":{d},", .{seq}));
+        if (line.call) |call| text = try std.mem.replaceOwned(u8, a, text, "conv-stall-run", call);
+        if (line.from == 7) text = try std.mem.replaceOwned(u8, a, text, "\"covers_through_seq\":7", "\"covers_through_seq\":3");
+        try events.writer.print("{s}\n", .{text});
     }
-    var kid = try t.store.manager.peek(alloc, "v1-kid");
-    defer kid.deinit(alloc);
-    try testing.expectEqual(sm.Role.child, kid.role);
-    try testing.expectEqualStrings("v1-parent", kid.parent.?);
-    try testing.expect(!V1Home.exists(&t, "v1-parent") and !V1Home.exists(&t, "v1-kid"));
+    try v1.put(id, null, "events.jsonl", events.written());
+    try v1.put(id, null, "recovery.json", try std.mem.replaceOwned(u8, a, try v1.file(id, "", "recovery.json"), "\"conversation_seq\":8", "\"conversation_seq\":12"));
+
+    const s = try openConverted(&t, id);
+    defer s.close();
+    var restored = try s.restore(alloc);
+    defer restored.deinit(alloc);
+    // The summary, the first turn from its second step, and the open turn
+    // whole from the checkpoint, as v1 shows them.
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    const first = restored.history[1].assistant;
+    try testing.expectEqualStrings("CONV_FIRST", first.user.text);
+    try testing.expectEqual(@as(usize, 1), first.execution.tool_steps.len);
+    try testing.expectEqualStrings("c2", first.execution.tool_steps[0].tool_calls[0].id);
+    try testing.expectEqualStrings("CONV_PARTIAL_REPLY", restored.history[2].interrupted.assistant.?);
 }
 
 test "a v1 session another process holds answers busy, and converts nothing (D38)" {
@@ -6073,15 +7204,19 @@ test "a v1 session another process holds answers busy, and converts nothing (D38
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-held", &.{assistantTurn("q", "a")});
+    const roots = try v1.fixture("plain", 1);
+    const v1_held_id = roots[0];
     {
-        var holder = try v1.store.resumeForWrite(alloc, "v1-held");
-        defer holder.deinit(alloc);
-        try testing.expectError(error.SessionBusy, Session.resumeSessionWithoutWaiting(alloc, &t.store, .{ .id = "v1-held" }, "/w", .app));
-        try testing.expectError(error.NotFound, t.store.manager.peek(alloc, "v1-held"));
-        try testing.expect(V1Home.exists(&t, "v1-held"));
+        // Held as a v1 writer holds it.
+        var v1_store = try session_store.Store.initReadOnlyFromHome(alloc, t.store.home, "/");
+        defer v1_store.deinit(alloc);
+        var holder = try v1_conversion.lockFamily(alloc, &v1_store, v1_held_id, 0, &t.store.problem);
+        defer holder.release();
+        try testing.expectError(error.SessionBusy, Session.resumeSessionWithoutWaiting(alloc, &t.store, .{ .id = v1_held_id }, "/w", .app));
+        try testing.expectError(error.NotFound, t.store.manager.peek(alloc, v1_held_id));
+        try testing.expect(V1Home.exists(&t, v1_held_id));
     }
-    const s = try openConverted(&t, "v1-held");
+    const s = try openConverted(&t, v1_held_id);
     s.close();
 }
 
@@ -6092,18 +7227,19 @@ test "an unreadable v1 session is refused with its file and reason, and nothing 
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-torn", &.{assistantTurn("q", "a")});
-    const log = try V1Home.read(&t, ".fx/sessions/v1-torn/events.jsonl");
+    const roots = try v1.fixture("plain", 1);
+    const v1_torn_id = roots[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(v1_torn_id, "events.jsonl"));
     defer alloc.free(log);
     const damaged = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
     defer alloc.free(damaged);
-    try v1.put("v1-torn", null, "events.jsonl", damaged);
+    try v1.put(v1_torn_id, null, "events.jsonl", damaged);
 
-    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, "v1-torn"));
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, v1_torn_id));
     const line = std.mem.count(u8, log, "\n") + 1;
     var buffer: [64]u8 = undefined;
     try testing.expectEqualStrings(try std.mem.print(&buffer, "events.jsonl line {d} is not valid JSON", .{line}), t.store.conversionProblem().?);
-    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, "v1-torn"));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, v1_torn_id));
     // No staging left behind, if any was made.
     if (t.tmp.dir.openDir(io_mod.getIo(), ".fx/sessions/v2/.tmp", .{ .iterate = true })) |opened_staging| {
         var staging = opened_staging;
@@ -6111,9 +7247,158 @@ test "an unreadable v1 session is refused with its file and reason, and nothing 
         var it = staging.iterate();
         try testing.expect(try it.next(io_mod.getIo()) == null);
     } else |err| try testing.expectEqual(error.FileNotFound, err);
-    const after = try V1Home.read(&t, ".fx/sessions/v1-torn/events.jsonl");
+    const after = try V1Home.read(&t, try v1.sessionPath(v1_torn_id, "events.jsonl"));
     defer alloc.free(after);
     try testing.expectEqualStrings(damaged, after);
+}
+
+test "recover salvages a damaged v1 session into a fresh v2 root and leaves its v1 folder as it was (D64)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // Two turns, then a torn line.
+    const torn = (try v1.fixture("cancelled", 1))[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(log);
+    const damaged = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(damaged);
+    try v1.put(torn, null, "events.jsonl", damaged);
+
+    var recovered = try recover(&t.store, alloc, torn);
+    defer recovered.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), recovered.history_len);
+    try testing.expect(!std.mem.eql(u8, recovered.id, torn));
+    var copy = try t.store.manager.peek(alloc, recovered.id);
+    defer copy.deinit(alloc);
+    try testing.expectEqual(sm.Role.root, copy.role);
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, torn));
+    const after = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(after);
+    try testing.expectEqualStrings(damaged, after);
+
+    const whole = (try v1.fixture("plain", 1))[0];
+    try testing.expectError(error.SessionRecoveryNotNeeded, recover(&t.store, alloc, whole));
+    try testing.expectError(error.SessionNotFound, recover(&t.store, alloc, "v1-none"));
+}
+
+test "recover copies a v1 conversation without saved rules it can't read and leaves its v1 folder as it was (D72)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("rules", 1))[0];
+    for ([_][]const u8{ "{broken", "" }) |rules| {
+        try v1.put(id, null, "permissions.json", rules);
+        // Resume still refuses to convert it.
+        try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+        var recovered = try recover(&t.store, alloc, id);
+        defer recovered.deinit(alloc);
+        try testing.expect(recovered.permission_rules_dropped);
+        try testing.expectEqual(@as(usize, 1), recovered.history_len);
+        try testing.expect(!std.mem.eql(u8, recovered.id, id));
+        var copy = try t.store.manager.peek(alloc, recovered.id);
+        defer copy.deinit(alloc);
+        try testing.expectEqual(sm.Role.root, copy.role);
+        const after = try V1Home.read(&t, try v1.sessionPath(id, "permissions.json"));
+        defer alloc.free(after);
+        try testing.expectEqualStrings(rules, after);
+    }
+}
+
+test "doctor counts sessions an older fx saved and names each that can't be converted with what recover copies (D73)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    _ = try v1.fixture("plain", 3);
+    const ruleless = (try v1.fixture("rules", 1))[0];
+    try v1.put(ruleless, null, "permissions.json", "{broken");
+    const torn = (try v1.fixture("cancelled", 1))[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(log);
+    const damaged = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(damaged);
+    try v1.put(torn, null, "events.jsonl", damaged);
+
+    var report = try doctor(&t.store, alloc, 100, io_mod.milliTimestamp());
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), report.sessions);
+    try testing.expectEqual(@as(usize, 5), report.unconverted);
+    try testing.expectEqual(@as(usize, 2), report.stuck.items.len);
+    for (report.stuck.items) |stuck| {
+        if (std.mem.eql(u8, stuck.id, ruleless)) {
+            try testing.expect(stuck.recover == .without_rules);
+            try testing.expect(std.mem.find(u8, stuck.reason, "permissions.json") != null);
+        } else {
+            try testing.expectEqualStrings(torn, stuck.id);
+            try testing.expect(stuck.recover == .good_turns);
+        }
+    }
+    // It converts nothing.
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, ruleless));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, torn));
+}
+
+test "recover leaves out a kept side file that is gone or not the bytes its name records, and says so (D74)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // One command result under tool-results/, then a torn line.
+    const id = (try v1.fixture("side", 1))[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(id, "events.jsonl"));
+    defer alloc.free(log);
+    const torn = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(torn);
+    try v1.put(id, null, "events.jsonl", torn);
+    const artifact = "result-shell-70a192405eaee816-83e94389437f0489.txt";
+    const original = try V1Home.read(&t, try v1.sessionPath(id, "tool-results/" ++ artifact));
+    defer alloc.free(original);
+    {
+        var whole = try recover(&t.store, alloc, id);
+        defer whole.deinit(alloc);
+        try testing.expect(whole.files_complete);
+    }
+    const changed = try alloc.dupe(u8, original);
+    defer alloc.free(changed);
+    changed[0] ^= 1;
+    for ([_]bool{ false, true }) |gone| {
+        if (gone) {
+            const path = try std.mem.concat(alloc, u8, &.{ ".fx/sessions/", id, "/tool-results/", artifact });
+            defer alloc.free(path);
+            try t.tmp.dir.deleteFile(io_mod.getIo(), path);
+        } else try v1.put(id, "tool-results", artifact, changed);
+        var recovered = try recover(&t.store, alloc, id);
+        defer recovered.deinit(alloc);
+        try testing.expect(!recovered.files_complete);
+        const r = try Session.resumeSession(alloc, &t.store, .{ .id = recovered.id }, "/w", .ask);
+        defer r.close();
+        var restored = try r.restore(alloc);
+        defer restored.deinit(alloc);
+        const result = restored.history[0].assistant.execution.tool_steps[0].tool_results[0];
+        try testing.expectEqualStrings("Saved tool-result content is unavailable. The complete output could not be restored.", result.output);
+    }
+}
+
+test "latest resume says saved sessions are unreadable when only an unreadable v1 one exists (D76)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    try testing.expectError(error.NoSavedSessions, Session.resumeSession(testing.allocator, &t.store, .last, "/w", .ask));
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("plain", 1))[0];
+    try v1.put(id, null, "session.json", "{ not json");
+    try testing.expectError(error.NoReadableSessions, Session.resumeSession(testing.allocator, &t.store, .last, "/w", .ask));
 }
 
 test "a leftover v1 folder goes on a later open only while it is what was converted (D60)" {
@@ -6123,22 +7408,23 @@ test "a leftover v1 folder goes on a later open only while it is what was conver
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-left", &.{assistantTurn("q", "a")});
-    var copy = try V1Copy.take(&t, "v1-left");
+    const roots = try v1.fixture("plain", 1);
+    const v1_left_id = roots[0];
+    var copy = try V1Copy.take(&t, v1_left_id);
     defer copy.deinit();
-    (try openConverted(&t, "v1-left")).close();
+    (try openConverted(&t, v1_left_id)).close();
 
     // As a refused delete leaves it: the next open deletes it.
-    try copy.restore(&v1, "v1-left");
-    (try openConverted(&t, "v1-left")).close();
-    try testing.expect(!V1Home.exists(&t, "v1-left"));
+    try copy.restore(&v1, v1_left_id);
+    (try openConverted(&t, v1_left_id)).close();
+    try testing.expect(!V1Home.exists(&t, v1_left_id));
 
     // Changed since by an older build: kept, and never reaches the v2 copy.
-    try copy.restore(&v1, "v1-left");
-    try v1.put("v1-left", null, "events.jsonl", "changed\n");
-    const s = try openConverted(&t, "v1-left");
+    try copy.restore(&v1, v1_left_id);
+    try v1.put(v1_left_id, null, "events.jsonl", "changed\n");
+    const s = try openConverted(&t, v1_left_id);
     defer s.close();
-    try testing.expect(V1Home.exists(&t, "v1-left"));
+    try testing.expect(V1Home.exists(&t, v1_left_id));
     var restored = try s.restore(alloc);
     defer restored.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), restored.history.len);
@@ -6146,27 +7432,79 @@ test "a leftover v1 folder goes on a later open only while it is what was conver
 
 test "-c opens the session v1 remembers while v2 has none, and --resume last the newest of both (D56, D61)" {
     const alloc = testing.allocator;
+    // The v1 app last opened the first; the second is newer. Each half in
+    // its own home: opening a session makes it the newest.
+    for ([_]enum { remembered, newest }{ .remembered, .newest }) |half| {
+        var t: TestHome = undefined;
+        try t.init();
+        defer t.deinit();
+        var v1 = try V1Home.init(&t);
+        defer v1.deinit();
+        const ids = try v1.fixture("remembered", 2);
+        switch (half) {
+            .remembered => {
+                const s = try Session.resumeSession(alloc, &t.store, .last_opened, v1.workspace, .app);
+                defer s.close();
+                try testing.expectEqualStrings(ids[0], s.id());
+            },
+            .newest => {
+                {
+                    // A v2 session older than the newest v1 one.
+                    const s = try t.store.manager.openImport(.{ .id = "v2-older", .workspace = v1.workspace, .host = .ask, .created_ms = 1000 });
+                    defer s.release();
+                    _ = try s.appendAt(&.{ .turn_started, .turn_committed }, 5000);
+                    try s.publishImport();
+                }
+                const s = try Session.resumeSession(alloc, &t.store, .last, v1.workspace, .ask);
+                defer s.close();
+                try testing.expectEqualStrings(ids[1], s.id());
+            },
+        }
+    }
+}
+
+test "the picker's listing orders v2 sessions and v1's unconverted ones newest first together (D61)" {
+    const alloc = testing.allocator;
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-remembered", &.{assistantTurn("q", "a")});
-    try v1.store.rememberSessionId(alloc, "v1-remembered");
+    const newer = (try v1.fixture("plain", 1))[0];
     {
-        const s = try Session.resumeSession(alloc, &t.store, .last_opened, "/w", .app);
-        defer s.close();
-        try testing.expectEqualStrings("v1-remembered", s.id());
+        // A v2 session older than the v1 one.
+        const s = try t.store.manager.openImport(.{ .id = "v2-older", .workspace = v1.workspace, .host = .ask, .created_ms = 1000 });
+        defer s.release();
+        _ = try s.appendAt(&.{ .turn_started, .turn_committed }, 5000);
+        try s.publishImport();
     }
-    var model = "m".*;
-    const fresh = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
-    try fresh.commitTurn(assistantTurn("v2 question", "v2 answer"), types.ConversationLanguage.default());
-    fresh.close();
-    // Written after the v2 session's turn, so listed as newer.
-    try v1.session("v1-newest", &.{assistantTurn("q", "a")});
-    const s = try Session.resumeSession(alloc, &t.store, .last, "/w", .ask);
-    defer s.close();
-    try testing.expectEqualStrings("v1-newest", s.id());
+    var cancel = std.atomic.Value(bool).init(false);
+    var list = try listSummaries(&t.store, alloc, null, &cancel);
+    defer {
+        for (list.items) |*summary| summary.deinit(alloc);
+        list.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqualStrings(newer, list.items[0].id);
+    try testing.expectEqualStrings("v2-older", list.items[1].id);
+}
+
+test "-c says the remembered session cannot be read when v1's bookmark is not a file (D86)" {
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    _ = try v1.fixture("remembered", 1);
+    // The bookmark becomes a folder, which v1's reader refuses as it does a FIFO.
+    var bookmarks = try t.tmp.dir.openDir(io, profile_paths.root_dir_name ++ "/continue", .{ .iterate = true });
+    defer bookmarks.close(io);
+    var entries = bookmarks.iterate();
+    const name = try v1.arena.allocator().dupe(u8, (try entries.next(io)).?.name);
+    try bookmarks.deleteFile(io, name);
+    try bookmarks.createDir(io, name, .fromMode(0o700));
+    try testing.expectError(error.RememberedSessionUnavailable, Session.resumeSession(testing.allocator, &t.store, .last_opened, v1.workspace, .app));
 }
 
 test "the listing shows v1 sessions not converted yet, and fx session reads one without converting it (D59, D61)" {
@@ -6176,7 +7514,7 @@ test "the listing shows v1 sessions not converted yet, and fx session reads one 
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-listed", &.{assistantTurn("listed question", "a")});
+    const listed = (try v1.fixture("plain", 1))[0];
     var cancel = std.atomic.Value(bool).init(false);
     var list = try listSummaries(&t.store, alloc, null, &cancel);
     defer {
@@ -6184,13 +7522,48 @@ test "the listing shows v1 sessions not converted yet, and fx session reads one 
         list.deinit(alloc);
     }
     try testing.expectEqual(@as(usize, 1), list.items.len);
-    try testing.expectEqualStrings("v1-listed", list.items[0].id);
+    try testing.expectEqualStrings(listed, list.items[0].id);
 
-    var detail = try readSession(&t.store, alloc, "v1-listed");
+    var detail = try readSession(&t.store, alloc, listed);
     defer detail.deinit(alloc);
-    try testing.expectEqualStrings("listed question", detail.state.history[0].assistant.user.text);
-    try testing.expect(V1Home.exists(&t, "v1-listed"));
-    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, "v1-listed"));
+    try testing.expectEqualStrings("CONV_FIRST 1", detail.state.history[0].assistant.user.text);
+    try testing.expect(V1Home.exists(&t, listed));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, listed));
+}
+
+test "the listing shows v1 roots, an empty one too, and never a child, by its flag or its owner marker (D59)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const plain = (try v1.fixture("plain", 1))[0];
+    const empty = (try v1.fixture("empty", 1))[0];
+    const family = try v1.fixture("family", 3);
+    // A child from before the flag, known only by its owner marker.
+    var older = try v1.metadata(family[2]);
+    try older.put(v1.arena.allocator(), "subagent_child", .{ .bool = false });
+    try v1.put(family[2], null, "session.json", try std.json.Stringify.valueAlloc(v1.arena.allocator(), std.json.Value{ .object = older }, .{}));
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var list = try listSummaries(&t.store, alloc, null, &cancel);
+    defer {
+        for (list.items) |*summary| summary.deinit(alloc);
+        list.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 3), list.items.len);
+    for (list.items) |summary| {
+        try testing.expect(std.mem.eql(u8, summary.id, plain) or std.mem.eql(u8, summary.id, empty) or std.mem.eql(u8, summary.id, family[0]));
+    }
+    const Listing = struct {
+        fn run(failing: Allocator, home: []const u8) !void {
+            var roots = try v1_conversion.listRoots(failing, home, null);
+            defer roots.deinit(failing);
+            try testing.expectEqual(@as(usize, 3), roots.summaries.items.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing_allocator.no_resize, Listing.run, .{t.store.home});
 }
 
 test "the listing's pages, read from part of the index, are the whole listing in v1's order, through a tie and v1's roots (D59, D62)" {
@@ -6200,22 +7573,23 @@ test "the listing's pages, read from part of the index, are the whole listing in
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
+    const roots = try v1.fixture("plain", 2);
     // Tied on their update time: v2 orders them by id ascending, v1's pages
     // by id descending.
     for ([_][]const u8{ "tie-c", "tie-a", "tie-e", "tie-b", "tie-d" }) |id| {
-        const s = try t.store.manager.openImport(.{ .id = id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+        const s = try t.store.manager.openImport(.{ .id = id, .workspace = v1.workspace, .host = .ask, .created_ms = 1000 });
         defer s.release();
         _ = try s.appendAt(&.{ .turn_started, .turn_committed }, 5000);
         try s.publishImport();
     }
-    try v1.session("v1-only", &.{assistantTurn("q", "a")});
     // Converted, its v1 folder left behind as a refused delete leaves it:
     // listed once.
-    try v1.session("v1-held", &.{assistantTurn("q", "a")});
-    var copy = try V1Copy.take(&t, "v1-held");
+    const v1_held_id = roots[1];
+    var copy = try V1Copy.take(&t, v1_held_id);
     defer copy.deinit();
-    (try openConverted(&t, "v1-held")).close();
-    try copy.restore(&v1, "v1-held");
+    // Opened where v1 saved it, so it stays in that workspace.
+    (try Session.resumeSession(alloc, &t.store, .{ .id = v1_held_id }, v1.workspace, .ask)).close();
+    try copy.restore(&v1, v1_held_id);
 
     var cancel = std.atomic.Value(bool).init(false);
     var whole = try listSummaries(&t.store, alloc, null, &cancel);
@@ -6225,7 +7599,7 @@ test "the listing's pages, read from part of the index, are the whole listing in
     }
     session_summary_codec.sortSummariesNewestFirst(whole.items);
     try testing.expectEqual(@as(usize, 7), whole.items.len);
-    for ([_]?[]const u8{ null, "/w" }) |workspace| for ([_]usize{ 1, 2, 3 }) |limit| {
+    for ([_]?[]const u8{ null, v1.workspace }) |workspace| for ([_]usize{ 1, 2, 3 }) |limit| {
         var seen: usize = 0;
         var continuation: ?session_store.ResumableSessionContinuation = null;
         var last_id: ?[]u8 = null;
@@ -6247,6 +7621,179 @@ test "the listing's pages, read from part of the index, are the whole listing in
     };
 }
 
+/// A legacy upgrade's pending authority fence for `id`, as v1 wrote it.
+fn legacyFence(a: Allocator, id: []const u8) ![]const u8 {
+    return std.mem.concat(a, u8, &.{ "{\"schema_version\":1,\"session_id\":\"", id, "\",\"operation_id\":\"11111111111111111111111111111111\",\"kind\":\"legacy_to_v3\",\"authority_id\":\"22222222222222222222222222222222\",\"prior\":{\"storage_format\":\"legacy_snapshot_v1\",\"primary_bytes\":1,\"primary_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"proposed\":{\"storage_format\":\"event_log_v1\",\"log_generation\":\"33333333333333333333333333333333\",\"through_seq\":1,\"through_event_id\":\"44444444444444444444444444444444\",\"through_event_log_bytes\":1}}" });
+}
+
+test "a FIFO in a v1 session never blocks the listing or its conversion, which refuses it and keeps v1 (D68)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    const C = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    for ([_][]const u8{ "events.jsonl", "session.json", "permissions.json" }) |name| {
+        var t: TestHome = undefined;
+        try t.init();
+        defer t.deinit();
+        var v1 = try V1Home.init(&t);
+        defer v1.deinit();
+        const ids = try v1.fixture("plain", 2);
+        const rel = try v1.sessionPath(ids[1], name);
+        try t.tmp.dir.deleteFile(io, rel);
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        if (C.mkfifo(try std.mem.printSentinel(&buf, "{s}/{s}", .{ t.home, rel }, 0), 0o600) != 0) return error.SkipZigTest;
+        // A blocking open of the FIFO would wait for a writer that never comes.
+        var cancel = std.atomic.Value(bool).init(false);
+        var list = try listSummaries(&t.store, alloc, null, &cancel);
+        defer {
+            for (list.items) |*summary| summary.deinit(alloc);
+            list.deinit(alloc);
+        }
+        try testing.expectEqual(@as(usize, 2), list.items.len);
+        try testing.expectError(error.InvalidSessionFormat, openConverted(&t, ids[1]));
+        try testing.expect(V1Home.exists(&t, ids[1]));
+        const s = try openConverted(&t, ids[0]);
+        s.close();
+    }
+}
+
+test "a v1 side folder that links elsewhere is refused, never followed, and v1 is kept (D68)" {
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const a = v1.arena.allocator();
+    const id = (try v1.fixture("side", 1))[0];
+    const rel = try v1.sessionPath(id, "tool-results");
+    var files = try v1.tree(id, "tool-results");
+    try testing.expect(files.count() > 0);
+    try t.tmp.dir.createDirPath(io, "outside");
+    var it = files.iterator();
+    while (it.next()) |entry| try t.tmp.dir.writeFile(io, .{ .sub_path = try std.Io.Dir.path.join(a, &.{ "outside", entry.key_ptr.* }), .data = entry.value_ptr.* });
+    try t.tmp.dir.deleteTree(io, rel);
+    try t.tmp.dir.symLink(io, "../../../outside", rel, .{ .is_directory = true });
+
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+    try testing.expect(V1Home.exists(&t, id));
+    it = files.iterator();
+    while (it.next()) |entry| {
+        const kept = try t.tmp.dir.readFileAlloc(io, try std.Io.Dir.path.join(a, &.{ "outside", entry.key_ptr.* }), a, .limited(1 << 24));
+        try testing.expectEqualStrings(entry.value_ptr.*, kept);
+    }
+}
+
+test "a legacy authority fence stops only an upgrade that never published, which keeps v1 (D70)" {
+    const alloc = testing.allocator;
+    const session_json = @import("session_json.zig");
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // Published: v0.0.14's own format, with a fence left behind.
+    const published = (try v1.fixture("plain", 1))[0];
+    try v1.put(published, null, "authority.pending.json", try legacyFence(v1.arena.allocator(), published));
+    // Never published: the oldest format's snapshot under its fence.
+    const snapshot = try session_json.renderSessionJson(alloc, "v1-fenced", 10, 20, types.ConversationLanguage.default(), "/w", &.{assistantTurn("old question", "old answer")}, .{});
+    defer alloc.free(snapshot);
+    try v1.put("v1-fenced", null, "session.json", snapshot);
+    try v1.put("v1-fenced", null, "authority.pending.json", try legacyFence(v1.arena.allocator(), "v1-fenced"));
+
+    const s = try openConverted(&t, published);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, published));
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, "v1-fenced"));
+    try testing.expect(V1Home.exists(&t, "v1-fenced"));
+}
+
+test "an image the oldest format saved as only its path is captured from its file, or left out when it can't be (D82)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const a = v1.arena.allocator();
+    const bytes = "\x89PNG\r\n\x1a\nkept";
+    try t.tmp.dir.writeFile(io, .{ .sub_path = "kept.png", .data = bytes });
+    const kept = try std.json.Stringify.valueAlloc(a, try io_mod.dirRealpathAlloc(a, t.tmp.dir, "kept.png"), .{});
+    const gone = try std.json.Stringify.valueAlloc(a, try std.Io.Dir.path.join(a, &.{ try io_mod.dirRealpathAlloc(a, t.tmp.dir, "."), "gone.png" }), .{});
+    try v1.put("v1-path-images", null, "session.json", try std.mem.concat(a, u8, &.{
+        "{\"schema_version\":2,\"id\":\"v1-path-images\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"/w\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"look [Image #1] [Image #2]\",\"images\":[{\"id\":1,\"path\":",
+        kept,
+        ",\"media_type\":\"image/png\"},{\"id\":2,\"path\":",
+        gone,
+        ",\"media_type\":\"image/png\"}]},\"assistant\":\"seen\"}",
+        "],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+    }));
+    const s = try openConverted(&t, "v1-path-images");
+    defer s.close();
+    var restored = try s.restore(alloc);
+    defer restored.deinit(alloc);
+    const user = restored.history[0].assistant.user;
+    // The prompt keeps its text; only the image whose file is gone is left out.
+    try testing.expectEqualStrings("look [Image #1] [Image #2]", user.text);
+    try testing.expectEqual(@as(usize, 1), user.images.len);
+    try testing.expectEqual(@as(usize, 1), user.images[0].id);
+    try testing.expectEqualSlices(u8, bytes, user.images[0].inline_data.?);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    try testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), user.images[0].snapshot_sha256.?);
+}
+
+test "images the oldest format saved without an id get the numbers v1's resume gave them (D69)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const a = v1.arena.allocator();
+    var quoted: [4][]const u8 = undefined;
+    for ([_][]const u8{ "first", "second", "valid", "nine" }, 0..) |name, i| {
+        const file = try std.mem.concat(a, u8, &.{ name, ".png" });
+        try t.tmp.dir.writeFile(io, .{ .sub_path = file, .data = try std.mem.concat(a, u8, &.{ "\x89PNG\r\n\x1a\n", name }) });
+        quoted[i] = try std.json.Stringify.valueAlloc(a, try io_mod.dirRealpathAlloc(a, t.tmp.dir, file), .{});
+    }
+    try v1.put("v1-zero-ids", null, "session.json", try std.mem.concat(a, u8, &.{
+        "{\"schema_version\":2,\"id\":\"v1-zero-ids\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"/w\",\"conversation_language\":\"en\",\"history_len\":4,\"history\":[",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"first [Image #1]\",\"images\":[{\"path\":",
+        quoted[0],
+        ",\"media_type\":\"image/png\"}]},\"assistant\":\"first answer\"},",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"second [Image #1]\",\"images\":[{\"path\":",
+        quoted[1],
+        ",\"media_type\":\"image/png\"}]},\"assistant\":\"second answer\"},",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"existing [Image #3]\",\"images\":[{\"id\":3,\"path\":",
+        quoted[2],
+        ",\"media_type\":\"image/png\"}]},\"assistant\":\"existing answer\"},",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"later [Image #9]\",\"images\":[{\"path\":",
+        quoted[3],
+        ",\"media_type\":\"image/png\"}]},\"assistant\":\"later answer\"}",
+        "],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+    }));
+    const s = try openConverted(&t, "v1-zero-ids");
+    defer s.close();
+    var restored = try s.restore(alloc);
+    defer restored.deinit(alloc);
+    const expected = [_]struct { id: usize, text: []const u8 }{
+        .{ .id = 1, .text = "first [Image #1]" },
+        .{ .id = 2, .text = "second [Image #2]" },
+        .{ .id = 3, .text = "existing [Image #3]" },
+        .{ .id = 9, .text = "later [Image #9]" },
+    };
+    try testing.expectEqual(expected.len, restored.history.len);
+    for (expected, restored.history) |want, turn| {
+        try testing.expectEqual(want.id, turn.assistant.user.images[0].id);
+        try testing.expectEqualStrings(want.text, turn.assistant.user.text);
+    }
+}
+
 test "a v1 session in the oldest format converts through v1's older reader (D61)" {
     const alloc = testing.allocator;
     const session_json = @import("session_json.zig");
@@ -6257,8 +7804,6 @@ test "a v1 session in the oldest format converts through v1's older reader (D61)
     defer v1.deinit();
     const text = try session_json.renderSessionJson(alloc, "v1-legacy", 10, 20, types.ConversationLanguage.default(), "/w", &.{assistantTurn("old question", "old answer")}, .{});
     defer alloc.free(text);
-    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&v1.store.canonical_root.sessions.?, "v1-legacy");
-    dir.close();
     try v1.put("v1-legacy", null, "session.json", text);
 
     const s = try openConverted(&t, "v1-legacy");
@@ -6290,6 +7835,229 @@ test "a conversion past its slow mark tells the host once (D61)" {
     try testing.expectEqual(@as(usize, 1), told);
 }
 
+test "fx sessions convert keeps a v1 subagent's own subagent as it is, and fx doctor names it too (D88)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    const a = v1.arena.allocator();
+    try nestThirdChild(&v1, family);
+    const before = try v1.tree(family[2], ".");
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.converted);
+    try testing.expectEqual(@as(usize, 0), report.skipped.items.len);
+    const reason = try a.print("it is a subagent of the earlier subagent {s}, which no fx opens", .{family[1]});
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(family[2], report.kept_children[0].id);
+    try testing.expectEqualStrings(reason, report.kept_children[0].reason);
+    // Its folder is as it was.
+    const after = try v1.tree(family[2], ".");
+    try testing.expectEqual(before.count(), after.count());
+    for (before.keys(), before.values()) |path, bytes| try testing.expectEqualStrings(bytes, after.get(path).?);
+
+    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    defer doctor_report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), doctor_report.kept_children.len);
+    try testing.expectEqualStrings(family[2], doctor_report.kept_children[0].id);
+    try testing.expectEqualStrings(reason, doctor_report.kept_children[0].reason);
+}
+
+test "fx sessions convert says a v1 subagent's own subagent stays with a parent it can't read (D88)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try nestThirdChild(&v1, family);
+    var parent = try t.tmp.dir.openDir(io, try v1.sessionPath(family[1], "."), .{});
+    defer parent.close(io);
+    parent.setFilePermissions(io, "session.json", .fromMode(0o000), .{}) catch return error.SkipZigTest;
+    defer parent.setFilePermissions(io, "session.json", .fromMode(0o600), .{}) catch {};
+    // Not when the file still opens, as it does for root.
+    if (parent.readFileAlloc(io, "session.json", alloc, .limited(1 << 20))) |bytes| {
+        alloc.free(bytes);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(family[2], report.kept_children[0].id);
+    var expected: [160]u8 = undefined;
+    try testing.expectEqualStrings(try std.mem.print(&expected, "its parent session {s} can't be read, so it stays with it", .{family[1]}), report.kept_children[0].reason);
+}
+
+/// Makes `family`'s third member the second's own subagent, as fx made
+/// them before a subagent lost the subagent tool.
+fn nestThirdChild(v1: *V1Home, family: []const []const u8) !void {
+    const a = v1.arena.allocator();
+    var registry = try std.json.parseFromSliceLeaky(std.json.Value, a, try v1.file(family[0], "subagent", "children.json"), .{});
+    const children = &registry.object.getPtr("children").?.array;
+    for (children.items, 0..) |child, index| {
+        if (std.mem.eql(u8, child.object.get("id").?.string, family[2])) {
+            _ = children.orderedRemove(index);
+            break;
+        }
+    } else return error.TestUnexpectedResult;
+    try v1.put(family[0], "subagent", "children.json", try std.json.Stringify.valueAlloc(a, registry, .{}));
+    try v1.put(family[2], "subagent", "owner.json", try a.print("{{\"schema_version\":1,\"parent_id\":\"{s}\"}}", .{family[1]}));
+}
+
+test "fx sessions convert says a converted v1 child whose folder a cleanup kept is converted already (D60, D88)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    const child = family[1];
+    var copy = try V1Copy.take(&t, child);
+    defer copy.deinit();
+    const owner = try v1.file(child, "subagent", "owner.json");
+    const s = try openConverted(&t, family[0]);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, child));
+    // The child's folder as a cleanup keeps it when an older fx changed it
+    // after its conversion: its parent's folder is gone.
+    try copy.restore(&v1, child);
+    try v1.put(child, "subagent", "owner.json", owner);
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(child, report.kept_children[0].id);
+    try testing.expectEqualStrings("fx converted it already, so anything an older fx added since stays only in this folder", report.kept_children[0].reason);
+}
+
+test "a kept subagent's reason names what its copy left out, one file by name and more by count (D62)" {
+    const alloc = testing.allocator;
+    const one = [_]V1Source.Record{.{ .file = "logs/commands/replay.bin", .cause = .too_large }};
+    const two = [_]V1Source.Record{ one[0], .{ .file = "terminal/state/link", .cause = .not_regular } };
+    const cases = [_]struct { source: ?V1Source, reason: []const u8 }{
+        .{ .source = null, .reason = "fx converted it already, so anything an older fx added since stays only in this folder" },
+        .{ .source = .{ .fingerprint = "f" }, .reason = "fx converted it already, so anything an older fx added since stays only in this folder" },
+        .{ .source = .{ .left_out = &one, .left_out_total = 1 }, .reason = "fx converted it already without logs/commands/replay.bin, so this folder keeps it" },
+        .{ .source = .{ .left_out = &two, .left_out_total = 2 }, .reason = "fx converted it already without 2 of its files, so this folder keeps them" },
+        // A copy names the first files only; the count is all of them.
+        .{ .source = .{ .left_out = &two, .left_out_total = 33 }, .reason = "fx converted it already without 33 of its files, so this folder keeps them" },
+        .{ .source = .{ .left_out_total = 1 }, .reason = "fx converted it already without 1 of its files, so this folder keeps them" },
+    };
+    for (cases) |case| {
+        const reason = try convertedReason(alloc, case.source);
+        defer alloc.free(reason);
+        try testing.expectEqualStrings(case.reason, reason);
+    }
+}
+
+test "a copy names the first files it left out and counts them all (D56, D62)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("terminal", 1))[0];
+    var state = try t.tmp.dir.openDir(io, try v1.sessionPath(id, "terminal/state"), .{});
+    defer state.close(io);
+    const total = V1Source.max_records + 1;
+    for (0..total) |index| {
+        var name: [32]u8 = undefined;
+        state.symLink(io, "elsewhere", try std.mem.print(&name, "link-{d}", .{index}), .{}) catch return error.SkipZigTest;
+    }
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.converted);
+    try testing.expectEqual(@as(usize, total), report.left_out.items.len);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const peeked = try t.store.manager.peek(scratch.allocator(), id);
+    const source = parseV1Source(scratch.allocator(), peeked.state.v1_source).?;
+    try testing.expectEqualStrings("", source.fingerprint);
+    try testing.expectEqual(@as(usize, V1Source.max_records), source.left_out.len);
+    try testing.expectEqual(@as(usize, total), source.left_out_total);
+    try testing.expect(V1Home.exists(&t, id));
+}
+
+test "fx doctor counts each v1 folder a family's conversion kept, a subagent's included (D62)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 2);
+    for (family) |id| {
+        var commands = try t.tmp.dir.createDirPathOpen(io, try v1.sessionPath(id, "logs/commands"), .{});
+        defer commands.close(io);
+        var file = try commands.createFile(io, "replay.bin", .{});
+        defer file.close(io);
+        // Sparse: no disk for the hole.
+        try file.setLength(io, sm.max_blob_bytes + 1);
+    }
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.converted);
+    try testing.expectEqual(@as(usize, 2), report.left_out.items.len);
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    defer doctor_report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
+    // Each copy names what it left out and keeps no fingerprint, which an
+    // older fx would match to remove the folder.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    for (family) |id| {
+        const peeked = try t.store.manager.peek(scratch.allocator(), id);
+        const source = parseV1Source(scratch.allocator(), peeked.state.v1_source).?;
+        try testing.expectEqualStrings("", source.fingerprint);
+        try testing.expectEqual(@as(usize, 1), source.left_out.len);
+        try testing.expectEqualStrings("logs/commands/replay.bin", source.left_out[0].file);
+        try testing.expectEqual(LeftOut.Cause.too_large, source.left_out[0].cause);
+        try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), source.left_out[0].bytes);
+    }
+}
+
+test "fx sessions convert says when it can't read a kept v1 child's converted copy (D88)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    const child = family[1];
+    var copy = try V1Copy.take(&t, child);
+    defer copy.deinit();
+    const owner = try v1.file(child, "subagent", "owner.json");
+    const s = try openConverted(&t, family[0]);
+    s.close();
+    try copy.restore(&v1, child);
+    try v1.put(child, "subagent", "owner.json", owner);
+    // The converted copy is damaged since.
+    var copied = try t.tmp.dir.openDir(io, try std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", "v2", child }), .{});
+    defer copied.close(io);
+    try copied.writeFile(io, .{ .sub_path = "log.jsonl", .data = "not a log\n" });
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(child, report.kept_children[0].id);
+    try testing.expect(std.mem.startsWith(u8, report.kept_children[0].reason, "fx can't read its converted copy ("));
+}
+
 test "fx sessions convert converts every v1 family, and counts what it skipped (D61)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
@@ -6297,12 +8065,16 @@ test "fx sessions convert converts every v1 family, and counts what it skipped (
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-plain", &.{assistantTurn("q", "a")});
-    try v1.session("v1-busy", &.{assistantTurn("q", "a")});
-    try v1.session("v1-bad", &.{assistantTurn("q", "a")});
-    try v1.put("v1-bad", null, "events.jsonl", "{ not json\n");
-    var holder = try v1.store.resumeForWrite(alloc, "v1-busy");
-    defer holder.deinit(alloc);
+    const roots = try v1.fixture("plain", 3);
+    const v1_plain_id = roots[0];
+    const v1_busy_id = roots[1];
+    const v1_bad_id = roots[2];
+    try v1.put(v1_bad_id, null, "events.jsonl", "{ not json\n");
+    // Held as a v1 writer holds it.
+    var v1_store = try session_store.Store.initReadOnlyFromHome(alloc, t.store.home, "/");
+    defer v1_store.deinit(alloc);
+    var holder = try v1_conversion.lockFamily(alloc, &v1_store, v1_busy_id, 0, &t.store.problem);
+    defer holder.release();
 
     var report = try convertAll(&t.store, alloc);
     defer report.deinit(alloc);
@@ -6310,85 +8082,12 @@ test "fx sessions convert converts every v1 family, and counts what it skipped (
     try testing.expectEqual(@as(usize, 1), report.busy);
     try testing.expectEqual(@as(usize, 1), report.unreadable);
     for (report.skipped.items) |skipped| {
-        const busy = std.mem.eql(u8, skipped.id, "v1-busy");
+        const busy = std.mem.eql(u8, skipped.id, v1_busy_id);
         try testing.expectEqualStrings(if (busy) "SessionBusy" else "InvalidSessionFormat", skipped.code);
         if (!busy) try testing.expectEqualStrings("events.jsonl line 1 is not valid JSON", skipped.reason.?);
     }
-    var plain = try t.store.manager.peek(alloc, "v1-plain");
+    var plain = try t.store.manager.peek(alloc, v1_plain_id);
     plain.deinit(alloc);
-}
-
-/// Writes v1 child sessions `ids` of the v1 root `parent`, and its
-/// registry naming them, each finished.
-fn v1Children(v1: *V1Home, parent: []const u8, ids: []const []const u8) !void {
-    const alloc = testing.allocator;
-    for (ids) |id| {
-        var writer = try v1.startAs(id, true);
-        defer writer.deinit(alloc);
-        try writer.conversation_writer.appendHistoryTurn(alloc, 2_000, assistantTurn("child task", "child answer"));
-    }
-    var registry = try child_state.Registry.init(alloc, parent);
-    defer registry.deinit(alloc);
-    registry.children = try alloc.alloc(child_state.Child, ids.len);
-    for (registry.children, ids) |*child, id| child.* = .{
-        .id = try alloc.dupe(u8, id),
-        .kind = .one_off,
-        .phase = .finished,
-        .work_generation = 1,
-        .last_work_id = try alloc.dupe(u8, id),
-        .last_request_fingerprint = @splat(7),
-        .last_outcome = .completed,
-    };
-    try (child_state.Store{ .backend = .{ .v1 = &v1.store }, .parent_id = parent }).save(alloc, registry);
-}
-
-test "a child an earlier try published is reused as it is, its v1 folder kept once v1 changed it (D60, D61)" {
-    const alloc = testing.allocator;
-    var t: TestHome = undefined;
-    try t.init();
-    defer t.deinit();
-    var v1 = try V1Home.init(&t);
-    defer v1.deinit();
-    try v1.session("v1-root", &.{assistantTurn("q", "a")});
-    try v1Children(&v1, "v1-root", &.{ "v1-same", "v1-changed" });
-    // A try that published the children and stopped before the root.
-    {
-        var v1_store = try session_store.Store.initReadOnlyFromHome(alloc, t.store.home, "/");
-        defer v1_store.deinit(alloc);
-        var locks = try v1_conversion.lockFamily(alloc, &v1_store, "v1-root", 0, &t.store.problem);
-        defer locks.release();
-        var c: Conversion = .{ .store = &t.store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
-        for (locks.members.items[1..]) |*member| {
-            var checked = try c.check(&v1_store, member, "v1-root", false, false);
-            const staged = try c.stage(&v1_store, &checked, member, .{ .child = .{ .parent = "v1-root", .instructions = null } });
-            defer staged.session.?.dropImport();
-            try staged.session.?.handle.publishImport();
-        }
-    }
-    // An older build changes one child since; a damaged one reads the same.
-    try v1.put("v1-changed", null, "events.jsonl", "{ not json\n");
-
-    const s = try openConverted(&t, "v1-root");
-    defer s.close();
-    var changed = try t.store.manager.peek(alloc, "v1-changed");
-    defer changed.deinit(alloc);
-    try testing.expectEqual(sm.Role.child, changed.role);
-    try testing.expect(V1Home.exists(&t, "v1-changed"));
-    try testing.expect(!V1Home.exists(&t, "v1-same") and !V1Home.exists(&t, "v1-root"));
-}
-
-test "a v1 session whose session.json is damaged names that file, whatever registry it has (D61)" {
-    var t: TestHome = undefined;
-    try t.init();
-    defer t.deinit();
-    var v1 = try V1Home.init(&t);
-    defer v1.deinit();
-    try v1.session("v1-broken", &.{assistantTurn("q", "a")});
-    try v1Children(&v1, "v1-broken", &.{"v1-broken-kid"});
-    try v1.put("v1-broken", null, "session.json", "{ not json");
-    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, "v1-broken"));
-    try testing.expectEqualStrings("session.json is not valid JSON", t.store.conversionProblem().?);
-    try testing.expect(V1Home.exists(&t, "v1-broken") and V1Home.exists(&t, "v1-broken-kid"));
 }
 
 test "a v1 profile an old release left readable by others converts (D61)" {
@@ -6399,18 +8098,19 @@ test "a v1 profile an old release left readable by others converts (D61)" {
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-open", &.{assistantTurn("q", "a")});
-    for ([_][]const u8{ ".fx", ".fx/sessions", ".fx/sessions/v1-open" }) |path| {
+    const roots = try v1.fixture("plain", 1);
+    const v1_open_id = roots[0];
+    for ([_][]const u8{ ".fx", ".fx/sessions", try v1.sessionPath(v1_open_id, "") }) |path| {
         var dir = try t.tmp.dir.openDir(io, path, .{});
         defer dir.close(io);
         dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
     }
-    const s = try openConverted(&t, "v1-open");
+    const s = try openConverted(&t, v1_open_id);
     defer s.close();
     var restored = try s.restore(alloc);
     defer restored.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), restored.history.len);
-    try testing.expect(!V1Home.exists(&t, "v1-open"));
+    try testing.expect(!V1Home.exists(&t, v1_open_id));
 }
 
 /// A legacy relationship-index page naming `child` in its first slot.
@@ -6439,28 +8139,231 @@ test "a schema 3 family converts its children from the relationship index, with 
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-old-root", &.{assistantTurn("q", "a")});
-    {
-        var writer = try v1.startAs("v1-old-kid", true);
-        defer writer.deinit(alloc);
-        try writer.conversation_writer.appendHistoryTurn(alloc, 2_000, assistantTurn("child task", "child answer"));
-    }
+    // A family whose root keeps no registry, so its child comes from the
+    // older relationship index.
+    const ids = try v1.fixture("family", 2);
+    const old_root = ids[0];
+    const old_kid = ids[1];
+    try t.tmp.dir.deleteFile(io_mod.getIo(), try v1.sessionPath(old_root, "subagent/children.json"));
     const header = try relationship_index_codec.encodeHeader(alloc, .{ .high_watermark = 1, .active_count = 1 });
     defer alloc.free(header);
-    try v1.put("v1-old-root", "subagent", "relationship-index.bin", header);
-    const page = try relationshipPage(alloc, "v1-old-kid");
+    try v1.put(old_root, "subagent", "relationship-index.bin", header);
+    const page = try relationshipPage(alloc, old_kid);
     defer alloc.free(page);
-    try v1.put("v1-old-root", "subagent", &relationship_index_codec.pageFileName(0), page);
+    try v1.put(old_root, "subagent", &relationship_index_codec.pageFileName(0), page);
 
-    const s = try openConverted(&t, "v1-old-root");
+    const s = try openConverted(&t, old_root);
     defer s.close();
     var st = try s.handle.state(alloc);
     defer st.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), st.children.items.len);
-    var kid = try t.store.manager.peek(alloc, "v1-old-kid");
+    var kid = try t.store.manager.peek(alloc, old_kid);
     defer kid.deinit(alloc);
-    try testing.expectEqualStrings("v1-old-root", kid.parent.?);
-    try testing.expect(!V1Home.exists(&t, "v1-old-root") and !V1Home.exists(&t, "v1-old-kid"));
+    try testing.expectEqualStrings(old_root, kid.parent.?);
+    try testing.expect(!V1Home.exists(&t, old_root) and !V1Home.exists(&t, old_kid));
+}
+
+test "a v1 family converts together: its children first, and one whose folder is gone recorded lost (D33, D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // The root and its first child; the registry also names a second child,
+    // whose folder is gone.
+    const ids = try v1.fixture("family", 2);
+    const parent = ids[0];
+    const kid = ids[1];
+
+    // A v1 child opens only through its parent.
+    try testing.expectError(error.SessionNotFound, openConverted(&t, kid));
+    const s = try openConverted(&t, parent);
+    defer s.close();
+    var st = try s.handle.state(alloc);
+    defer st.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), st.children.items.len);
+    for (st.children.items) |child| {
+        const expected: sm.Outcome = if (std.mem.eql(u8, child.id, kid)) .ok else .lost;
+        try testing.expectEqual(expected, child.outcome.?);
+    }
+    var converted = try t.store.manager.peek(alloc, kid);
+    defer converted.deinit(alloc);
+    try testing.expectEqual(sm.Role.child, converted.role);
+    try testing.expectEqualStrings(parent, converted.parent.?);
+    try testing.expect(!V1Home.exists(&t, parent) and !V1Home.exists(&t, kid));
+}
+
+test "a child an earlier try published is reused as it is, its v1 folder kept once v1 changed it (D60, D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const ids = try v1.fixture("family", 3);
+    const root = ids[0];
+    const same = ids[1];
+    const changed_id = ids[2];
+    // A try that published the children and stopped before the root.
+    {
+        var v1_store = try session_store.Store.initReadOnlyFromHome(alloc, t.store.home, "/");
+        defer v1_store.deinit(alloc);
+        var locks = try v1_conversion.lockFamily(alloc, &v1_store, root, 0, &t.store.problem);
+        defer locks.release();
+        var c: Conversion = .{ .store = &t.store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
+        for (locks.members.items[1..]) |*member| {
+            var checked = try c.check(&v1_store, member, root, false, false);
+            const staged = try c.stage(&v1_store, &checked, member, .{ .child = .{ .parent = root, .instructions = null } });
+            defer staged.session.?.dropImport();
+            try staged.session.?.handle.publishImport();
+        }
+    }
+    // An older build changes one child since; a damaged one reads the same.
+    try v1.put(changed_id, null, "events.jsonl", "{ not json\n");
+
+    const s = try openConverted(&t, root);
+    defer s.close();
+    var changed = try t.store.manager.peek(alloc, changed_id);
+    defer changed.deinit(alloc);
+    try testing.expectEqual(sm.Role.child, changed.role);
+    try testing.expect(V1Home.exists(&t, changed_id));
+    try testing.expect(!V1Home.exists(&t, same) and !V1Home.exists(&t, root));
+}
+
+test "a child an earlier try published keeps its v1 folder when that try left a file of it out (D60, D62)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const ids = try v1.fixture("family", 2);
+    const root = ids[0];
+    const child = ids[1];
+    {
+        var commands = try t.tmp.dir.createDirPathOpen(io, try v1.sessionPath(child, "logs/commands"), .{});
+        defer commands.close(io);
+        var file = try commands.createFile(io, "replay.bin", .{});
+        defer file.close(io);
+        // Sparse: no disk for the hole.
+        try file.setLength(io, sm.max_blob_bytes + 1);
+    }
+    // A try that published the child, leaving the file out, and stopped
+    // before the root.
+    {
+        var v1_store = try session_store.Store.initReadOnlyFromHome(alloc, t.store.home, "/");
+        defer v1_store.deinit(alloc);
+        var locks = try v1_conversion.lockFamily(alloc, &v1_store, root, 0, &t.store.problem);
+        defer locks.release();
+        var c: Conversion = .{ .store = &t.store, .alloc = alloc, .host = .ask, .started = io_mod.nanoTimestamp() };
+        defer c.deinit();
+        var checked = try c.check(&v1_store, &locks.members.items[1], root, false, false);
+        const staged = try c.stage(&v1_store, &checked, &locks.members.items[1], .{ .child = .{ .parent = root, .instructions = null } });
+        defer staged.session.?.dropImport();
+        try staged.session.?.handle.publishImport();
+        try testing.expect(staged.keeps);
+    }
+
+    var told: std.ArrayList(u8) = .empty;
+    defer told.deinit(alloc);
+    t.store.notice = .{ .context = &told, .emit = struct {
+        fn emit(context: ?*anyopaque, text: []const u8) void {
+            const out: *std.ArrayList(u8) = @ptrCast(@alignCast(context.?));
+            out.appendSlice(testing.allocator, text) catch {};
+        }
+    }.emit };
+    const s = try openConverted(&t, root);
+    defer s.close();
+    try testing.expect(!V1Home.exists(&t, root));
+    const stat = try t.tmp.dir.statFile(io, try v1.sessionPath(child, "logs/commands/replay.bin"), .{});
+    try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), stat.size);
+    // The open names what the earlier try left out, as that try would have.
+    var expected: [320]u8 = undefined;
+    try testing.expect(std.mem.find(u8, told.items, try std.mem.print(&expected, "converted without logs/commands/replay.bin of its subagent {s} because", .{child})) != null);
+
+    // fx sessions convert names the kept folder and what it keeps.
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(child, report.kept_children[0].id);
+    try testing.expectEqualStrings("fx converted it already without logs/commands/replay.bin, so this folder keeps it", report.kept_children[0].reason);
+    // fx doctor counts that folder, though its root's folder is gone.
+    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    defer doctor_report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), doctor_report.keeps_left_out);
+}
+
+test "a v1 session whose session.json is damaged names that file, whatever registry it has (D61)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const ids = try v1.fixture("family", 2);
+    try v1.put(ids[0], null, "session.json", "{ not json");
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, ids[0]));
+    try testing.expectEqualStrings("session.json is not valid JSON", t.store.conversionProblem().?);
+    try testing.expect(V1Home.exists(&t, ids[0]) and V1Home.exists(&t, ids[1]));
+}
+
+test "a root with a registry converts its children from it, never from a relationship index too (D61)" {
+    const alloc = testing.allocator;
+    const relationship_index_codec = @import("session_relationship_index_codec.zig");
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const ids = try v1.fixture("family", 3);
+    const both = ids[0];
+    const listed_kid = ids[1];
+    const indexed_kid = ids[2];
+    // The registry keeps only the first child; the index names the second.
+    const a = v1.arena.allocator();
+    var registry = try std.json.parseFromSliceLeaky(std.json.Value, a, try v1.file(both, "subagent", "children.json"), .{});
+    const children = &registry.object.getPtr("children").?.array;
+    var kept: usize = 0;
+    for (children.items) |child| if (!std.mem.eql(u8, child.object.get("id").?.string, indexed_kid)) {
+        children.items[kept] = child;
+        kept += 1;
+    };
+    children.shrinkRetainingCapacity(kept);
+    try v1.put(both, "subagent", "children.json", try std.json.Stringify.valueAlloc(a, registry, .{}));
+    const header = try relationship_index_codec.encodeHeader(alloc, .{ .high_watermark = 1, .active_count = 1 });
+    defer alloc.free(header);
+    try v1.put(both, "subagent", "relationship-index.bin", header);
+    const page = try relationshipPage(alloc, indexed_kid);
+    defer alloc.free(page);
+    try v1.put(both, "subagent", &relationship_index_codec.pageFileName(0), page);
+
+    (try openConverted(&t, both)).close();
+    var listed = try t.store.manager.peek(alloc, listed_kid);
+    listed.deinit(alloc);
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, indexed_kid));
+    try testing.expect(V1Home.exists(&t, indexed_kid));
+}
+
+test "the sweep drops what an earlier try staged for a child whose folder is gone since (D61)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const ids = try v1.fixture("family", 2);
+    const parent = ids[0];
+    const went = ids[1];
+    const staging = try t.store.manager.openImport(.{ .id = went, .workspace = "/w", .host = .ask, .role = .child, .parent = parent, .created_ms = 1 });
+    // An import's staging appears with its first blob.
+    _ = try staging.putBlob("staged before the folder went");
+    staging.release();
+    try t.tmp.dir.deleteTree(io_mod.getIo(), try v1.sessionPath(went, ""));
+    const staged = try std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", "v2", ".tmp", went });
+    _ = try t.tmp.dir.statFile(io_mod.getIo(), staged, .{});
+
+    (try openConverted(&t, parent)).close();
+    try testing.expectError(error.FileNotFound, t.tmp.dir.statFile(io_mod.getIo(), staged, .{}));
 }
 
 test "a stored result that kept only its preview replays as v1 shows it: wrapped with its handle" {
@@ -6510,8 +8413,6 @@ test "an older format's inline result converts as v1's migration stores it: unde
     var steps: [1]types.ToolExecutionStep = undefined;
     const text = try session_json.renderSessionJson(alloc, "v1-inline", 10, 20, types.ConversationLanguage.default(), "/w", &.{toolTurn("run it", &results, &steps)}, .{});
     defer alloc.free(text);
-    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&v1.store.canonical_root.sessions.?, "v1-inline");
-    dir.close();
     try v1.put("v1-inline", null, "session.json", text);
 
     const s = try openConverted(&t, "v1-inline");
@@ -6537,9 +8438,10 @@ test "a refusal's reason is never shown for a later open (D61)" {
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-torn-once", &.{assistantTurn("q", "a")});
-    try v1.put("v1-torn-once", null, "events.jsonl", "{ not json\n");
-    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, "v1-torn-once"));
+    const roots = try v1.fixture("plain", 1);
+    const v1_torn_once_id = roots[0];
+    try v1.put(v1_torn_once_id, null, "events.jsonl", "{ not json\n");
+    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, v1_torn_once_id));
     try testing.expect(t.store.conversionProblem() != null);
     try testing.expectError(error.SessionNotFound, openConverted(&t, "nowhere"));
     try testing.expect(t.store.conversionProblem() == null);
@@ -6547,85 +8449,43 @@ test "a refusal's reason is never shown for a later open (D61)" {
 
 test "a v1 prompt image that cannot be read refuses the session, and one that is gone keeps its path (D61)" {
     const alloc = testing.allocator;
-    var t: TestHome = undefined;
-    try t.init();
-    defer t.deinit();
-    var v1 = try V1Home.init(&t);
-    defer v1.deinit();
-    var images = [_]types.ImageAttachment{.{ .id = 1, .path = @constCast("shot.png"), .media_type = @constCast("image/png"), .snapshot_path = @constCast("images/shot.bin") }};
-    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("look"), .images = &images }, .assistant = @constCast("seen") } };
-    try v1.session("v1-image-bad", &.{turn});
-    try v1.session("v1-image-gone", &.{turn});
-    // A folder where the image should be: not a lost snapshot, a fault.
-    var dir = (try io_mod.openVerifiedPrivateDirIfPresent(&v1.store.canonical_root.sessions.?, "v1-image-bad")).?;
-    defer dir.close();
-    try dir.dir.createDirPath(io_mod.getIo(), "images/shot.bin");
-
-    try testing.expectError(error.InvalidSessionFormat, openConverted(&t, "v1-image-bad"));
-    try testing.expectEqualStrings("images/shot.bin can't be read (ReadFailed)", t.store.conversionProblem().?);
-    try testing.expect(V1Home.exists(&t, "v1-image-bad"));
-
-    const s = try openConverted(&t, "v1-image-gone");
-    defer s.close();
-    var restored = try s.restore(alloc);
-    defer restored.deinit(alloc);
-    try testing.expectEqualStrings("images/shot.bin", restored.history[0].assistant.user.images[0].snapshot_path.?);
-}
-
-test "a root with a registry converts its children from it, never from a relationship index too (D61)" {
-    const alloc = testing.allocator;
-    const relationship_index_codec = @import("session_relationship_index_codec.zig");
-    var t: TestHome = undefined;
-    try t.init();
-    defer t.deinit();
-    var v1 = try V1Home.init(&t);
-    defer v1.deinit();
-    try v1.session("v1-both", &.{assistantTurn("q", "a")});
-    try v1Children(&v1, "v1-both", &.{"v1-listed-kid"});
-    {
-        var writer = try v1.startAs("v1-indexed-kid", true);
-        defer writer.deinit(alloc);
+    for ([_]enum { unreadable, gone }{ .unreadable, .gone }) |variant| {
+        var t: TestHome = undefined;
+        try t.init();
+        defer t.deinit();
+        var v1 = try V1Home.init(&t);
+        defer v1.deinit();
+        const id = (try v1.fixture("image", 1))[0];
+        const a = v1.arena.allocator();
+        const snapshot = try std.mem.concat(a, u8, &.{ "images/", try v1.only(id, "images") });
+        const on_disk = try v1.sessionPath(id, snapshot);
+        try t.tmp.dir.deleteFile(io_mod.getIo(), on_disk);
+        switch (variant) {
+            .unreadable => {
+                // A folder where the image should be: not a lost snapshot, a fault.
+                try t.tmp.dir.createDirPath(io_mod.getIo(), on_disk);
+                try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+                // Refused at the open: never read through anything but a regular file.
+                try testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ snapshot, " can't be read (DurablePathUnsafe)" }), t.store.conversionProblem().?);
+                try testing.expect(V1Home.exists(&t, id));
+            },
+            .gone => {
+                const s = try openConverted(&t, id);
+                defer s.close();
+                var restored = try s.restore(alloc);
+                defer restored.deinit(alloc);
+                try testing.expectEqualStrings(snapshot, restored.history[0].assistant.user.images[0].snapshot_path.?);
+            },
+        }
     }
-    const header = try relationship_index_codec.encodeHeader(alloc, .{ .high_watermark = 1, .active_count = 1 });
-    defer alloc.free(header);
-    try v1.put("v1-both", "subagent", "relationship-index.bin", header);
-    const page = try relationshipPage(alloc, "v1-indexed-kid");
-    defer alloc.free(page);
-    try v1.put("v1-both", "subagent", &relationship_index_codec.pageFileName(0), page);
-
-    (try openConverted(&t, "v1-both")).close();
-    var listed = try t.store.manager.peek(alloc, "v1-listed-kid");
-    listed.deinit(alloc);
-    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, "v1-indexed-kid"));
-    try testing.expect(V1Home.exists(&t, "v1-indexed-kid"));
-}
-
-test "the sweep drops what an earlier try staged for a child whose folder is gone since (D61)" {
-    var t: TestHome = undefined;
-    try t.init();
-    defer t.deinit();
-    var v1 = try V1Home.init(&t);
-    defer v1.deinit();
-    try v1.session("v1-parent", &.{assistantTurn("q", "a")});
-    try v1Children(&v1, "v1-parent", &.{"v1-went"});
-    const staging = try t.store.manager.openImport(.{ .id = "v1-went", .workspace = "/w", .host = .ask, .role = .child, .parent = "v1-parent", .created_ms = 1 });
-    // An import's staging appears with its first blob.
-    _ = try staging.putBlob("staged before the folder went");
-    staging.release();
-    try t.tmp.dir.deleteTree(io_mod.getIo(), ".fx/sessions/v1-went");
-    _ = try t.tmp.dir.statFile(io_mod.getIo(), ".fx/sessions/v2/.tmp/v1-went", .{});
-
-    (try openConverted(&t, "v1-parent")).close();
-    try testing.expectError(error.FileNotFound, t.tmp.dir.statFile(io_mod.getIo(), ".fx/sessions/v2/.tmp/v1-went", .{}));
 }
 
 test "a new session never takes an id v1's folder could not be checked for (D61)" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
-    var v1 = try V1Home.init(&t);
-    defer v1.deinit();
     const io = io_mod.getIo();
+    try t.tmp.dir.createDirPath(io, ".fx/sessions");
     var sessions = try t.tmp.dir.openDir(io, ".fx/sessions", .{});
     defer sessions.close(io);
     sessions.setPermissions(io, .fromMode(0o000)) catch return error.SkipZigTest;
@@ -6641,9 +8501,9 @@ test "a v1 folder whose kind cannot be told stays listed and is reported unreada
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    try v1.session("v1-fine", &.{assistantTurn("q", "a")});
-    try v1.session("v1-unknown", &.{assistantTurn("q", "a")});
-    try v1.put("v1-unknown", null, "session.json", "{ not json");
+    const roots = try v1.fixture("plain", 2);
+    const v1_unknown_id = roots[1];
+    try v1.put(v1_unknown_id, null, "session.json", "{ not json");
 
     var cancel = std.atomic.Value(bool).init(false);
     var list = try listSummaries(&t.store, alloc, null, &cancel);
@@ -6657,7 +8517,7 @@ test "a v1 folder whose kind cannot be told stays listed and is reported unreada
     defer report.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), report.converted);
     try testing.expectEqual(@as(usize, 1), report.unreadable);
-    try testing.expectEqualStrings("v1-unknown", report.skipped.items[0].id);
+    try testing.expectEqualStrings(v1_unknown_id, report.skipped.items[0].id);
     try testing.expectEqualStrings("session.json is not valid JSON", report.skipped.items[0].reason.?);
 }
 
@@ -6675,8 +8535,6 @@ test "a legacy session larger than the current format's metadata converts (D61)"
     const text = try session_json.renderSessionJson(alloc, "v1-big-legacy", 10, 20, types.ConversationLanguage.default(), "/w", &.{assistantTurn("old question", long_answer)}, .{});
     defer alloc.free(text);
     try testing.expect(text.len > session_codec.max_session_metadata_bytes);
-    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&v1.store.canonical_root.sessions.?, "v1-big-legacy");
-    dir.close();
     try v1.put("v1-big-legacy", null, "session.json", text);
 
     var report = try convertAll(&t.store, alloc);
@@ -6689,7 +8547,7 @@ test "a legacy session larger than the current format's metadata converts (D61)"
     try testing.expectEqual(long_answer.len, restored.history[0].assistant.assistant.len);
 }
 
-test "a v1 side file larger than one v2 blob is left out and named, and the rest of its session converts and continues (D62)" {
+test "a v1 side file larger than one v2 blob is left out and named, its v1 folder keeps it, and the rest of its session converts and continues (D62)" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();
     var t: TestHome = undefined;
@@ -6697,10 +8555,9 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
     defer t.deinit();
     var v1 = try V1Home.init(&t);
     defer v1.deinit();
-    for ([_][]const u8{ "v1-huge", "v1-huge-all" }) |id| {
-        try v1.session(id, &.{assistantTurn("q", "a")});
-        var path: [64]u8 = undefined;
-        var commands = try t.tmp.dir.createDirPathOpen(io, try std.mem.print(&path, ".fx/sessions/{s}/logs/commands", .{id}), .{});
+    const roots = try v1.fixture("plain", 2);
+    for (roots) |id| {
+        var commands = try t.tmp.dir.createDirPathOpen(io, try v1.sessionPath(id, "logs/commands"), .{});
         defer commands.close(io);
         try commands.writeFile(io, .{ .sub_path = "small.bin", .data = "kept", .flags = .{ .permissions = .fromMode(0o600) } });
         var file = try commands.createFile(io, "replay.bin", .{});
@@ -6718,10 +8575,10 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
     }.emit };
 
     // Opened: the host is told what was left out.
-    const s = try openConverted(&t, "v1-huge");
+    const s = try openConverted(&t, roots[0]);
     defer s.close();
-    var expected: [256]u8 = undefined;
-    try testing.expectEqualStrings(try std.mem.print(&expected, "This session was converted without logs/commands/replay.bin, which is {d} bytes, more than the {d} the new store keeps in one file.", .{ sm.max_blob_bytes + 1, sm.max_blob_bytes }), told.items);
+    var expected: [320]u8 = undefined;
+    try testing.expectEqualStrings(try std.mem.print(&expected, "This session was converted without logs/commands/replay.bin because it is {d} bytes, more than the {d} the new store keeps in one file. Its earlier folder ~/.fx/sessions/{s} keeps it.", .{ sm.max_blob_bytes + 1, sm.max_blob_bytes, roots[0] }), told.items);
     try testing.expect(s.host.moved.get("logs/commands/small.bin") != null);
     try testing.expect(s.host.moved.get("logs/commands/replay.bin") == null);
     try s.commitTurn(assistantTurn("next", "reply"), types.ConversationLanguage.default());
@@ -6736,10 +8593,24 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
     try testing.expectEqual(@as(usize, 0), report.skipped.items.len);
     try testing.expectEqual(@as(usize, 1), report.left_out.items.len);
     const left = report.left_out.items[0];
-    try testing.expectEqualStrings("v1-huge-all", left.id);
-    try testing.expectEqualStrings("v1-huge-all", left.file.member);
+    try testing.expectEqualStrings(roots[1], left.id);
+    try testing.expectEqualStrings(roots[1], left.file.member);
     try testing.expectEqualStrings("logs/commands/replay.bin", left.file.file);
     try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), left.file.bytes);
+
+    // Each v1 folder keeps the file it alone holds, and a later run, whose
+    // cleanup removes a converted session's v1 folder, keeps it too, by
+    // what the copy recorded: even once the file is small enough.
+    var small = try t.tmp.dir.openFile(io, try v1.sessionPath(roots[0], "logs/commands/replay.bin"), .{ .mode = .read_write });
+    try small.setLength(io, 1);
+    small.close(io);
+    var again = try convertAll(&t.store, alloc);
+    defer again.deinit(alloc);
+    for (roots) |id| try testing.expect(V1Home.exists(&t, id));
+    try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), (try t.tmp.dir.statFile(io, try v1.sessionPath(roots[1], "logs/commands/replay.bin"), .{})).size);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    defer doctor_report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
 }
 
 test "only the adapter imports the session manager" {

@@ -3464,6 +3464,16 @@ fn streamReplaySafe(
     return stream_ctx.interruption_source_or("").len == 0 and !stream_ctx.saw_tool_start;
 }
 
+/// Whether the current attempt has shown no output. A provider refuses a
+/// request for its size before any output, so a reply an earlier attempt
+/// streamed, such as one restored when a turn resumes, does not make sending
+/// it again with fewer images unsafe.
+fn attemptReplaySafe(
+    stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
+) bool {
+    return stream_ctx.raw_text.items.len == 0 and !stream_ctx.saw_tool_start;
+}
+
 const continue_response_recovery_prompt =
     "The previous response was interrupted. Restart that response from the beginning using the completed tool results above. Do not repeat completed tool actions.";
 const regenerate_tool_recovery_prompt =
@@ -3980,6 +3990,44 @@ fn persistRecoveryCheckpoint(
     tool_evidence: model_response_recovery.ToolEvidence,
     trace_ctx: TraceContext,
 ) !void {
+    try persistRecoveryCheckpointWithAction(
+        deps,
+        finalization,
+        job,
+        current_turn_messages,
+        assistant_source,
+        route_model,
+        requested_fast_mode,
+        fast_mode,
+        attempt_limit,
+        consumed_attempts,
+        outstanding_reservation,
+        cause,
+        checkpointAction(strategy),
+        tool_evidence,
+        trace_ctx,
+    );
+}
+
+/// Persists a recovery checkpoint whose action the caller already knows,
+/// such as a finished final reply that recovery must deliver as saved.
+fn persistRecoveryCheckpointWithAction(
+    deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    assistant_source: []const u8,
+    route_model: []const u8,
+    requested_fast_mode: bool,
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    outstanding_reservation: bool,
+    cause: model_response_recovery.FailureCause,
+    action: types.ModelRecoveryAction,
+    tool_evidence: model_response_recovery.ToolEvidence,
+    trace_ctx: TraceContext,
+) !void {
     if (deps.recovery_checkpoint == null and deps.append_turn_piece == null) return;
     // Every sink copies or serializes the borrowed checkpoint synchronously.
     // Retaining these full-history reconstructions in the turn arena is quadratic.
@@ -4001,7 +4049,7 @@ fn persistRecoveryCheckpoint(
         .assistant_source = @constCast(assistant_source),
         .execution = projected,
         .cause = checkpointCause(cause),
-        .action = checkpointAction(strategy),
+        .action = action,
         .tool_state = checkpointToolState(tool_evidence),
         .authority = .{
             .provider = job.provider,
@@ -4033,9 +4081,57 @@ fn persistRecoveryCheckpoint(
             attempt_limit,
             if (outstanding_reservation) "true" else "false",
             @tagName(cause),
-            @tagName(strategy orelse .retry_request),
+            @tagName(action),
         },
     );
+}
+
+/// Saves the reply a turn is about to end with, so a crash before the turn's
+/// end is stored resumes by delivering it instead of asking the model again.
+/// Called only once nothing can go on with the turn: every check of the reply
+/// passed, and no steer, subagent, or stop hook continues it.
+fn persistFinalReplyCheckpoint(
+    deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    reply: []const u8,
+    route_model: []const u8,
+    requested_fast_mode: bool,
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    cause: model_response_recovery.FailureCause,
+    trace_ctx: TraceContext,
+) !void {
+    if (std.mem.trim(u8, reply, " \t\r\n").len == 0) return;
+    try persistRecoveryCheckpointWithAction(
+        deps,
+        finalization,
+        job,
+        current_turn_messages,
+        reply,
+        route_model,
+        requested_fast_mode,
+        fast_mode,
+        attempt_limit,
+        consumed_attempts,
+        false,
+        cause,
+        .delivering_response,
+        .none,
+        trace_ctx,
+    );
+}
+
+/// A checkpoint `persistFinalReplyCheckpoint` saved holds the reply its turn
+/// was ending with. Recovery delivers it as the turn's reply instead of
+/// asking the model again (`tests/tla/durable/Resumption.tla`
+/// `SavedAnswerNotRequested`).
+fn deliversSavedResponse(checkpoint: session_codec.RecoveryCheckpoint) bool {
+    return checkpoint.action == .delivering_response and
+        checkpoint.tool_state == .none and
+        std.mem.trim(u8, checkpoint.assistant_source, " \t\r\n").len > 0;
 }
 
 /// The running turn, saved just before automatic compaction sends anything
@@ -4536,24 +4632,24 @@ test "context overflow recovery is typed safe and bounded" {
     ));
 }
 
-/// Size retries allowed in one turn. Each lowers the learned limit, so the
-/// next request leaves out more of its oldest images.
-const max_request_size_retries: u8 = 2;
-
-/// A size rejection is retried without compaction only when the rejected
-/// request carried images the next one can leave out. Anything else falls
-/// through to context overflow recovery.
+/// A size rejection is retried without compaction while the rejected request
+/// carried images, and fewer than the request refused before it, if any.
+/// Each retry lowers the learned limit below the size just refused, which
+/// only leaving out more images can meet, so the count falls with every
+/// retry and the retries end. Anything else falls through to context
+/// overflow recovery.
 fn shouldRetryWithFewerImages(
     failure: agent_stream_provider.Failure,
     images_sent: usize,
-    retries_used: u8,
+    images_last_refused: ?usize,
     replay_safe: bool,
     cancelled: bool,
 ) bool {
+    const fewer = if (images_last_refused) |last| images_sent < last else true;
     return !cancelled and
         replay_safe and
         images_sent > 0 and
-        retries_used < max_request_size_retries and
+        fewer and
         failure.kind == .request_too_large;
 }
 
@@ -4572,11 +4668,12 @@ fn fitRequestImages(
     first_body: []const u8,
     limits: request_image_budget.Limits,
     tool_text_limit: usize,
+    blob_dir: ?[]const u8,
     trace_ctx: TraceContext,
 ) ![]const u8 {
     var body = first_body;
     while (true) {
-        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit);
+        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit, blob_dir);
         if (projection.withheld == 0) return body;
         var smaller = request.*;
         smaller.messages = projection.messages;
@@ -4601,15 +4698,20 @@ test "size rejections retry with fewer images only while images remain" {
     const cases = [_]struct {
         failure: agent_stream_provider.Failure,
         images_sent: usize = 3,
-        retries_used: u8 = 0,
+        images_last_refused: ?usize = null,
         replay_safe: bool = true,
         cancelled: bool = false,
         expected: bool,
     }{
         .{ .failure = too_large, .expected = true },
-        .{ .failure = too_large, .retries_used = max_request_size_retries - 1, .expected = true },
-        .{ .failure = too_large, .retries_used = max_request_size_retries, .expected = false },
+        // Any number of retries, while each leaves out more images.
+        .{ .failure = too_large, .images_sent = 3, .images_last_refused = 5, .expected = true },
+        .{ .failure = too_large, .images_sent = 1, .images_last_refused = 2, .expected = true },
+        // One that left out none stops, so the retries always end.
+        .{ .failure = too_large, .images_sent = 3, .images_last_refused = 3, .expected = false },
+        .{ .failure = too_large, .images_sent = 4, .images_last_refused = 3, .expected = false },
         .{ .failure = too_large, .images_sent = 0, .expected = false },
+        .{ .failure = too_large, .images_sent = 0, .images_last_refused = 1, .expected = false },
         .{ .failure = too_large, .replay_safe = false, .expected = false },
         .{ .failure = too_large, .cancelled = true, .expected = false },
         .{ .failure = overflow_text, .expected = false },
@@ -4617,7 +4719,7 @@ test "size rejections retry with fewer images only while images remain" {
     for (cases) |case| try std.testing.expectEqual(case.expected, shouldRetryWithFewerImages(
         case.failure,
         case.images_sent,
-        case.retries_used,
+        case.images_last_refused,
         case.replay_safe,
         case.cancelled,
     ));
@@ -7137,12 +7239,48 @@ fn processQueuedPromptLoop(
 
         if (restore_recovery_source) {
             const checkpoint = job.recovery_checkpoint.?;
+            restore_recovery_source = false;
+            // The reply finished before the turn was saved as done: deliver
+            // it as saved. A steer that arrived, or a stop hook still to run,
+            // means the turn goes on, so those cases restart as before.
+            if (deliversSavedResponse(checkpoint) and steering_action == .none and
+                (!lifecycle.view.hasStop() or stop_state.dispatched))
+            {
+                debug_trace.eventf(
+                    "agent",
+                    "recovery_delivered_saved_response",
+                    step_ctx,
+                    "bytes={d}",
+                    .{checkpoint.assistant_source.len},
+                );
+                // A host that already holds the reply got its closing newline
+                // too; one that holds none of the turn gets both now.
+                try stream_ctx.restoreRecoverySource(
+                    checkpoint.assistant_source,
+                    job.recovery_source_already_presented,
+                );
+                if (!job.recovery_source_already_presented) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                try finishCommonAssistantTerminal(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    .{ .history = checkpoint.assistant_source },
+                    .completed,
+                    null,
+                    &finish_trace,
+                    "recovered_assistant",
+                    .{ .role = .assistant, .content = checkpoint.assistant_source },
+                );
+                return;
+            }
             try stream_ctx.restoreRecoverySource(
                 checkpoint.assistant_source,
                 job.recovery_source_already_presented,
             );
             try stream_ctx.beginRecoveryAttempt();
-            restore_recovery_source = false;
         }
 
         var advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
@@ -7160,7 +7298,9 @@ fn processQueuedPromptLoop(
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
-        var request_size_retries: u8 = 0;
+        var request_size_retries: usize = 0;
+        // The images the last request refused for its size carried.
+        var request_images_last_refused: ?usize = null;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
         defer {
@@ -7354,11 +7494,12 @@ fn processQueuedPromptLoop(
                     subagent_request_messages.len,
                 });
             }
-            const result_request_messages = try project_read_tool_result_request_messages(
+            // Images the session dropped leave every request as notes.
+            const result_request_messages = try image_attachments.withholdDroppedImages(overlay_arena, try project_read_tool_result_request_messages(
                 overlay_arena,
                 read_tool_result_request_eligible,
                 subagent_request_messages,
-            );
+            ));
             if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
                 for (result_request_messages) |message| {
                     const memory = message.tool_result_memory orelse continue;
@@ -7378,13 +7519,20 @@ fn processQueuedPromptLoop(
                     &attachment_dimensions,
                     safe_tool_messages,
                     max_dimension,
+                    deps.image_blob_dir,
                 );
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
-            if (request_messages.ptr != image_projection.messages.ptr) {
-                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
+            // Saved turns keep steering without its envelope; the model gets it
+            // back as the live update it saw when the turn took it.
+            const steering_messages = try runtime_execution_memory.rewrapRestoredSteering(overlay_arena, image_projection.messages);
+            // After the steering rewrap, which recognizes a parent's steering
+            // by how its text starts.
+            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages, deps.image_blob_dir);
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
+            if (request_messages.ptr != located_messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
             }
             // Tool images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. Tell the user
@@ -7438,6 +7586,21 @@ fn processQueuedPromptLoop(
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
+            // The request re-sends every image the session keeps, and
+            // building it whole would hold all of them, encoded, at once.
+            // Images that pass every limit by their own size leave before the
+            // build; `fitRequestImages` fits the rest to this model's limit.
+            const past_limit = try request_image_budget.withholdImagesPastLimit(
+                overlay_arena,
+                request_data.messages,
+                request_image_budget.largestRequestBytes(agent.requestByteLimit(gateway_model)),
+                config.max_tool_result_bytes,
+                deps.image_blob_dir,
+            );
+            if (past_limit.withheld > 0) {
+                debug_trace.eventf("images", "request_images_withheld_before_build", step_ctx, "withheld={d}", .{past_limit.withheld});
+                request_data.messages = past_limit.messages;
+            }
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
@@ -7450,8 +7613,12 @@ fn processQueuedPromptLoop(
                     deps.agent_stream_provider,
                     &request_data,
                     built_request_body,
-                    .{ .max_request_bytes = agent.requestByteLimit(gateway_model) orelse request_image_budget.default_max_request_bytes },
+                    .{ .max_request_bytes = request_image_budget.maxRequestBytes(
+                        agent.requestByteLimit(gateway_model),
+                        deps.agent_stream_provider.max_request_bytes,
+                    ) },
                     config.max_tool_result_bytes,
+                    deps.image_blob_dir,
                     step_ctx,
                 );
                 prepared_request_body = request_body;
@@ -7614,7 +7781,14 @@ fn processQueuedPromptLoop(
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
                             .steering = finalization.compacted_execution.steering + active_cut.steering,
                         };
-                        if (overflow_pending) context_overflow_recovery = .used;
+                        if (overflow_pending) {
+                            context_overflow_recovery = .used;
+                            // The shorter history can fit more images than the
+                            // request last refused for its size carried, so size
+                            // retries count again from the next refusal. This
+                            // happens once per step, so the retries still end.
+                            request_images_last_refused = null;
+                        }
                         compactor.traceEvent(
                             step_ctx,
                             .installed,
@@ -8261,12 +8435,13 @@ fn processQueuedPromptLoop(
                 if (request_cost_for_attempt) |rejected| if (shouldRetryWithFewerImages(
                     failure,
                     request_images_for_attempt,
-                    request_size_retries,
-                    streamReplaySafe(&stream_ctx),
+                    request_images_last_refused,
+                    attemptReplaySafe(&stream_ctx),
                     config.cancel_flag.load(.seq_cst),
                 )) {
                     const limit = loweredRequestByteLimit(rejected.serialized_bytes);
                     agent.lowerRequestByteLimit(gateway_model, limit);
+                    request_images_last_refused = request_images_for_attempt;
                     request_size_retries += 1;
                     debug_trace.eventf("images", "request_size_retry", step_ctx, "model={s} rejected_bytes={d} images_sent={d} limit_bytes={d} retry={d}", .{
                         gateway_model,
@@ -9530,6 +9705,20 @@ fn processQueuedPromptLoop(
                 );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
+                if (has_content and disposition == .completed) try persistFinalReplyCheckpoint(
+                    deps,
+                    finalization,
+                    job,
+                    within_turn_suffix.items,
+                    persisted_text.history,
+                    gateway_model,
+                    selected_fast_mode,
+                    route_fast_mode,
+                    semantic_limit,
+                    semantic_attempt + 1,
+                    recovery_cause,
+                    step_ctx,
+                );
                 try finishCommonAssistantTerminal(
                     deps,
                     finalization,
@@ -10858,6 +11047,13 @@ fn processQueuedPromptLoop(
                                     prepared_terminal.memory,
                                     null,
                                     advertised_dynamic_tool_names,
+                                );
+                                try runtime_tool_admission.recordRejectedToolCall(
+                                    deps,
+                                    arena,
+                                    tool_call,
+                                    safe_output,
+                                    null,
                                 );
                                 try runtime_tool_batch.appendToolResultContent(
                                     arena,
@@ -12349,6 +12545,20 @@ fn processQueuedPromptLoop(
                 );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
+                try persistFinalReplyCheckpoint(
+                    deps,
+                    finalization,
+                    job,
+                    within_turn_suffix.items,
+                    persisted_text.history,
+                    gateway_model,
+                    selected_fast_mode,
+                    route_fast_mode,
+                    semantic_limit,
+                    semantic_attempt + 1,
+                    recovery_cause,
+                    step_ctx,
+                );
                 try finishCommonAssistantTerminal(
                     deps,
                     finalization,

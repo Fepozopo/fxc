@@ -28,14 +28,6 @@ test "checkpoint-only summaries are resumable without changing turn counts" {
     try std.testing.expectEqual(@as(usize, 0), page.summaries.items[0].history_len);
 }
 
-pub fn freeSummaries(
-    alloc: Allocator,
-    sessions: *std.ArrayList(SessionSummary),
-) void {
-    for (sessions.items) |*summary| summary.deinit(alloc);
-    sessions.deinit(alloc);
-}
-
 pub fn cloneSessionSummary(
     alloc: Allocator,
     source: SessionSummary,

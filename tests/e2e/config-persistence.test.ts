@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -244,10 +245,10 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       const until = Date.now() + TIMEOUT;
       let committed = false;
       while (Date.now() < until) {
-        const root = join(fixture.home, ".fx", "sessions");
-        if (existsSync(root)) committed = readdirSync(root, { withFileTypes: true }).filter(entry => entry.isDirectory()).some(entry => {
-          const events = join(root, entry.name, "events.jsonl");
-          return existsSync(events) && readFileSync(events, "utf8").includes("provider summary");
+        // The summary is saved inline on the session's compaction line.
+        if (existsSync(storeRoot(fixture.home))) committed = savedSessionIds(fixture.home).some(id => {
+          const log = join(sessionDir(fixture.home, id), "log.jsonl");
+          return existsSync(log) && readFileSync(log, "utf8").includes("provider summary");
         });
         if (committed) break;
         await Bun.sleep(25);

@@ -3,6 +3,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { logLines, rootSessionIds, storeRoot } from "./saved-sessions";
 import {
   fakeGatewayFinalText,
   startDynamicFakeGateway,
@@ -58,17 +59,13 @@ function baseEnv(root: FixtureRoot, gateway: { baseUrl: string; chatUrl: string 
   };
 }
 
+/// Each saved session's title: its log's newest title setting.
 function sessionTitles(root: FixtureRoot): string[] {
-  const sessionsDir = join(root.home, ".fx", "sessions");
-  if (!existsSync(sessionsDir)) return [];
-  const titles: string[] = [];
-  for (const id of readdirSync(sessionsDir)) {
-    const manifest = join(sessionsDir, id, "session.json");
-    if (!existsSync(manifest)) continue;
-    const value = JSON.parse(readFileSync(manifest, "utf8"));
-    if (typeof value.title === "string") titles.push(value.title);
-  }
-  return titles;
+  if (!existsSync(storeRoot(root.home))) return [];
+  return rootSessionIds(root.home).flatMap((id) => {
+    const title = (logLines(root.home, id) as any[]).filter((line) => line.kind === "set" && line.key === "title").at(-1)?.value;
+    return typeof title === "string" ? [title] : [];
+  });
 }
 
 function titleRequests(gateway: ReturnType<typeof startTitleAwareGateway>) {
@@ -269,7 +266,7 @@ test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
   }
 }, 60_000);
 
-test.skipIf(SKIP_TMUX)("tui generates a title after an upgrade relaunch resumes an untitled session", async () => {
+test.skipIf(SKIP_TMUX)("tui generates a title in the fresh session an upgrade relaunch opens for a session that saved nothing", async () => {
   const root = createFixtureRoot("tui-upgrade-title", JSON.stringify({ statusLine: { session: true } }));
   const installDir = join(root.root, "install");
   mkdirSync(installDir);
@@ -298,17 +295,20 @@ test.skipIf(SKIP_TMUX)("tui generates a title after an upgrade relaunch resumes 
     await tui.sendHexBytes(["07"]);
     await tui.waitForStableComposer(15000);
 
-    // Pin the resume leg: the relaunch must resume the same session, not start
-    // a fresh one (a fresh session would title on the first prompt anyway).
-    const sessionId = readdirSync(join(root.home, ".fx", "sessions"))
-      .filter(name => name !== "latest")[0]!;
-    const relaunchArgv = readFileSync(argvLogPath, "utf8").trim().split("\n");
-    expect(relaunchArgv).toContain(`${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`);
+    // The relaunch hands over the session, which saved nothing without a
+    // turn (D2), so the new build opens a fresh session with the update's
+    // notice instead (D81).
+    const handed = readFileSync(argvLogPath, "utf8").trim().split("\n")
+      .map(line => line.split("\t"))
+      .find(args => args[0] === installedFx && args[1] === "resume" && args[3] === "--upgrade-relaunch");
+    expect(handed).toBeDefined();
+    await tui.waitForText("fx has been updated to ", 15000);
 
     await tui.sendText("refactor the renderer loop to fix the crash");
     await tui.waitForText("MAIN_ANSWER_OK", 20000);
     await tui.waitForText(GENERATED_TITLE, 15000);
     expect(sessionTitles(root)).toContain(GENERATED_TITLE);
+    expect(rootSessionIds(root.home)).not.toContain(handed![2]);
     expect(titleRequests(gateway).length).toBe(1);
   } finally {
     await tui?.kill();

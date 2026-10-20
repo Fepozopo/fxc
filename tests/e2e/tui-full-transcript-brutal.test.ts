@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -28,6 +27,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { stdoutFrames } from "./render-lab/tape";
+import { logLines, savedSessionIds, storeRoot } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const INPUT_SANITY_BUDGET_MS = 5_000;
@@ -134,23 +134,11 @@ function countOccurrences(text: string, needle: string): number {
 }
 
 function committedAssistantOccurrences(home: string, assistant: string): number {
-  const sessionsRoot = join(home, ".fx", "sessions");
-  let count = 0;
-  for (const entry of readdirSync(sessionsRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory() || entry.name === "latest") continue;
-    const eventsPath = join(sessionsRoot, entry.name, "events.jsonl");
-    if (!existsSync(eventsPath)) continue;
-    for (const line of readFileSync(eventsPath, "utf8").split("\n")) {
-      if (line.length === 0) continue;
-      const event = JSON.parse(line) as {
-        event?: { assistant?: { text?: string } };
-      };
-      if (event.event?.assistant?.text === assistant) {
-        count += 1;
-      }
-    }
-  }
-  return count;
+  if (!existsSync(storeRoot(home))) return 0;
+  return savedSessionIds(home).reduce((count, id) =>
+    count + logLines(home, id).filter((line: any) =>
+      line.kind === "item" && line.type === "assistant" && line.data?.text === assistant
+    ).length, 0);
 }
 
 function percentile(values: number[], fraction: number): number {

@@ -7,6 +7,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const io_mod = @import("../core/shared/io.zig");
+const select_watch = @import("../core/shared/select_watch.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
@@ -263,25 +264,6 @@ pub const ProviderAttemptOwner = enum {
     agent,
 };
 
-pub fn fetchGatewayJson(
-    alloc: std.mem.Allocator,
-    api_key: ?[]const u8,
-    gateway_team: ?[]const u8,
-    url: []const u8,
-) !GatewayJsonResult {
-    var result = try fetchGatewayGetAtUrl(alloc, api_key, gateway_team, url, e2e_gateway_models_url_env);
-    if (failedGatewayJsonStatus(result.status)) |status| {
-        result.deinit(alloc);
-        return .{ .http_status = status };
-    }
-
-    return .{ .success = result.body };
-}
-
-pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
-    return fetchGatewayGet(alloc, api_key, null, path, e2e_gateway_credits_url_env);
-}
-
 const usage_response_max_bytes: usize = 1024 * 1024;
 const usage_request_timeout_ms: i64 = 15_000;
 
@@ -391,18 +373,13 @@ const UsageGetOperation = struct {
     }
 };
 
-fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team: ?[]const u8, path: []const u8, e2e_url_env: []const u8) !GetResult {
+pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
     const default_url = try alloc.print("{s}{s}", .{ gatewayBaseUrl(), path });
     defer alloc.free(default_url);
+    const url = try resolveE2eGatewayUrl(e2e_gateway_credits_url_env, default_url);
 
-    return fetchGatewayGetAtUrl(alloc, api_key, gateway_team, default_url, e2e_url_env);
-}
-
-fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team: ?[]const u8, default_url: []const u8, e2e_url_env: []const u8) !GetResult {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-
-    const url = try resolveE2eGatewayUrl(e2e_url_env, default_url);
 
     var auth_header: ?[]u8 = null;
     defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
@@ -413,8 +390,6 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
         auth_header = try alloc.print("Bearer {s}", .{key});
         headers.authorization = .{ .override = auth_header.? };
     }
-    var extra_headers_buf: [1]std.http.Header = undefined;
-    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -423,7 +398,6 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
         .location = .{ .url = url },
         .method = .GET,
         .headers = headers,
-        .extra_headers = extra_headers,
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     });
@@ -444,8 +418,12 @@ pub fn fetchGatewayJsonCancellable(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_models_url_env, url);
-    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag);
+    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms);
 }
+
+/// A stalled catalog request fails with `error.Timeout` after this long, so a
+/// hung endpoint cannot hold a background refresh or an ACP options request.
+const gateway_json_fetch_timeout_ms: i64 = 30_000;
 
 fn fetchGatewayJsonAtUrlCancellable(
     alloc: std.mem.Allocator,
@@ -453,6 +431,7 @@ fn fetchGatewayJsonAtUrlCancellable(
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    timeout_ms: i64,
 ) !GatewayJsonResult {
     var operation = GatewayJsonFetchOperation{
         .alloc = alloc,
@@ -461,7 +440,11 @@ fn fetchGatewayJsonAtUrlCancellable(
         .url = url,
         .cancel_flag = cancel_flag,
     };
-    return runCancellableGatewayJsonFetch(alloc, cancel_flag, &operation);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(timeout_ms),
+    });
+    return runBoundedHttpOperation(GatewayJsonResult, alloc, cancel_flag, deadline, &operation);
 }
 
 const GatewayJsonFetchOperation = struct {
@@ -481,66 +464,6 @@ const GatewayJsonFetchOperation = struct {
         );
     }
 };
-
-fn runCancellableGatewayJsonFetch(
-    alloc: std.mem.Allocator,
-    cancel_flag: *std.atomic.Value(bool),
-    operation: *GatewayJsonFetchOperation,
-) !GatewayJsonResult {
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-
-    const Event = union(enum) {
-        request: anyerror!GatewayJsonResult,
-        watch: anyerror!BoundedRequestWatch.Outcome,
-    };
-    const Runner = struct {
-        fn run(value: *GatewayJsonFetchOperation) anyerror!GatewayJsonResult {
-            return value.run();
-        }
-    };
-    const Cleanup = struct {
-        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stopped.set(select.io);
-            while (select.cancel()) |item| switch (item) {
-                .request => |request_result| {
-                    var late_result = request_result catch continue;
-                    late_result.deinit(result_alloc);
-                },
-                .watch => {},
-            };
-        }
-    };
-
-    var watch: BoundedRequestWatch = .{};
-    var select_buffer: [2]Event = undefined;
-    var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, null }) catch |err| return err;
-    select.concurrent(.request, Runner.run, .{operation}) catch |err| {
-        watch.finish(&select);
-        return err;
-    };
-
-    const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select, &watch);
-        return err;
-    };
-    switch (event) {
-        .request => |request_result| {
-            watch.finish(&select);
-            if (cancel_flag.load(.seq_cst)) {
-                var result = request_result catch return error.Cancelled;
-                result.deinit(alloc);
-                return error.Cancelled;
-            }
-            return request_result;
-        },
-        .watch => |watch_result| {
-            Cleanup.drain(alloc, &select, &watch);
-            _ = try watch_result;
-            return error.Cancelled;
-        },
-    }
-}
 
 fn fetchGatewayJsonAtUrlCore(
     alloc: std.mem.Allocator,
@@ -611,16 +534,42 @@ fn fetchGatewayJsonAtUrlCore(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (failedGatewayJsonStatus(response.head.status)) |status| return .{ .http_status = status };
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
     var transfer_buffer: [64 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    _ = reader.streamRemaining(&out.writer) catch |err| {
+    const body = readGatewayJsonBody(alloc, response.reader(&transfer_buffer), max_gateway_json_bytes) catch |err| {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         return err;
     };
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    return .{ .success = try out.toOwnedSlice() };
+    if (cancel_flag.load(.seq_cst)) {
+        alloc.free(body);
+        return error.Cancelled;
+    }
+    return .{ .success = body };
+}
+
+/// About fifty times today's model catalog. A larger response fails rather
+/// than growing memory without bound.
+const max_gateway_json_bytes: usize = 16 * 1024 * 1024;
+
+/// Returns the caller-owned body, or `error.GatewayJsonResponseTooLarge` when
+/// it exceeds `max_bytes`.
+fn readGatewayJsonBody(alloc: std.mem.Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
+    return reader.allocRemaining(alloc, .limited(max_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => error.GatewayJsonResponseTooLarge,
+        else => |e| e,
+    };
+}
+
+test "gateway JSON bodies past the size cap fail instead of growing" {
+    var at_cap = std.Io.Reader.fixed("12345678");
+    const body = try readGatewayJsonBody(std.testing.allocator, &at_cap, 8);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("12345678", body);
+
+    var over_cap = std.Io.Reader.fixed("123456789");
+    try std.testing.expectError(
+        error.GatewayJsonResponseTooLarge,
+        readGatewayJsonBody(std.testing.allocator, &over_cap, 8),
+    );
 }
 
 fn failedGatewayJsonStatus(status: std.http.Status) ?std.http.Status {
@@ -1057,11 +1006,11 @@ fn openGatewayRequestBounded(
 
     const Event = union(enum) {
         request: anyerror!std.http.Client.Request,
-        watch: anyerror!BoundedRequestWatch.Outcome,
+        watch: anyerror!select_watch.Outcome,
     };
     const Cleanup = struct {
         fn drain(select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stopped.set(select.io);
+            watch.stop(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_request = request_result catch continue;
@@ -1082,7 +1031,7 @@ fn openGatewayRequestBounded(
     var watch: BoundedRequestWatch = .{};
     var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, epoch.deadline }) catch |err| return err;
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, select.io, RequestCondition{ .cancel_flag = cancel_flag, .deadline = epoch.deadline } }) catch |err| return err;
     select.concurrent(.request, RequestOpenOperation.run, .{&operation}) catch |err| {
         watch.finish(&select);
         return err;
@@ -2023,7 +1972,7 @@ pub fn runBoundedHttpOperation(
 
     const Event = union(enum) {
         request: anyerror!Result,
-        watch: anyerror!BoundedRequestWatch.Outcome,
+        watch: anyerror!select_watch.Outcome,
     };
     const Operation = @TypeOf(operation);
     const Runner = struct {
@@ -2033,7 +1982,7 @@ pub fn runBoundedHttpOperation(
     };
     const Cleanup = struct {
         fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stopped.set(select.io);
+            watch.stop(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_result = request_result catch continue;
@@ -2047,7 +1996,7 @@ pub fn runBoundedHttpOperation(
     var watch: BoundedRequestWatch = .{};
     var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(zio, &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, deadline }) catch |err| {
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, select.io, RequestCondition{ .cancel_flag = cancel_flag, .deadline = deadline } }) catch |err| {
         return err;
     };
     select.concurrent(.request, Runner.run, .{operation}) catch |err| {
@@ -2087,50 +2036,24 @@ pub fn runBoundedHttpOperation(
     }
 }
 
-/// Watches one bounded request for cancellation and its deadline. The request
-/// owner stops it with `finish` instead of cancelling it: in Zig 0.17 a cancel
-/// can interrupt whatever task the watch's worker thread runs next, and an
-/// interrupted connect then fails with ISCONN.
-const BoundedRequestWatch = struct {
-    stopped: std.Io.Event = .unset,
+/// Ends a bounded request's watch when its cancel flag is set or its deadline
+/// passes. The request owner stops the watch with `finish` when the request
+/// wins, as `select_watch` explains.
+const RequestCondition = struct {
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
 
-    const Outcome = enum { stopped, cancelled, deadline };
-
-    fn run(
-        watch: *BoundedRequestWatch,
-        cancel_flag: *std.atomic.Value(bool),
-        deadline: ?std.Io.Clock.Timestamp,
-    ) anyerror!Outcome {
-        const zio = io_mod.getIo();
-        while (true) {
-            if (cancel_flag.load(.seq_cst)) return .cancelled;
-            if (deadline) |limit| {
-                const now = std.Io.Clock.Timestamp.now(zio, .awake);
-                if (!std.Io.Clock.Timestamp.compare(now, .lt, limit)) return .deadline;
-            }
-            watch.stopped.waitTimeout(zio, .{ .duration = .{
-                .raw = .fromMilliseconds(5),
-                .clock = .awake,
-            } }) catch |err| switch (err) {
-                error.Timeout => continue,
-                else => |e| return e,
-            };
-            return .stopped;
-        }
+    pub fn cancelled(condition: RequestCondition) bool {
+        return condition.cancel_flag.load(.seq_cst);
     }
 
-    /// Stops the watch and waits for its event, then releases the select.
-    /// Call only when the watch event is the one still outstanding.
-    fn finish(watch: *BoundedRequestWatch, select: anytype) void {
-        watch.stopped.set(select.io);
-        const event = select.queue.getOneUncancelable(select.io) catch |err| switch (err) {
-            // Only Select.cancel closes the queue, so nothing is outstanding.
-            error.Closed => return,
-        };
-        std.debug.assert(event == .watch);
-        std.debug.assert(select.cancel() == null);
+    pub fn expired(condition: RequestCondition, io: std.Io) bool {
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        return !std.Io.Clock.Timestamp.compare(now, .lt, condition.deadline);
     }
 };
+
+const BoundedRequestWatch = select_watch.Watch(RequestCondition);
 
 const GatewayCancelWatcher = struct {
     fn run(
@@ -2210,23 +2133,6 @@ fn suspendGapDetected(previous: SuspendClockSample, current: SuspendClockSample)
     return boot_elapsed - awake_elapsed > suspend_gap_tolerance_ns;
 }
 
-pub fn spawnHttpCancelWatcher(
-    done: *std.atomic.Value(bool),
-    cancel_flag: *std.atomic.Value(bool),
-    stream: std.Io.net.Stream,
-) !std.Thread {
-    return spawn_gateway_cancel_watcher(done, cancel_flag, null, null, null, stream);
-}
-
-pub fn spawnHttpCancelWatcherBounded(
-    done: *std.atomic.Value(bool),
-    cancel_flag: *std.atomic.Value(bool),
-    deadline: std.Io.Clock.Timestamp,
-    stream: std.Io.net.Stream,
-) !std.Thread {
-    return spawn_gateway_cancel_watcher(done, cancel_flag, null, deadline, null, stream);
-}
-
 /// One shared concrete opener result so every backend reuses the same
 /// bounded-operation instantiation instead of specializing per file.
 pub const OpenedPost = struct {
@@ -2275,24 +2181,202 @@ pub fn openBoundedPost(
     return runBoundedHttpOperation(OpenedPost, alloc, cancel_flag, deadline, operation);
 }
 
-pub const CancelWatch = struct {
+/// Watches one provider request on its connection with the lifecycle the
+/// gateway path uses: cancellation, the caller deadline, the response-head
+/// wait, and, once the head commits, a response body that stops sending.
+/// Call `armHead` before waiting for the head, `commitHead` when it arrives,
+/// read the body through an `sse.Reader` given `progress`, pass a failed read
+/// to `failure`, and call `finish` after a complete response.
+pub const ConnectionWatch = struct {
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    state: ConnectedRequestWatch,
 
-    pub fn start(self: *CancelWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
-        self.done.store(false, .seq_cst);
-        self.thread = if (deadline) |limit|
-            try spawnHttpCancelWatcherBounded(&self.done, cancel, limit, connection)
-        else
-            try spawnHttpCancelWatcher(&self.done, cancel, connection);
+    pub fn init(timing: ResponseHeadTiming) ConnectionWatch {
+        return .{ .state = .init(timing) };
     }
 
-    pub fn stop(self: *CancelWatch) void {
+    /// The body stall window for a request. An agent stream, which has no
+    /// caller deadline, gets the gateway's agent window; a caller deadline
+    /// already bounds the whole request, so it gets none.
+    pub fn bodyStallTimeoutMs(deadline: ?std.Io.Clock.Timestamp) i64 {
+        if (deadline != null) return std.math.maxInt(i64);
+        if (builtin.is_test) {
+            if (test_body_stall_timeout_ms) |ms| return ms;
+        }
+        return agent_stream_stall_timeout_ms;
+    }
+
+    pub fn start(self: *ConnectionWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
+        self.done.store(false, .seq_cst);
+        self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, null, deadline, &self.state, connection);
+    }
+
+    /// Starts the response-head wait. An error names the cause that already
+    /// ended the request.
+    pub fn armHead(self: *ConnectionWatch) ?anyerror {
+        return self.state.arm_response_head();
+    }
+
+    /// Records the head and starts timing body silence.
+    pub fn commitHead(self: *ConnectionWatch) ?anyerror {
+        return self.state.commit_response_head();
+    }
+
+    /// Progress hook for the body's `sse.Reader`. Borrows `self`.
+    pub fn progress(self: *ConnectionWatch) sse.Progress {
+        return .{ .context = &self.state, .mark_fn = markProgress };
+    }
+
+    fn markProgress(context: *anyopaque) void {
+        const state: *ConnectedRequestWatch = @ptrCast(@alignCast(context));
+        state.markStreamProgress();
+    }
+
+    /// The error to report for a failed read: the watch's own cause, such as
+    /// `error.Timeout` or `error.StreamStalled`, when it closed the
+    /// connection, otherwise `err`.
+    pub fn failure(self: *ConnectionWatch, err: anyerror) anyerror {
+        return self.state.finish_error(err);
+    }
+
+    /// Ends the watch after a complete response. Returns the watch's cause
+    /// when it closed the connection first.
+    pub fn finish(self: *ConnectionWatch) ?anyerror {
+        return self.state.finish();
+    }
+
+    pub fn stop(self: *ConnectionWatch) void {
         self.done.store(true, .seq_cst);
         if (self.thread) |thread| thread.join();
         self.thread = null;
     }
 };
+
+/// Tests shorten the agent body stall window.
+pub var test_body_stall_timeout_ms: ?i64 = null;
+
+/// Accepts one connection and sends `events` SSE data events `gap_ms` apart.
+/// Then it closes the connection when `close` is set, or holds it open
+/// without sending another byte until the test stops it.
+const SilentBodyServer = struct {
+    io_backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server,
+    events: usize,
+    gap_ms: u64,
+    close: bool,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *SilentBodyServer) !void {
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try address.listen(self.io_backend.io(), .{ .reuse_address = true });
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn stop(self: *SilentBodyServer) void {
+        self.stopping.store(true, .seq_cst);
+        const zio = self.io_backend.io();
+        const listener = std.Io.net.Stream{ .socket = self.server.socket };
+        listener.shutdown(zio, .both) catch {};
+        if (self.thread) |thread| thread.join();
+        self.server.deinit(zio);
+    }
+
+    fn sleepMs(ms: u64) void {
+        var sleep_io: std.Io.Threaded = .init_single_threaded;
+        sleep_io.io().sleep(.fromMilliseconds(@intCast(ms)), .real) catch {};
+    }
+
+    fn run(self: *SilentBodyServer) void {
+        const zio = self.io_backend.io();
+        var stream = self.server.accept(zio) catch return;
+        defer stream.close(zio);
+        var buffer: [64]u8 = undefined;
+        var writer = stream.writer(zio, &buffer);
+        for (0..self.events) |index| {
+            if (index > 0) sleepMs(self.gap_ms);
+            if (self.stopping.load(.seq_cst)) return;
+            writer.interface.writeAll("data: x\n\n") catch return;
+            writer.interface.flush() catch return;
+        }
+        if (self.close) return;
+        while (!self.stopping.load(.seq_cst)) sleepMs(5);
+    }
+};
+
+const WatchedBody = struct { err: ?anyerror, events: usize, elapsed_ms: i64 };
+
+fn cancelAfterMs(cancel: *std.atomic.Value(bool), ms: u64) void {
+    SilentBodyServer.sleepMs(ms);
+    cancel.store(true, .seq_cst);
+}
+
+/// Reads the server's body as an agent stream would, through a
+/// `ConnectionWatch` with no caller deadline.
+fn readWatchedBody(server: *SilentBodyServer, cancel_after_ms: ?u64) !WatchedBody {
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = ConnectionWatch.bodyStallTimeoutMs(null) });
+    defer watch.stop();
+    try watch.start(&cancel, null, stream);
+    if (watch.armHead()) |err| return err;
+    if (watch.commitHead()) |err| return err;
+    const canceller = if (cancel_after_ms) |ms| try std.Thread.spawn(.{}, cancelAfterMs, .{ &cancel, ms }) else null;
+    defer if (canceller) |thread| thread.join();
+    var socket_buffer: [64]u8 = undefined;
+    var socket_reader = stream.reader(zio, &socket_buffer);
+    var events = sse.Reader{ .max_event_bytes = 64, .progress = watch.progress() };
+    defer events.deinit(std.testing.allocator);
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    var count: usize = 0;
+    const err: ?anyerror = while (true) {
+        const event = events.next(std.testing.allocator, &socket_reader.interface, &cancel) catch |err| break watch.failure(err);
+        if (event == null) break watch.finish();
+        count += 1;
+    };
+    return .{ .err = err, .events = count, .elapsed_ms = @intCast(started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds()) };
+}
+
+test "connection watch closes a body that stops sending as stalled" {
+    test_body_stall_timeout_ms = 80;
+    defer test_body_stall_timeout_ms = null;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 1, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const body = try readWatchedBody(&server, null);
+    try std.testing.expectEqual(@as(?anyerror, error.StreamStalled), body.err);
+    try std.testing.expectEqual(@as(usize, 1), body.events);
+    try std.testing.expect(body.elapsed_ms >= 70 and body.elapsed_ms < 2_000);
+}
+
+test "connection watch never cuts a body whose events arrive inside the window" {
+    test_body_stall_timeout_ms = 1_000;
+    defer test_body_stall_timeout_ms = null;
+    // 75 events 20 ms apart outlast the window by half, while each gap stays
+    // far inside it so a slow scheduler cannot stretch one into a stall.
+    var server: SilentBodyServer = .{ .server = undefined, .events = 75, .gap_ms = 20, .close = true };
+    try server.start();
+    defer server.stop();
+    const body = try readWatchedBody(&server, null);
+    try std.testing.expectEqual(@as(?anyerror, null), body.err);
+    try std.testing.expectEqual(@as(usize, 75), body.events);
+    try std.testing.expect(body.elapsed_ms > 1_000);
+}
+
+test "cancelling a request wins over its body stall window" {
+    test_body_stall_timeout_ms = 5_000;
+    defer test_body_stall_timeout_ms = null;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 1, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const body = try readWatchedBody(&server, 30);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), body.err);
+    try std.testing.expect(body.elapsed_ms < 2_000);
+}
 
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
@@ -8179,25 +8263,11 @@ test "direct gateway cancellation before admission opens no connection" {
     if (fixture.failure) |err| return err;
 }
 
-var stable_models_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableModelsTestEnviron() !*const std.process.Environ.Map {
-    if (stable_models_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_models_test_environ = map;
-    return map;
-}
-
 const ModelsUrlTestEnv = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: std.mem.Allocator, models_url: []const u8) !*ModelsUrlTestEnv {
-        _ = try stableModelsTestEnviron();
-
         const self = try alloc.create(ModelsUrlTestEnv);
         errdefer alloc.destroy(self);
         self.* = .{
@@ -8211,7 +8281,7 @@ const ModelsUrlTestEnv = struct {
     }
 
     fn deinit(self: *ModelsUrlTestEnv) void {
-        if (stable_models_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -8267,7 +8337,7 @@ fn expectCancellableGatewayJsonCancellation(
 
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     const result = if (use_tls)
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag)
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms)
     else
         fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
@@ -8280,6 +8350,26 @@ fn expectCancellableGatewayJsonCancellation(
 
 test "cancellable gateway JSON request closes a held response head" {
     try expectCancellableGatewayJsonCancellation(.response_head_stall, "test-key", false, 20, 800, 500);
+}
+
+test "cancellable gateway JSON request times out a held response head" {
+    const zio = io_mod.getIo();
+    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 2000);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const models_url = try std.testing.allocator.print("http://127.0.0.1:{d}/v1/models", .{fixture.port()});
+    defer std.testing.allocator.free(models_url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    try std.testing.expectError(
+        error.Timeout,
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, 100),
+    );
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms < 1500);
+    if (fixture.failure) |err| return err;
 }
 
 test "cancellable gateway JSON request closes a stalled request send" {

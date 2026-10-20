@@ -461,12 +461,6 @@ pub const Parser = struct {
 
 const header_len = magic.len + 2 + 2 + 8 + 1;
 
-var test_empty_env: std.process.Environ.Map = std.process.Environ.Map.init(std.heap.c_allocator);
-
-fn resetEnvForTest() void {
-    io_mod.setEnvironMap(&test_empty_env);
-}
-
 fn tapePath(alloc: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);
@@ -719,8 +713,8 @@ test "recordStdin suppresses input by default" {
 
 test "debug recording request creates a private tape under home" {
     const alloc = testing.allocator;
-    resetEnvForTest();
-    defer resetEnvForTest();
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -830,8 +824,8 @@ test "startup policy resolves recording environment without effects" {
 
 test "debug recording request uses the temporary fallback when HOME is empty" {
     const alloc = testing.allocator;
-    resetEnvForTest();
-    defer resetEnvForTest();
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
 
     var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
@@ -861,8 +855,8 @@ test "debug recording request uses the temporary fallback when HOME is empty" {
 
 test "configureFromEnv enables stdin for the accepted truthy values only" {
     const alloc = testing.allocator;
-    resetEnvForTest();
-    defer resetEnvForTest();
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -881,7 +875,7 @@ test "configureFromEnv enables stdin for the accepted truthy values only" {
 
         shutdown();
         io_mod.setEnvironMap(&env);
-        defer resetEnvForTest();
+        defer io_mod.resetEnvironForTest();
         try configureFromEnv(alloc, 80, 24, "v");
         recordStdin("typed");
         shutdown();
@@ -894,7 +888,7 @@ test "configureFromEnv enables stdin for the accepted truthy values only" {
         try testing.expectEqualStrings("typed", frame.payload);
         try testing.expect((try parser.next()) == null);
 
-        resetEnvForTest();
+        io_mod.resetEnvironForTest();
     }
 
     const path = try tapePath(alloc, tmp.dir, "stdin-yes.fxtape");

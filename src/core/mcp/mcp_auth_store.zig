@@ -1103,22 +1103,10 @@ test "credential read decisions preserve the portable store during migration" {
     );
 }
 
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
 const TestHome = struct {
     map: std.process.Environ.Map,
 
     fn init(home: []const u8) !TestHome {
-        _ = try stableTestEnviron();
         var result = TestHome{
             .map = std.process.Environ.Map.init(std.testing.allocator),
         };
@@ -1133,7 +1121,7 @@ const TestHome = struct {
     }
 
     fn deinit(self: *TestHome) void {
-        if (stable_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         self.* = undefined;
     }

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { compactionRecordPath, logLines, sessionDir } from "./saved-sessions";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-helpers");
@@ -55,17 +56,16 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     const seededRequest = JSON.parse(bodies[0]!);
     const seededUser = seededRequest.prompt.findLast((message: { role: string }) => message.role === "user");
     expect(seededUser.content[0].text).toBe(originalUser);
-    const sessionDir = join(home, ".fx/sessions", seed.session_id), log = join(sessionDir, "events.jsonl"), before = readFileSync(log);
+    const log = join(sessionDir(home, seed.session_id), "log.jsonl"), before = readFileSync(log);
     phase = "continue";
     const result = await ask(["--resume-id", seed.session_id, "Continue the saved task without losing its pending check."], "continue");
     expect(result.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
     // The turn is only a user message and a final reply, which both stay, so
     // there is nothing for the model to summarize.
     expect(summaryCalls).toBe(0);
-    const rows = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
-    const checkpoints = rows.filter(row => row.event?.context_checkpoint);
+    const checkpoints = logLines(home, seed.session_id).filter((line: any) => line.kind === "compacted");
     expect(checkpoints.length).toBe(1);
-    const saved: string = checkpoints[0].event.context_checkpoint.summary;
+    const saved: string = (checkpoints[0] as any).data.summary;
     expect(saved.startsWith(checkpointMarker)).toBe(true);
     const payload = JSON.parse(saved.slice(checkpointMarker.length));
     expect(payload.turn_count).toBe(1);
@@ -101,7 +101,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     expect(continuedText).toContain("Saved word for word: turn M1.");
     expect(continuedText).not.toContain("Assistant reference 7000:");
     // Either way the whole turn is saved word for word as M1.
-    const record = readFileSync(join(sessionDir, "tool-results", "compacted-M1.txt"), "utf8");
+    const record = readFileSync(compactionRecordPath(home, seed.session_id, "compacted-M1.txt")!, "utf8");
     expect(record).toContain(`User 1:\n${originalUser}\n`);
     expect(record).toContain("Assistant reference 7000:");
     expect(record).toContain("PENDING_CHECK=transport-resume");

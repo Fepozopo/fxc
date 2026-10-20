@@ -31,11 +31,19 @@ fn line_end(bytes: []const u8) usize {
     return bytes.len;
 }
 
+/// Told about each delivered data event, so a connection watch can measure
+/// how long a response body has been silent.
+pub const Progress = struct {
+    context: *anyopaque,
+    mark_fn: *const fn (*anyopaque) void,
+};
+
 /// Request-local SSE framing. The caller owns the source and all allocations.
 /// Returned data is borrowed until the next next() call or deinit().
 pub const Reader = struct {
     max_event_bytes: usize,
     max_total_bytes: ?usize = null,
+    progress: ?Progress = null,
     line: std.ArrayList(u8) = .empty,
     data: std.ArrayList(u8) = .empty,
     total_bytes: usize = 0,
@@ -58,7 +66,10 @@ pub const Reader = struct {
             self.first_line = false;
             switch (classify(line)) {
                 .ignored => {},
-                .boundary => if (saw_data) return self.data.items,
+                .boundary => if (saw_data) {
+                    if (self.progress) |progress| progress.mark_fn(progress.context);
+                    return self.data.items;
+                },
                 .data => |value| {
                     if (saw_data) {
                         if (self.data.items.len == self.max_event_bytes) return error.EventTooLarge;

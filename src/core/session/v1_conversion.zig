@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -157,14 +158,90 @@ pub fn rootIds(alloc: Allocator, home: []const u8) ![]Root {
     return roots.toOwnedSlice(alloc);
 }
 
-/// The session v1 remembered for `workspace` (`-c`), or null. Reads only.
-/// Caller owns it.
+/// A v1 child that no root's conversion takes (D88), and the parent it
+/// names, which is not a v1 root.
+pub const Stray = struct {
+    id: []u8,
+    /// The parent its `subagent/owner.json` or `subagent/control.json`
+    /// names; null when it names none.
+    parent: ?[]u8,
+    /// What v1 holds for that parent: nothing, a v1 child, or a folder
+    /// whose kind can't be read.
+    parent_kind: enum { absent, child, unreadable },
+
+    pub fn deinit(stray: Stray, alloc: Allocator) void {
+        alloc.free(stray.id);
+        if (stray.parent) |parent| alloc.free(parent);
+    }
+};
+
+/// Every v1 child whose parent is not a v1 root, which a conversion leaves
+/// as it is (D88): a child of an earlier subagent, or one whose parent is
+/// gone or already converted. A folder whose kind or parent cannot be read
+/// is left out; `rootIds` reports the first. Fails only when v1's sessions
+/// folder cannot be listed. Caller owns the result.
+pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
+    var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
+    defer store.deinit(alloc);
+    var strays: std.ArrayList(Stray) = .empty;
+    errdefer {
+        for (strays.items) |stray| stray.deinit(alloc);
+        strays.deinit(alloc);
+    }
+    var candidates = store.readOnlyCandidates();
+    while (try candidates.nextId(alloc, null)) |id| {
+        defer alloc.free(id);
+        if ((kindOf(&store, alloc, id) catch continue) != .child) continue;
+        const parent = parentOf(&store, alloc, id) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        errdefer if (parent) |value| alloc.free(value);
+        const parent_kind: ?Kind = if (parent) |value| kindOf(&store, alloc, value) catch null else .absent;
+        if (parent_kind == .root) {
+            if (parent) |value| alloc.free(value);
+            continue;
+        }
+        try strays.ensureUnusedCapacity(alloc, 1);
+        strays.appendAssumeCapacity(.{ .id = try alloc.dupe(u8, id), .parent = parent, .parent_kind = if (parent_kind) |kind| switch (kind) {
+            .child => .child,
+            else => .absent,
+        } else .unreadable });
+    }
+    return strays.toOwnedSlice(alloc);
+}
+
+/// The parent v1's child `id` names in `subagent/owner.json`, or in
+/// schema 3's `subagent/control.json`; null when it names none. Owned.
+fn parentOf(store: *session_store.Store, alloc: Allocator, id: []const u8) !?[]u8 {
+    var dir = (try openMemberDir(store, id)) orelse return null;
+    defer dir.close();
+    var subagent = (try io_mod.openRealDirIfPresent(&dir, subagent_dir)) orelse return null;
+    defer subagent.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "owner.json", "control.json" }) |name| {
+        const bytes = (try readFileIfPresent(a, &subagent, name, child_state.max_state_bytes + 1)) orelse continue;
+        const Named = struct { parent_id: ?[]const u8 = null };
+        const named = std.json.parseFromSliceLeaky(Named, a, bytes, .{ .ignore_unknown_fields = true }) catch continue;
+        if (named.parent_id) |parent| return try alloc.dupe(u8, parent);
+    }
+    return null;
+}
+
+/// The session v1 remembered for `workspace` (`-c`), or null when it
+/// remembers none. A bookmark fx cannot read is `RememberedSessionUnavailable`,
+/// so `-c` says so, as v1 did (D86). Reads only. Caller owns it.
 pub fn rememberedId(alloc: Allocator, home: []const u8, workspace: []const u8) !?[]u8 {
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, workspace);
     defer store.deinit(alloc);
     return store.readRememberedSessionId(alloc) catch |err| switch (err) {
-        error.InvalidRememberedSession => null,
-        else => err,
+        error.OutOfMemory => error.OutOfMemory,
+        else => {
+            debug_trace.logf("convert", "action=RememberedUnreadable err={s}", .{@errorName(err)});
+            return error.RememberedSessionUnavailable;
+        },
     };
 }
 
@@ -187,7 +264,7 @@ pub fn listRoots(alloc: Allocator, home: []const u8, active_id: ?[]const u8) !se
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
     const sessions = &(store.canonical_root.sessions orelse return .{});
-    var catalog = try session_catalog_cache.listActionableCatalog(store, alloc, active_id, null, null);
+    var catalog = try session_catalog_cache.listActionableCatalog(store, alloc, active_id);
     errdefer catalog.deinit(alloc);
     for (catalog.invalid_ids.items) |id| {
         const kind = kindOf(&store, alloc, id) catch |err| switch (err) {
@@ -217,6 +294,14 @@ pub fn listRoots(alloc: Allocator, home: []const u8, active_id: ?[]const u8) !se
         };
     }
     return catalog;
+}
+
+/// Whether v1's folder holds a session its listing could not read, which a
+/// latest resume reports as unreadable rather than absent, as v1 did (D76).
+pub fn hasUnreadable(alloc: Allocator, home: []const u8) !bool {
+    var catalog = try listRoots(alloc, home, null);
+    defer catalog.deinit(alloc);
+    return catalog.invalid_ids.items.len > 0;
 }
 
 fn openMemberDir(store: *session_store.Store, id: []const u8) !?io_mod.VerifiedDir {
@@ -330,9 +415,8 @@ fn readRegistry(alloc: Allocator, a: Allocator, root: *io_mod.VerifiedDir, root_
 }
 
 /// The children schema 3's relationship index names, read only when the
-/// root has no `children.json`, as v1's `sessionHasManagedChildren`
-/// (`session_store.zig`) reads it, with v1's own codec. That format keeps
-/// no registry beside it, so v1 itself has no child lines for them. In `a`.
+/// root has no `children.json`, with v1's own codec. That format keeps no
+/// registry beside it, so v1 itself has no child lines for them. In `a`.
 fn indexedChildren(a: Allocator, root: *io_mod.VerifiedDir, ids: *std.ArrayList([]const u8), problem: *Problem) !void {
     var subagent = (try io_mod.openRealDirIfPresent(root, subagent_dir)) orelse return;
     defer subagent.close();
@@ -368,12 +452,24 @@ const subagent_dir = "subagent";
 /// its folder is gone, including when another process converted it and
 /// removed the folder while this one waited for the lock (D61).
 fn lockMember(alloc: Allocator, store: *session_store.Store, id: []const u8, started: i64, wait_ms: u64) !?Locked {
-    var dir = (try openMemberDir(store, id)) orelse return null;
+    const dir = (try openMemberDir(store, id)) orelse return null;
+    return lockOpened(alloc, store, id, dir, started, wait_ms);
+}
+
+/// `lockMember` once `opened`, the member's folder, is open; takes it.
+fn lockOpened(alloc: Allocator, store: *session_store.Store, id: []const u8, opened: io_mod.VerifiedDir, started: i64, wait_ms: u64) !?Locked {
+    var dir = opened;
     errdefer dir.close();
     const spent: u64 = @intCast(@max(io_mod.milliTimestamp() - started, 0));
-    var lock = io_mod.acquireTimedAdvisoryLock(&dir, lock_file, wait_ms -| spent) catch |err| return switch (err) {
-        error.LockBusy => error.SessionBusy,
-        else => err,
+    var lock = io_mod.acquireTimedAdvisoryLock(&dir, lock_file, wait_ms -| spent) catch |err| switch (err) {
+        error.LockBusy => return error.SessionBusy,
+        // Gone since it was opened here, so its lock file is gone too.
+        error.FileNotFound => {
+            debug_trace.logf("convert", "action=Vanished session={s}", .{id});
+            dir.close();
+            return null;
+        },
+        else => return err,
     };
     errdefer lock.release();
     if (!try stillInPlace(store, id, &dir)) {
@@ -421,7 +517,10 @@ const Step = union(enum) {
 
 const Framed = struct {
     events: []const Event,
-    /// No end piece: v1 closes it as failed on its next writable open.
+    /// Each event's seq, for a compaction's coverage.
+    seqs: []const u64,
+    /// No end piece: converted as an interrupted, failed turn, as v2's own
+    /// reopen keeps one (D1, D77). v1's next writable open discarded it.
     open: bool,
     ts_ms: u64,
 };
@@ -438,6 +537,10 @@ const Compacted = struct {
     /// The member's turn (from 0) the compaction keeps from when that turn
     /// precedes this step; null keeps the turns after it.
     keep_from: ?usize,
+    /// The steps and steering messages of the first kept turn that the
+    /// summary covers, which v1 left out of that turn (D87).
+    keep_tool_steps: usize = 0,
+    keep_steering: usize = 0,
     ts_ms: u64,
 };
 
@@ -453,6 +556,9 @@ pub const Member = struct {
     preferences: session_codec.DurableSessionPreferences,
     title: ?[]const u8,
     permissions: session_permission_state.State,
+    /// True when `permissions.json` could not be read and `permissions`
+    /// holds no rules in its place (`Rules.drop_unreadable`).
+    rules_dropped: bool,
     steps: []const Step,
     turns: usize,
     /// Results an older format kept inline, which v1's migration stores as
@@ -473,14 +579,20 @@ pub const Stored = struct {
     bytes: []const u8,
 };
 
+/// What a read does with saved permission rules it can't read: a
+/// conversion refuses the session, and a salvage copies the conversation
+/// without them (D72).
+pub const Rules = enum { required, drop_unreadable };
+
 /// Reads a locked member read-only. `error.InvalidSessionFormat` with
 /// `problem` set when v1 could not read it either.
-pub fn readMember(gpa: Allocator, store: *session_store.Store, locked: *Locked, problem: *Problem) !Member {
+pub fn readMember(gpa: Allocator, store: *session_store.Store, locked: *Locked, problem: *Problem, rules: Rules) !Member {
     var member: Member = undefined;
     member.arena = .init(gpa);
     errdefer member.arena.deinit();
     const a = member.arena.allocator();
     member.stored = &.{};
+    member.rules_dropped = false;
     member.fingerprint = fingerprintOf(a, &locked.dir) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return problem.set("its folder can't be read ({s})", .{@errorName(err)}),
@@ -496,15 +608,43 @@ pub fn readMember(gpa: Allocator, store: *session_store.Store, locked: *Locked, 
         .bytes => |bytes| {
             if (!(std.json.validate(a, bytes) catch false)) return problem.set("session.json is not valid JSON", .{});
             if (isConversationMetadata(a, bytes)) {
-                try readConversation(a, locked, bytes, &member, problem);
+                try readConversation(a, locked, bytes, &member, problem, rules);
             } else try readOlderFormat(a, store, locked, &member, problem);
         },
     }
+    member.turns = countTurns(member.steps);
+    return member;
+}
+
+fn countTurns(steps: []const Step) usize {
     var turns: usize = 0;
-    for (member.steps) |step| {
+    for (steps) |step| {
         if (step != .compacted) turns += 1;
     }
-    member.turns = turns;
+    return turns;
+}
+
+/// The start of a damaged root that v1's `fx session recover` keeps (D64),
+/// read by v1's own recovery from the locked folder, as a member to import
+/// under a new id. Errors as `session_store.Store.recoverableState`, and
+/// `error.InvalidSessionFormat` with `problem` set when a kept turn is one
+/// the current format cannot keep.
+pub fn readSalvage(gpa: Allocator, store: *session_store.Store, locked: *Locked, problem: *Problem) !Member {
+    var member: Member = undefined;
+    member.arena = .init(gpa);
+    errdefer member.arena.deinit();
+    const a = member.arena.allocator();
+    member.stored = &.{};
+    member.rules_dropped = false;
+    member.fingerprint = fingerprintOf(a, &locked.dir) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return problem.set("its folder can't be read ({s})", .{@errorName(err)}),
+    };
+    var recoverable = try store.recoverableState(a, &locked.dir, locked.id);
+    member.listed_ms = @intCast(@max(recoverable.state.updated_at_ms, 0));
+    member.title = recoverable.title;
+    try fromState(a, locked, &recoverable.state, "events.jsonl", &member, problem);
+    member.turns = countTurns(member.steps);
     return member;
 }
 
@@ -528,7 +668,7 @@ fn isConversationMetadata(a: Allocator, bytes: []const u8) bool {
 
 /// The current format: `session.json` and `events.jsonl` frames, read as
 /// v1's state load reads them.
-fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, member: *Member, problem: *Problem) !void {
+fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, member: *Member, problem: *Problem, rules: Rules) !void {
     const metadata = session_codec.decodeSessionMetadata(a, metadata_bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return problem.set("session.json {s}", .{describe(a, metadata_bytes, err)}),
@@ -547,7 +687,14 @@ fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, m
         .ultrafast_mode = value.ultrafast_mode orelse false,
     };
     member.title = value.title;
-    member.permissions = try readPermissions(a, &locked.dir, problem);
+    member.permissions = readPermissions(a, &locked.dir, problem) catch |err| switch (rules) {
+        .required => return err,
+        .drop_unreadable => if (err == error.OutOfMemory) return err else dropped: {
+            problem.* = .{};
+            member.rules_dropped = true;
+            break :dropped .{};
+        },
+    };
 
     var frames: FrameReader = .{ .arena = a, .dir = &locked.dir, .id = locked.id, .problem = problem, .builder = .init(a) };
     defer frames.builder.deinit();
@@ -595,9 +742,12 @@ const FrameReader = struct {
     steps: std.ArrayList(Step) = .empty,
     /// The seq of each written turn's last frame, for compaction coverage.
     turn_last_seq: std.ArrayList(u64) = .empty,
-    /// The open turn's events, and the compactions inside it, which go
-    /// before it (`Compacted.keep_from`).
+    /// Where each written turn's step sits in `steps`.
+    turn_steps: std.ArrayList(usize) = .empty,
+    /// The open turn's events and their seqs, and the compactions inside
+    /// it, which go before it (`Compacted.keep_from`).
     open: std.ArrayList(Event) = .empty,
+    open_seqs: std.ArrayList(u64) = .empty,
     open_user_seq: ?u64 = null,
     deferred: std.ArrayList(Step) = .empty,
     compactions: usize = 0,
@@ -609,7 +759,8 @@ const FrameReader = struct {
     /// it rather than be copied.
     fn readAll(reader: *FrameReader) !void {
         const io = io_mod.getIo();
-        var file = reader.dir.dir.openFile(io, "events.jsonl", .{ .follow_symlinks = false }) catch |err| switch (err) {
+        // Never waits on a FIFO or other special file put in its place.
+        var file = io_mod.openExistingReadOnlyRegularFile(reader.dir.dir, "events.jsonl", .no_follow) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return reader.problem.set("events.jsonl can't be opened ({s})", .{@errorName(err)}),
         };
@@ -662,27 +813,27 @@ const FrameReader = struct {
                 reader.open_user_seq = seq;
                 var user = value;
                 user.images = try withImages(a, reader.dir, reader.id, value.images, reader.problem);
-                try reader.open.append(a, .{ .user = user });
+                try reader.keep(.{ .user = user }, seq);
             },
             .assistant => |value| {
                 try reader.requireOpen();
                 try reader.builder.appendAssistant(value);
-                try reader.open.append(a, event);
+                try reader.keep(event, seq);
             },
             .tool_call => |value| {
                 try reader.requireOpen();
                 try reader.builder.appendToolCall(value);
-                try reader.open.append(a, event);
+                try reader.keep(event, seq);
             },
             .tool_result => |value| {
                 try reader.requireOpen();
                 try reader.builder.appendToolResult(value);
-                try reader.open.append(a, event);
+                try reader.keep(event, seq);
             },
             .steering => |value| {
                 try reader.requireOpen();
                 try reader.builder.appendSteering(value.text);
-                try reader.open.append(a, event);
+                try reader.keep(event, seq);
             },
             // The builder only checks the turn; its copy lives in the arena.
             .turn_completed => |value| {
@@ -708,17 +859,34 @@ const FrameReader = struct {
                         prior += 1;
                     } else if (keep_from == null) keep_from = index;
                 }
+                // The first kept turn can be partly covered: v1 kept its
+                // prompt and the frames after the coverage (D87).
+                const covered: types.ContextHistoryCut = if (keep_from) |index| blk: {
+                    const turn = reader.steps.items[reader.turn_steps.items[index]].framed;
+                    break :blk try coveredSteps(turn.events, turn.seqs, checkpoint.covers_through_seq);
+                } else if (reader.open_user_seq != null)
+                    try coveredSteps(reader.open.items, reader.open_seqs.items, checkpoint.covers_through_seq)
+                else
+                    .{};
                 const step: Step = .{ .compacted = .{
                     .summary = checkpoint.summary,
                     .removed_turn_count = prior,
                     .compaction_count = reader.compactions,
                     .keep_from = keep_from,
+                    .keep_tool_steps = covered.tool_steps,
+                    .keep_steering = covered.steering,
                     .ts_ms = reader.last_ts,
                 } };
-                // Inside a turn it goes before that turn, which v2 keeps whole.
+                // Inside a turn it goes before that turn.
                 if (reader.open_user_seq != null) try reader.deferred.append(a, step) else try reader.steps.append(a, step);
             },
         }
+    }
+
+    /// Adds `event` to the open turn.
+    fn keep(reader: *FrameReader, event: Event, seq: u64) !void {
+        try reader.open.append(reader.arena, event);
+        try reader.open_seqs.append(reader.arena, seq);
     }
 
     fn requireOpen(reader: *const FrameReader) error{InvalidConversationFrame}!void {
@@ -727,9 +895,15 @@ const FrameReader = struct {
 
     /// Ends the open turn with `event`, its end piece.
     fn end(reader: *FrameReader, event: Event, seq: u64) !void {
-        try reader.open.append(reader.arena, event);
+        try reader.keep(event, seq);
         try reader.flushDeferred();
-        try reader.steps.append(reader.arena, .{ .framed = .{ .events = try reader.open.toOwnedSlice(reader.arena), .open = false, .ts_ms = reader.last_ts } });
+        try reader.turn_steps.append(reader.arena, reader.steps.items.len);
+        try reader.steps.append(reader.arena, .{ .framed = .{
+            .events = try reader.open.toOwnedSlice(reader.arena),
+            .seqs = try reader.open_seqs.toOwnedSlice(reader.arena),
+            .open = false,
+            .ts_ms = reader.last_ts,
+        } });
         try reader.turn_last_seq.append(reader.arena, seq);
         reader.open_user_seq = null;
     }
@@ -749,6 +923,16 @@ const FrameReader = struct {
             error.OutOfMemory => return err,
             else => return reader.problem.set("recovery.json can't be read ({s})", .{@errorName(err)}),
         };
+        // v1 shows the recovery checkpoint's turn whole, in place of the open
+        // one a compaction inside it covered part of. A compaction that kept
+        // from an earlier turn still leaves out what it covered there.
+        if (checkpoint != null and reader.open_user_seq != null) for (reader.deferred.items) |*step| switch (step.*) {
+            .compacted => |*compacted| if (compacted.keep_from == null) {
+                compacted.keep_tool_steps = 0;
+                compacted.keep_steering = 0;
+            },
+            else => {},
+        };
         try reader.flushDeferred();
         if (reader.open_user_seq == null) {
             if (checkpoint != null) debug_trace.logf("convert", "action=RecoveryDropped session={s} reason=turn_not_open", .{reader.id});
@@ -764,9 +948,31 @@ const FrameReader = struct {
             try reader.steps.append(a, .{ .whole = .{ .turn = kept.interruptedTurn(), .ts_ms = reader.last_ts } });
             return;
         }
-        try reader.steps.append(a, .{ .framed = .{ .events = try reader.open.toOwnedSlice(a), .open = true, .ts_ms = reader.last_ts } });
+        try reader.steps.append(a, .{ .framed = .{
+            .events = try reader.open.toOwnedSlice(a),
+            .seqs = try reader.open_seqs.toOwnedSlice(a),
+            .open = true,
+            .ts_ms = reader.last_ts,
+        } });
     }
 };
+
+/// How much of a turn a checkpoint summarized: its steps and steering
+/// messages through `coverage`, counted as v1's writer counted them when it
+/// chose that coverage (`session_log.ConversationProgress`).
+fn coveredSteps(events: []const Event, seqs: []const u64, coverage: u64) !types.ContextHistoryCut {
+    var progress: session_log.ConversationProgress = .{};
+    for (events, seqs) |event, seq| {
+        if (seq > coverage) break;
+        try progress.observe(seq, event, null);
+    }
+    // A coverage that ends at a reply with no tool call ends at that reply's
+    // own seq, which the progress counts only once a later frame arrives.
+    if (progress.pending_assistant) |assistant| {
+        if (assistant.seq == coverage) progress.point.tool_steps += 1;
+    }
+    return .{ .tool_steps = progress.point.tool_steps, .steering = progress.point.steering };
+}
 
 /// Schema 3 and the legacy snapshots, through v1's older reader (D61).
 fn readOlderFormat(a: Allocator, store: *session_store.Store, locked: *Locked, member: *Member, problem: *Problem) !void {
@@ -774,13 +980,21 @@ fn readOlderFormat(a: Allocator, store: *session_store.Store, locked: *Locked, m
         error.OutOfMemory => return err,
         else => return problem.set("session.json can't be read in any format this fx knows ({s})", .{@errorName(err)}),
     };
-    const state = &detail.state;
+    member.listed_ms = @intCast(@max(detail.summary.updated_at_ms, 0));
+    member.title = detail.summary.title;
+    // Schema 3 keeps its history in its log, a legacy session in its
+    // snapshot.
+    const history_file: []const u8 = if (locked.dir.dir.statFile(io_mod.getIo(), "authority.json", .{ .follow_symlinks = false })) |_| "events.jsonl" else |_| "session.json";
+    try fromState(a, locked, &detail.state, history_file, member, problem);
+}
+
+/// Fills `member` from a v1 state as v1's migration leaves it. `history_file`
+/// names the file its turns came from, for a refusal.
+fn fromState(a: Allocator, locked: *Locked, state: *session_codec.DurableSessionState, history_file: []const u8, member: *Member, problem: *Problem) !void {
     member.workspace = state.workspace_root;
     member.created_ms = @intCast(@max(state.created_at_ms, 0));
-    member.listed_ms = @intCast(@max(detail.summary.updated_at_ms, 0));
     member.language = state.conversation_language;
     member.preferences = state.preferences;
-    member.title = detail.summary.title;
     member.permissions = state.permission_state;
     if (state.permission_state.version != session_permission_state.schema_version) {
         member.permissions = session_permission_state.migrateV1ToV2(a, state.permission_state) catch |err| switch (err) {
@@ -788,16 +1002,12 @@ fn readOlderFormat(a: Allocator, store: *session_store.Store, locked: *Locked, m
             else => return problem.set("permissions can't be migrated ({s})", .{@errorName(err)}),
         };
     }
-    // As v1's migration leaves it (`session_log.zig`
-    // `importLegacySnapshotStateWithOps`): a history-only checkpoint kept as
-    // an interrupted turn, the rest dropped; empty file evidence dropped;
-    // each result kept inline stored under v1's handle.
+    // As v1's migration of an older format left it: a history-only
+    // checkpoint kept as an interrupted turn, the rest dropped; empty file
+    // evidence dropped; each result kept inline stored under v1's handle.
     if (!try state.archive_legacy_recovery(a) and state.recovery_checkpoint != null)
         debug_trace.logf("convert", "action=RecoveryDropped session={s} reason=older_format", .{locked.id});
     _ = try session_log.discardEmptyLegacyFileEvidence(a, state.history);
-    // Schema 3 keeps its history in its log, a legacy session in its
-    // snapshot.
-    const history_file: []const u8 = if (locked.dir.dir.statFile(io_mod.getIo(), "authority.json", .{ .follow_symlinks = false })) |_| "events.jsonl" else |_| "session.json";
     var stored: std.ArrayList(Stored) = .empty;
     var steps: std.ArrayList(Step) = .empty;
     const ts_floor: u64 = member.created_ms;
@@ -879,12 +1089,19 @@ fn turnTime(turn: types.HistoryTurn) u64 {
 /// them (D44), since its v1 folder goes once the conversion lands. One
 /// whose file is gone keeps its path, as v1 shows a lost snapshot; one that
 /// cannot be read refuses the member, `problem` set, so its v1 folder
-/// stays. In `a`.
+/// stays. One the oldest format saved as only its file's path is captured
+/// from that file, or left out (D82). In `a`.
 fn withImages(a: Allocator, dir: *io_mod.VerifiedDir, id: []const u8, images: []const types.ImageAttachment, problem: *Problem) ![]types.ImageAttachment {
-    const copy = try a.dupe(types.ImageAttachment, images);
-    for (copy) |*image| {
+    var kept: std.ArrayList(types.ImageAttachment) = try .initCapacity(a, images.len);
+    for (images) |source| {
+        var image = source;
+        if (image.inline_data == null and image.snapshot_path == null) {
+            if (try capturePathOnly(a, id, &image)) kept.appendAssumeCapacity(image);
+            continue;
+        }
+        defer kept.appendAssumeCapacity(image);
         if (image.inline_data != null) continue;
-        const leaf = snapshotLeaf(image.snapshot_path orelse continue, id) orelse continue;
+        const leaf = snapshotLeaf(image.snapshot_path.?, id) orelse continue;
         const bytes = blk: {
             var images_dir = (io_mod.openRealDirIfPresent(dir, "images") catch |err|
                 return problem.set("images can't be opened ({s})", .{@errorName(err)})) orelse break :blk null;
@@ -900,7 +1117,27 @@ fn withImages(a: Allocator, dir: *io_mod.VerifiedDir, id: []const u8, images: []
         };
         image.snapshot_path = null;
     }
-    return copy;
+    return kept.items;
+}
+
+/// An image the oldest format saved as only its file's path, captured from
+/// that file once as v1's resume did (`repair_legacy_image_snapshots`):
+/// false when it can't be, and the prompt goes on without it, as in v1
+/// (D82). In `a`.
+fn capturePathOnly(a: Allocator, id: []const u8, image: *types.ImageAttachment) !bool {
+    const folder = try image_attachments.createTempSnapshotDir(a);
+    defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), folder) catch |err|
+        debug_trace.logf("convert", "action=ImageCaptureLeftover session={s} err={s}", .{ id, @errorName(err) });
+    image_attachments.captureImageSnapshot(a, image, folder) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("convert", "action=ImageDropped session={s} image={d} err={s}", .{ id, image.id, @errorName(err) });
+            return false;
+        },
+    };
+    try image_attachments.inlineCapturedSnapshot(a, image);
+    image.snapshot_path = null;
+    return true;
 }
 
 const max_image_bytes = 64 * 1024 * 1024;
@@ -945,7 +1182,7 @@ pub fn fingerprintOf(a: Allocator, dir: *io_mod.VerifiedDir) ![64]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     for (names.items) |name| {
-        var file = dir.dir.openFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        var file = io_mod.openExistingReadOnlyRegularFile(dir.dir, name, .no_follow) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
@@ -1042,7 +1279,7 @@ pub fn emptyTrash(alloc: Allocator, store: *session_store.Store) void {
 // Helpers
 
 fn readFileIfPresent(a: Allocator, dir: *io_mod.VerifiedDir, name: []const u8, max_bytes: usize) !?[]u8 {
-    var file = dir.dir.openFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    var file = io_mod.openExistingReadOnlyRegularFile(dir.dir, name, .no_follow) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -1054,6 +1291,48 @@ fn readFileIfPresent(a: Allocator, dir: *io_mod.VerifiedDir, name: []const u8, m
 fn describe(a: Allocator, bytes: []const u8, err: anyerror) []const u8 {
     if (!(std.json.validate(a, bytes) catch false)) return "is not valid JSON";
     return @errorName(err);
+}
+
+test "a checkpoint inside a turn covers that turn's steps and steering as v1's writer counted them (D87)" {
+    const result = struct {
+        fn of(id: []const u8) Event {
+            return .{ .tool_result = .{ .call_id = id, .tool_name = "shell", .status = .success, .artifact_ref = "", .stored_bytes = 0, .completeness = .complete } };
+        }
+    };
+    const events = [_]Event{
+        .{ .user = .{ .text = "go" } },
+        .{ .assistant = .{ .text = "plan" } },
+        .{ .tool_call = .{ .call_id = "c1", .tool_name = "shell", .arguments_json = "{}" } },
+        result.of("c1"),
+        .{ .steering = .{ .text = "faster" } },
+        .{ .assistant = .{ .text = "a reply with no tool call" } },
+        .{ .assistant = .{ .text = "then one more" } },
+        .{ .tool_call = .{ .call_id = "c2", .tool_name = "shell", .arguments_json = "{}" } },
+        result.of("c2"),
+    };
+    const seqs = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    // Each coverage v1's writer can choose: a step's last result, a
+    // steering message, and a reply with no tool call, at its own seq.
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, try coveredSteps(&events, &seqs, 4));
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1, .steering = 1 }, try coveredSteps(&events, &seqs, 5));
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 2, .steering = 1 }, try coveredSteps(&events, &seqs, 6));
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 3, .steering = 1 }, try coveredSteps(&events, &seqs, 9));
+}
+
+test "a member folder another process removes after it is opened and before it is locked is gone, not an error (D61)" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".fx/sessions/v1memberid01");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
+    defer store.deinit(alloc);
+    const opened = (try openMemberDir(&store, "v1memberid01")).?;
+    // The other process's conversion removes the folder.
+    try tmp.dir.deleteTree(io, ".fx/sessions/v1memberid01");
+    try std.testing.expectEqual(@as(?Locked, null), try lockOpened(alloc, &store, "v1memberid01", opened, io_mod.milliTimestamp(), 0));
 }
 
 test "an older turn the current event format cannot keep names its file, turn and cause" {

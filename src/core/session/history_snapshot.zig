@@ -29,11 +29,8 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const session_event = @import("session_event.zig");
-const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
-
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
 pub const file_name = "history-cache.bin";
 
@@ -55,73 +52,7 @@ const max_frames: usize = 4 * 1024 * 1024;
 // mis-encode a newly introduced field type.
 // ---------------------------------------------------------------------------
 
-const EncodeError = error{ OutOfMemory, PayloadTooLarge };
 const DecodeError = error{ InvalidCache, OutOfMemory };
-
-fn encodeAny(out: *std.ArrayList(u8), alloc: Allocator, value: anytype) EncodeError!void {
-    const T = @TypeOf(value);
-    switch (@typeInfo(T)) {
-        .bool => try out.append(alloc, @intFromBool(value)),
-        .int => |info| {
-            if (info.bits > 64) @compileError("snapshot codec: integer too wide: " ++ @typeName(T));
-            const wide: u64 = if (info.signedness == .signed)
-                @bitCast(@as(i64, value))
-            else
-                std.math.cast(u64, value) orelse return error.PayloadTooLarge;
-            var buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &buf, wide, .little);
-            try out.appendSlice(alloc, &buf);
-        },
-        .@"enum" => |info| {
-            if (@bitSizeOf(info.tag_type) > 8) @compileError("snapshot codec: enum tag too wide: " ++ @typeName(T));
-            try out.append(alloc, std.math.cast(u8, @backingInt(value)) orelse return error.PayloadTooLarge);
-        },
-        .optional => {
-            if (value) |inner| {
-                try out.append(alloc, 1);
-                try encodeAny(out, alloc, inner);
-            } else {
-                try out.append(alloc, 0);
-            }
-        },
-        .pointer => |info| switch (info.size) {
-            .slice => {
-                const len: u32 = std.math.cast(u32, value.len) orelse return error.PayloadTooLarge;
-                try encodeAny(out, alloc, len);
-                if (info.child == u8) {
-                    try out.appendSlice(alloc, value);
-                } else {
-                    for (value) |item| try encodeAny(out, alloc, item);
-                }
-            },
-            else => @compileError("snapshot codec: unsupported pointer: " ++ @typeName(T)),
-        },
-        .array => |info| {
-            if (info.child == u8) {
-                try out.appendSlice(alloc, &value);
-            } else {
-                for (value) |item| try encodeAny(out, alloc, item);
-            }
-        },
-        .@"struct" => |info| {
-            inline for (info.field_names) |field_name| {
-                try encodeAny(out, alloc, @field(value, field_name));
-            }
-        },
-        .@"union" => |info| {
-            const tag_info = @typeInfo(info.tag_type orelse
-                @compileError("snapshot codec: untagged union: " ++ @typeName(T))).@"enum";
-            if (@bitSizeOf(tag_info.tag_type) > 8) @compileError("snapshot codec: union tag too wide: " ++ @typeName(T));
-            const active = std.meta.activeTag(value);
-            try out.append(alloc, std.math.cast(u8, @backingInt(active)) orelse return error.PayloadTooLarge);
-            switch (value) {
-                inline else => |payload| try encodeAny(out, alloc, payload),
-            }
-        },
-        .void => {},
-        else => @compileError("snapshot codec: unsupported type: " ++ @typeName(T)),
-    }
-}
 
 const ByteCursor = struct {
     bytes: []const u8,
@@ -280,29 +211,6 @@ pub const FrameMeta = struct {
     line_crc: u32,
 };
 
-fn encodeFramePayload(
-    out: *std.ArrayList(u8),
-    alloc: Allocator,
-    envelope: session_event.ConversationEnvelope,
-    log_offset: u64,
-    log_bytes: u32,
-    line_crc: u32,
-) EncodeError!void {
-    try encodeAny(out, alloc, log_offset);
-    try encodeAny(out, alloc, log_bytes);
-    try encodeAny(out, alloc, line_crc);
-    try encodeAny(out, alloc, envelope);
-}
-
-fn headerBytes(out: *std.ArrayList(u8), alloc: Allocator, session_id: []const u8) EncodeError!void {
-    try out.appendSlice(alloc, magic);
-    try encodeAny(out, alloc, format_version);
-    try encodeAny(out, alloc, session_event.conversation_schema_version);
-    const id_len: u32 = std.math.cast(u32, session_id.len) orelse return error.PayloadTooLarge;
-    try encodeAny(out, alloc, id_len);
-    try out.appendSlice(alloc, session_id);
-}
-
 // The codec normalizes every integer to an 8-byte little-endian value, so the
 // header is magic ++ u64 version ++ u64 fingerprint ++ u64 id length.
 const header_len_min = magic.len + 8 + 8 + 8;
@@ -310,123 +218,6 @@ const header_len_min = magic.len + 8 + 8 + 8;
 /// line_crc (8 bytes each, codec-normalized) precede the envelope, whose own
 /// schema_version u64 precedes seq.
 const envelope_seq_offset = 24 + 8;
-
-// ---------------------------------------------------------------------------
-// Writer
-//
-// Appends frames next to the log commit path. Never fails its caller: any
-// error marks the writer broken, and finalize/discard removes the file so the
-// next open rebuilds from scratch.
-// ---------------------------------------------------------------------------
-
-pub const Writer = struct {
-    alloc: Allocator,
-    /// Borrowed for deletion of a broken cache at finalize. Valid because the
-    /// writer is finalized at session-open time, before the owning session
-    /// struct can move.
-    dir: *io_mod.VerifiedDir,
-    file: ?std.Io.File,
-    len: u64 = 0,
-    broken: bool = false,
-
-    /// Creates a fresh cache, replacing any existing file.
-    pub fn beginReplace(alloc: Allocator, dir: *io_mod.VerifiedDir, session_id: []const u8) !Writer {
-        io_mod.e2eFailIfDurableMutationAttempted();
-        deleteCacheFile(dir);
-        var header: std.ArrayList(u8) = .empty;
-        defer header.deinit(alloc);
-        try headerBytes(&header, alloc, session_id);
-        const file = createCacheFile(dir) catch |err| {
-            debug_trace.logf("session", "history cache create failed err={s}", .{@errorName(err)});
-            return err;
-        };
-        errdefer file.close(io_mod.getIo());
-        try file.writePositionalAll(io_mod.getIo(), header.items, 0);
-        return .{ .alloc = alloc, .dir = dir, .file = file, .len = header.items.len };
-    }
-
-    /// Opens an existing verified cache to append after its valid prefix.
-    pub fn beginAppend(alloc: Allocator, dir: *io_mod.VerifiedDir, prefix_file_bytes: u64) !Writer {
-        io_mod.e2eFailIfDurableMutationAttempted();
-        var file = try openCacheFile(dir, .read_write);
-        errdefer file.close(io_mod.getIo());
-        try file.setLength(io_mod.getIo(), prefix_file_bytes);
-        return .{ .alloc = alloc, .dir = dir, .file = file, .len = prefix_file_bytes };
-    }
-
-    /// Appends one frame mirroring a committed log line. `log_offset` and
-    /// `log_bytes` locate the line in events.jsonl and `line_crc` is its CRC32.
-    /// Cache failures never propagate: the writer marks itself broken and the
-    /// file is deleted at finalize.
-    pub fn append(
-        self: *Writer,
-        envelope: session_event.ConversationEnvelope,
-        log_offset: u64,
-        log_bytes: u32,
-        line_crc: u32,
-    ) void {
-        self.appendFailing(envelope, log_offset, log_bytes, line_crc) catch |err| {
-            self.broken = true;
-            debug_trace.logf("session", "history cache append failed offset={d} err={s}", .{ log_offset, @errorName(err) });
-        };
-    }
-
-    fn appendFailing(
-        self: *Writer,
-        envelope: session_event.ConversationEnvelope,
-        log_offset: u64,
-        log_bytes: u32,
-        line_crc: u32,
-    ) !void {
-        if (self.broken) return;
-        const file = self.file orelse return;
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.alloc);
-        try encodeFramePayload(&payload, self.alloc, envelope, log_offset, log_bytes, line_crc);
-        const payload_len: u32 = std.math.cast(u32, payload.items.len) orelse return error.PayloadTooLarge;
-        var head: [8]u8 = undefined;
-        std.mem.writeInt(u32, head[0..4], payload_len + 4, .little);
-        std.mem.writeInt(u32, head[4..8], std.hash.Crc32.hash(payload.items), .little);
-        try file.writePositionalAll(io_mod.getIo(), &head, self.len);
-        try file.writePositionalAll(io_mod.getIo(), payload.items, self.len + 8);
-        self.len += 8 + payload.items.len;
-    }
-
-    /// Truncates the cache to a prefix after a log-side rollback or torn-tail
-    /// truncation made later frames stale.
-    pub fn truncateTo(self: *Writer, file_offset: u64) void {
-        const file = self.file orelse return;
-        if (self.broken) return;
-        file.setLength(io_mod.getIo(), file_offset) catch |err| {
-            self.broken = true;
-            debug_trace.logf("session", "history cache truncate failed err={s}", .{@errorName(err)});
-            return;
-        };
-        self.len = file_offset;
-    }
-
-    /// Syncs and closes the cache. A broken writer deletes the file so the next
-    /// open rebuilds from the log; deletion goes through the directory the
-    /// writer was created with, which outlives the writer by construction.
-    pub fn finalize(self: *Writer) void {
-        const alloc = self.alloc;
-        const dir = self.dir;
-        const file = self.file orelse {
-            self.* = .{ .alloc = alloc, .dir = dir, .file = null };
-            return;
-        };
-        if (self.broken) {
-            file.close(io_mod.getIo());
-            deleteCacheFile(dir);
-        } else {
-            file.sync(io_mod.getIo()) catch |err| {
-                debug_trace.logf("session", "history cache sync failed err={s}", .{@errorName(err)});
-            };
-            file.close(io_mod.getIo());
-        }
-        self.* = .{ .alloc = alloc, .dir = dir, .file = null };
-    }
-};
 
 // ---------------------------------------------------------------------------
 // Verification
@@ -441,8 +232,6 @@ pub const Verified = struct {
     frames: []FrameMeta,
     /// Log bytes covered by the cache prefix.
     covered_log_bytes: u64,
-    /// Cache file bytes belonging to the valid prefix.
-    prefix_file_bytes: u64,
     last_seq: u64,
 
     pub fn deinit(self: *Verified, alloc: Allocator) void {
@@ -545,7 +334,6 @@ pub fn openAndVerify(
         .file = file,
         .frames = owned,
         .covered_log_bytes = covered_log_bytes,
-        .prefix_file_bytes = file_offset,
         .last_seq = expected_seq - 1,
     };
 }
@@ -616,223 +404,58 @@ fn openCacheFile(dir: *io_mod.VerifiedDir, mode: std.Io.Dir.OpenFileOptions.Mode
     return file;
 }
 
-fn createCacheFile(dir: *io_mod.VerifiedDir) !std.Io.File {
-    var file = try dir.dir.createFile(io_mod.getIo(), file_name, .{
-        .read = true,
-        .truncate = true,
-        .exclusive = false,
-        .permissions = private_file_permissions,
-        .resolve_beneath = true,
-    });
-    errdefer file.close(io_mod.getIo());
-    file.setPermissions(io_mod.getIo(), private_file_permissions) catch return error.HistoryCachePermissionsUnsupported;
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.nlink != 1) return error.HistoryCacheUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) return error.HistoryCachePermissionsUnsupported;
-    return file;
-}
-
-fn deleteCacheFile(dir: *io_mod.VerifiedDir) void {
-    dir.dir.deleteFile(io_mod.getIo(), file_name) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => debug_trace.logf("session", "history cache delete failed err={s}", .{@errorName(err)}),
-    };
-}
-
-/// Deletes the cache after a cache-backed load was rejected, so the retry and
-/// later opens rebuild from the authoritative log. Writable paths only.
-pub fn deleteForRebuild(dir: *io_mod.VerifiedDir) void {
-    deleteCacheFile(dir);
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-fn sampleEnvelope(seq: u64) session_event.ConversationEnvelope {
-    return .{
-        .seq = seq,
-        .timestamp_ms = 1726000000000,
-        .event = .{ .steering = .{ .text = "keep going" } },
-    };
+/// A conversation v0.0.14 saved, with the history cache that release wrote
+/// beside its log (`tests/fixtures/v1-sessions/generate.ts`).
+const fixture_session_id = "rtXn8_Z6_NNt";
+
+/// Copies the fixture session's log and history cache into `dir` and returns
+/// the log's bytes, owned by the caller.
+fn copyFixtureSession(alloc: Allocator, dir: std.Io.Dir) ![]u8 {
+    const io = std.testing.io;
+    // `source_root` is relative to the build root, where tests run.
+    const path = @import("test_paths").source_root ++ "/../tests/fixtures/v1-sessions/remembered/sessions/" ++ fixture_session_id;
+    var source = try std.Io.Dir.cwd().openDir(io, path, .{});
+    defer source.close(io);
+    const cache = try source.readFileAlloc(io, file_name, alloc, .limited(1 << 20));
+    defer alloc.free(cache);
+    try dir.writeFile(io, .{ .sub_path = file_name, .data = cache });
+    const log = try source.readFileAlloc(io, "events.jsonl", alloc, .limited(1 << 20));
+    errdefer alloc.free(log);
+    try dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = log });
+    return log;
 }
 
-fn encodeDecodeRoundtrip(alloc: Allocator, envelope: session_event.ConversationEnvelope) !void {
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(alloc);
-    try encodeFramePayload(&payload, alloc, envelope, 42, 128, 0xdeadbeef);
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    var cursor = ByteCursor{ .bytes = payload.items };
-    try std.testing.expectEqual(@as(u64, 42), try cursor.takeInt());
-    try std.testing.expectEqual(@as(u64, 128), try cursor.takeInt());
-    try std.testing.expectEqual(@as(u64, 0xdeadbeef), try cursor.takeInt());
-    const decoded = try decodeAny(session_event.ConversationEnvelope, arena.allocator(), &cursor);
-    try std.testing.expectEqual(payload.items.len, cursor.pos);
-    // Canonical re-encode proves field fidelity without a field-by-field diff.
-    var again: std.ArrayList(u8) = .empty;
-    defer again.deinit(alloc);
-    try encodeFramePayload(&again, alloc, decoded, 42, 128, 0xdeadbeef);
-    try std.testing.expectEqualSlices(u8, payload.items, again.items);
-}
-
-test "history snapshot codec round trips every event kind" {
+test "history snapshot codec rejects a truncated payload" {
     const alloc = std.testing.allocator;
-    const model_provider = @import("../config/model_provider.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log = try copyFixtureSession(alloc, tmp.dir);
+    defer alloc.free(log);
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
+    var log_file = try tmp.dir.openFile(std.testing.io, "events.jsonl", .{});
+    defer log_file.close(std.testing.io);
+    var verified = (try openAndVerify(alloc, &dir, fixture_session_id, log_file, log.len)).?;
+    defer verified.deinit(alloc);
 
-    try encodeDecodeRoundtrip(alloc, .{
-        .seq = 1,
-        .timestamp_ms = 1,
-        .event = .{ .user = .{
-            .text = "hello world",
-            .images = &.{},
-            .work_id = "work-1",
-        } },
-    });
-    try encodeDecodeRoundtrip(alloc, .{
-        .seq = 2,
-        .timestamp_ms = 2,
-        .event = .{ .user = .{
-            .text = "with image",
-            .images = &.{.{
-                .id = 3,
-                .path = @constCast("/tmp/a.png"),
-                .media_type = @constCast("image/png"),
-                .snapshot_path = @constCast("/tmp/s.png"),
-                .snapshot_sha256 = @constCast("abc123"),
-                .source_ref = @constCast("host:original"),
-            }},
-            .work_id = null,
-        } },
-    });
-    try encodeDecodeRoundtrip(alloc, .{
-        .seq = 3,
-        .timestamp_ms = 3,
-        .event = .{ .assistant = .{
-            .text = "answer",
-            .provider_replay = .{
-                .source = .{ .provider = model_provider.parse("gateway").?, .model = "kimi-k3" },
-                .parts_json = "[{\"type\":\"text\"}]",
-            },
-            .standalone_response = true,
-        } },
-    });
-    try encodeDecodeRoundtrip(alloc, .{
-        .seq = 4,
-        .timestamp_ms = 4,
-        .event = .{ .tool_call = .{
-            .call_id = "c1",
-            .tool_name = "shell",
-            .arguments_json = "{\"command\":\"ls\"}",
-            .argument_integrity = .valid,
-            .provisional_id = "p1",
-            .provider_result = "{\"ok\":true}",
-            .final_identity = .valid,
-            .provenance = .fx_local,
-        } },
-    });
-    try encodeDecodeRoundtrip(alloc, .{
-        .seq = 5,
-        .timestamp_ms = 5,
-        .event = .{ .tool_result = .{
-            .call_id = "c1",
-            .tool_name = "shell",
-            .status = .success,
-            .artifact_ref = "tool-results/abc",
-            .tool_image_handle = "img-handle",
-            .output_bytes = 1024,
-            .stored_bytes = 512,
-            .completeness = .partial,
-            .preview = "first bytes",
-            .provider_native = true,
-            .review_feedback = true,
-            .created_at_ms = 42,
-            .permission_feedback = &.{ "allowed once", "denied earlier" },
-            .committed_file_presentation = .{
-                .path = "src/main.zig",
-                .kind = .edited,
-                .lines = &.{.{ .kind = .addition, .old_line = null, .new_line = 7, .text = "+hello" }},
-                .additions = 1,
-                .deletions = 0,
-                .truncated = false,
-                .previous_content = "before",
-                .after_content = "after",
-                .lifecycle_id = .{ .turn_id = 9, .call_id = "c1" },
-            },
-            .command_replay_ref = "cmd-handle",
-            .command_replay_bytes = 2048,
-            .command_process_presentation = .{ .exit_code = 0 },
-            .terminal_action_presentation = .{ .returned = .{ .exited = 0 } },
-        } },
-    });
-    try encodeDecodeRoundtrip(alloc, .{
-        .seq = 6,
-        .timestamp_ms = 6,
-        .event = .{ .turn_completed = .{
-            .files = &.{.{
-                .path = @constCast("src/a.zig"),
-                .new_path = @constCast("src/b.zig"),
-                .tool_call_id = @constCast("c1"),
-                .tool_name = @constCast("edit"),
-                .action = .edit,
-                .status = .success,
-                .model_view_covers_full_file = true,
-                .stale = false,
-            }},
-            .turn_summary = .{
-                .started_at_ms = 10,
-                .completed_at_ms = 20,
-                .thinking_duration_ms = 3,
-                .turn_duration_ms = 10,
-                .token_progress = .{
-                    .input_tokens = 100,
-                    .output_tokens = 50,
-                    .input_exact = true,
-                    .output_exact = false,
-                },
-            },
-        } },
-    });
-    try encodeDecodeRoundtrip(alloc, .{
-        .seq = 7,
-        .timestamp_ms = 7,
-        .event = .{ .interrupted = .{
-            .reason = .cancelled,
-            .partial_text = "partial",
-            .command_replay_ref = "h",
-            .command_replay_bytes = 7,
-            .command_artifact_ref = "a",
-            .files = &.{},
-            .turn_summary = null,
-            .cancellation_origin = .compaction,
-        } },
-    });
-    try encodeDecodeRoundtrip(alloc, .{
-        .seq = 8,
-        .timestamp_ms = 8,
-        .event = .{ .context_checkpoint = .{
-            .covers_through_seq = 7,
-            .summary = "summary text",
-        } },
-    });
-    try encodeDecodeRoundtrip(alloc, sampleEnvelope(9));
-}
-
-test "history snapshot codec rejects truncated and corrupt payloads" {
-    const alloc = std.testing.allocator;
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(alloc);
-    try encodeFramePayload(&payload, alloc, sampleEnvelope(1), 0, 10, 7);
+    // The first frame's payload: three integers, then the envelope.
+    var head: [8]u8 = undefined;
+    _ = try verified.file.readPositionalAll(std.testing.io, &head, verified.frames[0].file_offset);
+    const payload = try alloc.alloc(u8, std.mem.readInt(u32, head[0..4], .little) - 4);
+    defer alloc.free(payload);
+    _ = try verified.file.readPositionalAll(std.testing.io, payload, verified.frames[0].file_offset + 8);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var cursor = ByteCursor{ .bytes = payload.items[0 .. payload.items.len - 3] };
+    var cursor = ByteCursor{ .bytes = payload[0 .. payload.len - 3] };
+    for (0..3) |_| _ = try cursor.takeInt();
     try std.testing.expectError(error.InvalidCache, decodeAny(session_event.ConversationEnvelope, arena.allocator(), &cursor));
 
-    cursor = .{ .bytes = payload.items };
-    _ = try cursor.takeInt();
-    _ = try cursor.takeInt();
-    _ = try cursor.takeInt();
+    cursor = .{ .bytes = payload };
+    for (0..3) |_| _ = try cursor.takeInt();
     const decoded = try decodeAny(session_event.ConversationEnvelope, arena.allocator(), &cursor);
     try std.testing.expectEqual(@as(u64, 1), decoded.seq);
 }
@@ -841,96 +464,67 @@ test "history snapshot verify, cursor, and watermark authority" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var verified_dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
-
-    // Two steering events at log offsets 0 and 10.
-    const line1 = "{\"seq\":1}\n";
-    const line2 = "{\"seq\":2}\n";
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, line1);
-        try file.writeStreamingAll(std.testing.io, line2);
-    }
+    const log = try copyFixtureSession(alloc, tmp.dir);
+    defer alloc.free(log);
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
     var log_file = try tmp.dir.openFile(std.testing.io, "events.jsonl", .{});
     defer log_file.close(std.testing.io);
-    const log_len = try log_file.length(std.testing.io);
 
-    var writer = try Writer.beginReplace(alloc, &verified_dir, "sess-1");
-    writer.append(sampleEnvelope(1), 0, line1.len, std.hash.Crc32.hash(line1));
-    writer.append(sampleEnvelope(2), line1.len, line2.len, std.hash.Crc32.hash(line2));
-    writer.finalize();
-
-    var verified = (try openAndVerify(alloc, &verified_dir, "sess-1", log_file, log_len)).?;
+    var verified = (try openAndVerify(alloc, &dir, fixture_session_id, log_file, log.len)).?;
     defer verified.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 2), verified.last_seq);
-    try std.testing.expectEqual(log_len, verified.covered_log_bytes);
+    try std.testing.expectEqual(@as(u64, log.len), verified.covered_log_bytes);
 
-    var cursor = Cursor{ .file = verified.file, .frames = verified.frames };
+    // Every frame decodes to its log line's event, in order.
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const first = (try cursor.next(arena.allocator())).?;
-    try std.testing.expectEqual(@as(u64, 1), first.seq);
-    try std.testing.expectEqualStrings("keep going", first.event.steering.text);
-    try cursor.seekLogOffset(line1.len);
-    const second = (try cursor.next(arena.allocator())).?;
-    try std.testing.expectEqual(@as(u64, 2), second.seq);
+    var cursor = Cursor{ .file = verified.file, .frames = verified.frames };
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, log, "\n"), '\n');
+    var count: usize = 0;
+    var second_offset: ?u64 = null;
+    while (lines.next()) |line| : (count += 1) {
+        if (count == 1) second_offset = lines.index.? - line.len - 1;
+        const saved = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), line, .{});
+        const decoded = (try cursor.next(arena.allocator())).?;
+        try std.testing.expectEqual(@as(u64, @intCast(saved.object.get("seq").?.integer)), decoded.seq);
+        try std.testing.expectEqualStrings(saved.object.get("event").?.object.keys()[0], @tagName(decoded.event));
+    }
+    try std.testing.expect(count >= 2);
     try std.testing.expect((try cursor.next(arena.allocator())) == null);
+    try std.testing.expectEqual(count, verified.frames.len);
+    try std.testing.expectEqual(@as(u64, count), verified.last_seq);
+    try cursor.seekLogOffset(second_offset.?);
+    try std.testing.expectEqual(@as(u64, 2), (try cursor.next(arena.allocator())).?.seq);
 
     // Wrong session id, a shrunk log, and a rewritten tail all invalidate.
-    try std.testing.expect((try openAndVerify(alloc, &verified_dir, "sess-2", log_file, log_len)) == null);
-    try std.testing.expect((try openAndVerify(alloc, &verified_dir, "sess-1", log_file, log_len - 1)) == null);
+    try std.testing.expect((try openAndVerify(alloc, &dir, "another-id12", log_file, log.len)) == null);
+    try std.testing.expect((try openAndVerify(alloc, &dir, fixture_session_id, log_file, log.len - 1)) == null);
     {
         var mutable = try tmp.dir.openFile(std.testing.io, "events.jsonl", .{ .mode = .read_write });
         defer mutable.close(std.testing.io);
-        try mutable.writePositionalAll(std.testing.io, "X", log_len - 2);
+        try mutable.writePositionalAll(std.testing.io, "X", log.len - 2);
     }
-    try std.testing.expect((try openAndVerify(alloc, &verified_dir, "sess-1", log_file, log_len)) == null);
+    try std.testing.expect((try openAndVerify(alloc, &dir, fixture_session_id, log_file, log.len)) == null);
 }
 
-test "history snapshot rejects version two image caches before decoding" {
+test "history snapshot rejects version two caches before decoding" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const log = try copyFixtureSession(alloc, tmp.dir);
+    defer alloc.free(log);
     var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
-    const line = "{\"seq\":1}\n";
-    var log_file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
+    var log_file = try tmp.dir.openFile(std.testing.io, "events.jsonl", .{});
     defer log_file.close(std.testing.io);
-    try log_file.writeStreamingAll(std.testing.io, line);
-
-    var writer = try Writer.beginReplace(alloc, &dir, "legacy-images");
-    defer writer.finalize();
-    const file = writer.file.?;
-    var version: [8]u8 = undefined;
-    std.mem.writeInt(u64, &version, 2, .little);
-    try file.writePositionalAll(std.testing.io, &version, magic.len);
-
-    const envelope: session_event.ConversationEnvelope = .{
-        .seq = 1,
-        .timestamp_ms = 1,
-        .event = .{ .user = .{
-            .text = "with image",
-            .images = &.{.{ .id = 3, .path = @constCast("/tmp/a.png"), .media_type = @constCast("image/png") }},
-        } },
-    };
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(alloc);
-    try encodeFramePayload(&payload, alloc, envelope, 0, line.len, std.hash.Crc32.hash(line));
-    payload.items.len = envelope_seq_offset + 8 + 8 + 1;
-    // Frozen version-2 user payload: the image has no source_ref tag.
-    const legacy_user = "\x0a\x00\x00\x00\x00\x00\x00\x00" ++ "with image" ++
-        "\x01\x00\x00\x00\x00\x00\x00\x00" ++ "\x03\x00\x00\x00\x00\x00\x00\x00" ++
-        "\x0a\x00\x00\x00\x00\x00\x00\x00" ++ "/tmp/a.png" ++
-        "\x09\x00\x00\x00\x00\x00\x00\x00" ++ "image/png" ++ "\x00\x00\x00\x00";
-    try payload.appendSlice(alloc, legacy_user);
-    var frame_header: [8]u8 = undefined;
-    std.mem.writeInt(u32, frame_header[0..4], @intCast(payload.items.len + 4), .little);
-    std.mem.writeInt(u32, frame_header[4..8], std.hash.Crc32.hash(payload.items), .little);
-    try file.writePositionalAll(std.testing.io, &frame_header, writer.len);
-    try file.writePositionalAll(std.testing.io, payload.items, writer.len + frame_header.len);
-    writer.finalize();
-
-    var verified = try openAndVerify(alloc, &dir, "legacy-images", log_file, line.len);
+    {
+        // Version two encoded images without their source tag, so its frames
+        // would misdecode; the header check refuses the file first.
+        var cache = try tmp.dir.openFile(std.testing.io, file_name, .{ .mode = .read_write });
+        defer cache.close(std.testing.io);
+        var version: [8]u8 = undefined;
+        std.mem.writeInt(u64, &version, 2, .little);
+        try cache.writePositionalAll(std.testing.io, &version, magic.len);
+    }
+    var verified = try openAndVerify(alloc, &dir, fixture_session_id, log_file, log.len);
     defer if (verified) |*cache| cache.deinit(alloc);
     try std.testing.expect(verified == null);
 }
@@ -939,28 +533,25 @@ test "history snapshot verification tolerates a torn tail as a shorter prefix" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var verified_dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
-
-    const line1 = "{\"seq\":1}\n";
-    {
-        var file = try tmp.dir.createFile(std.testing.io, "events.jsonl", .{ .read = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, line1);
-    }
+    const log = try copyFixtureSession(alloc, tmp.dir);
+    defer alloc.free(log);
+    var dir: io_mod.VerifiedDir = .{ .dir = tmp.dir };
     var log_file = try tmp.dir.openFile(std.testing.io, "events.jsonl", .{});
     defer log_file.close(std.testing.io);
-    const log_len = try log_file.length(std.testing.io);
-
-    var writer = try Writer.beginReplace(alloc, &verified_dir, "sess-1");
-    writer.append(sampleEnvelope(1), 0, line1.len, std.hash.Crc32.hash(line1));
-    // Simulate a torn second frame: a plausible frame header with no payload.
-    const fake: [8]u8 = .{ 0, 64, 0, 0, 1, 2, 3, 4 };
-    const file = writer.file.?;
-    try file.writePositionalAll(std.testing.io, &fake, writer.len);
-    writer.finalize();
-
-    var verified = (try openAndVerify(alloc, &verified_dir, "sess-1", log_file, log_len)).?;
+    const frames = blk: {
+        var whole = (try openAndVerify(alloc, &dir, fixture_session_id, log_file, log.len)).?;
+        defer whole.deinit(alloc);
+        break :blk whole.frames.len;
+    };
+    {
+        // A plausible frame header with no payload after the last frame.
+        var cache = try tmp.dir.openFile(std.testing.io, file_name, .{ .mode = .read_write });
+        defer cache.close(std.testing.io);
+        const fake: [8]u8 = .{ 0, 64, 0, 0, 1, 2, 3, 4 };
+        try cache.writePositionalAll(std.testing.io, &fake, try cache.length(std.testing.io));
+    }
+    var verified = (try openAndVerify(alloc, &dir, fixture_session_id, log_file, log.len)).?;
     defer verified.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), verified.frames.len);
-    try std.testing.expectEqual(@as(u64, 1), verified.last_seq);
+    try std.testing.expectEqual(frames, verified.frames.len);
+    try std.testing.expectEqual(@as(u64, frames), verified.last_seq);
 }

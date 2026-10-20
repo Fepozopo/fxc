@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -14,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { logLines, rootSessionIds } from "./saved-sessions";
 import {
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
@@ -242,9 +242,8 @@ describe("lean auto mode reliability", () => {
       expect(laterReview).not.toContain(accusation);
       expect(readFileSync(plan, "utf8")).toBe("48 runs\n");
       const sessionId = JSON.parse(result.stdout).session_id;
-      const events = readFileSync(join(root.home, ".fx", "sessions", sessionId, "events.jsonl"), "utf8")
-        .trim().split("\n").map((line) => JSON.parse(line));
-      const held = events.find((entry) => entry.event.tool_result?.call_id === "edit_plan").event.tool_result;
+      const held = (logLines(root.home, sessionId) as any[])
+        .find((line) => line.kind === "item" && line.type === "tool_result" && line.data?.call_id === "edit_plan").data;
       expect(held.review_feedback).toBe(true);
       const resumed = await runFx(
         ["ask", "--auto", "--quiet", "--json", "--resume-id", sessionId, "Summarize the previous result without tools."],
@@ -1423,14 +1422,7 @@ describe("lean auto mode reliability", () => {
         timeoutMs: TIMEOUT,
       });
       expect(first.code).toBe(0);
-      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) =>
-          entry.isDirectory() &&
-          existsSync(join(root.home, ".fx", "sessions", entry.name, "session.json"))
-        )
-        .map((entry) => entry.name);
+      const sessionIds = rootSessionIds(root.home);
       expect(sessionIds).toHaveLength(1);
       const sessionId = sessionIds[0]!;
 
@@ -2188,16 +2180,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.kill();
       activeSession = null;
 
-      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) =>
-          entry.isDirectory() &&
-          existsSync(
-            join(root.home, ".fx", "sessions", entry.name, "session.json"),
-          )
-        )
-        .map((entry) => entry.name);
+      const sessionIds = rootSessionIds(root.home);
       expect(sessionIds).toHaveLength(1);
       const result = await runFx(
         [

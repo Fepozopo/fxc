@@ -831,17 +831,6 @@ test "host-managed Grok catalog auth carries no local headers" {
     try std.testing.expect(!auth.include_subscription_headers);
 }
 
-var stable_catalog_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableCatalogTestEnviron() !*const std.process.Environ.Map {
-    if (stable_catalog_test_environ) |map| return map;
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_catalog_test_environ = map;
-    return map;
-}
-
 const CatalogEndpointEnvironment = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
@@ -851,7 +840,6 @@ const CatalogEndpointEnvironment = struct {
         models_url: []const u8,
         modalities_url: []const u8,
     ) !*@This() {
-        _ = try stableCatalogTestEnviron();
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
         self.* = .{
@@ -867,7 +855,7 @@ const CatalogEndpointEnvironment = struct {
     }
 
     fn deinit(self: *@This()) void {
-        if (stable_catalog_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

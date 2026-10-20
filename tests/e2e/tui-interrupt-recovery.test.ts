@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -14,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks, readTrace } from "./tui-render-assertions";
+import { savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -89,7 +89,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       const seeded = await runFx(["ask", "--json", "Save the first fact."], { cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(seeded.code).toBe(0); expect(seeded.stderr).toBe("");
       const id = JSON.parse(seeded.stdout).session_id;
-      const eventPath = join(home, ".fx", "sessions", id, "events.jsonl");
+      const eventPath = join(sessionDir(home, id), "log.jsonl");
       const saved = readFileSync(eventPath);
       const stderrPath = join(root, "stderr.log"), tracePath = join(root, "trace.log");
       const arm = join(root, "armed"), receipt = join(root, "injected.txt");
@@ -369,17 +369,16 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
 
-      const sessionRoot = join(home, ".fx", "sessions");
       let eventsPath: string | undefined;
       await waitForCondition(() => {
-        eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory())
-          .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
+        if (!existsSync(storeRoot(home))) return false;
+        eventsPath = savedSessionIds(home)
+          .map((id) => join(sessionDir(home, id), "log.jsonl"))
           .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(steeringText));
         return eventsPath !== undefined;
       }, "steering history persistence");
       const events = readFileSync(eventsPath!, "utf8");
-      expect(events).not.toContain('"kind":"interrupted"');
+      expect(events).not.toContain('"kind":"turn_interrupted"');
       expect(events).toContain(steeringText);
       const scrollback = await session.captureFullScrollback();
       expect(countOccurrences(scrollback, steeringText)).toBe(1);
@@ -613,27 +612,17 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(finalScrollback).not.toContain("HTTP 400");
 
-      const sessionRoot = join(home, ".fx", "sessions");
-      const sessionIds = readdirSync(sessionRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-        .filter((id) => {
-          const path = join(sessionRoot, id, "events.jsonl");
-          return existsSync(path) && readFileSync(path, "utf8").includes(
-            "Stream a response that I will interrupt.",
-          );
-        });
-      expect(sessionIds).toHaveLength(1);
-      const events = readFileSync(
-        join(sessionRoot, sessionIds[0]!, "events.jsonl"),
-        "utf8",
+      const sessionIds = savedSessionIds(home).filter((id) =>
+        readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8").includes("Stream a response that I will interrupt.")
       );
+      expect(sessionIds).toHaveLength(1);
+      const events = readFileSync(join(sessionDir(home, sessionIds[0]!), "log.jsonl"), "utf8");
       const interruptedEvents = events
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((line) => JSON.parse(line) as { event: Record<string, unknown> })
-        .filter((record) => record.event.interrupted !== undefined);
+        .map((line) => JSON.parse(line))
+        .filter((line) => line.kind === "turn_interrupted");
       expect(interruptedEvents).toHaveLength(1);
       for (const chunk of PARTIAL_CHUNKS) {
         expect(events).toContain(chunk.trim());
@@ -1009,141 +998,6 @@ while :; do sleep 1; done
     TIMEOUT * 2,
   );
 
-  test(
-    "resume after an unclean exit asks before restarting a recovering turn",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-crash-resume-gate-")));
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const stderrPath = join(root, "stderr.log");
-      const tracePath = join(root, "trace.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-
-      const held: HoldState = {
-        started: false,
-        cancelled: false,
-        cancelCount: 0,
-        released: false,
-      };
-      gateway = startFakeGateway([() => heldPartialResponse(held)]);
-      const baseEnv = {
-        HOME: home,
-        AI_GATEWAY_API_KEY: "fake-crash-resume-gate-key",
-        VERCEL_OIDC_TOKEN: undefined,
-        FX_AUTO_UPGRADE: "0",
-        FX_MODEL: FAKE_GATEWAY_MODEL,
-        FX_TRACE_SCOPES: TRACE_SCOPES,
-      };
-      session = await TmuxSession.create({
-        cwd: realpathSync(workspace),
-        stderrPath,
-        width: 120,
-        height: 40,
-        remainOnExit: true,
-        isolated: true,
-        env: {
-          ...baseEnv,
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_TRACE_LOG: tracePath,
-        },
-      });
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Work on the report.");
-      await waitForCondition(() => held.started, "held response start");
-      // Drop the live stream so the turn enters recovery, then kill fx before
-      // any cleanup can run: the checkpoint and the owner marker both survive.
-      gateway.stop();
-      await waitForTrace(tracePath, "recovery_checkpoint_set", TIMEOUT);
-      Bun.spawnSync(["kill", "-9", String(session.processPid())]);
-      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
-
-      const sessionsRoot = join(home, ".fx", "sessions");
-      const sessionId = readdirSync(sessionsRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)[0]!;
-      const sessionDir = join(sessionsRoot, sessionId);
-      expect(existsSync(join(sessionDir, "owner.live"))).toBe(true);
-      expect(existsSync(join(sessionDir, "recovery.json"))).toBe(true);
-      await session.kill();
-      session = null;
-      gateway = null;
-
-      // Same profile, fresh process: the recovering turn must not restart
-      // itself; the user decides whether to retry it.
-      const retryGateway = startFakeGateway([
-        fakeGatewayFinalText("RECOVERY_RETRY_COMPLETE"),
-      ]);
-      gateway = retryGateway;
-      session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume ${sessionId}`,
-        cwd: realpathSync(workspace),
-        stderrPath: join(root, "stderr-resume.log"),
-        width: 120,
-        height: 40,
-        isolated: true,
-        env: {
-          ...baseEnv,
-          FX_GATEWAY_BASE_URL: retryGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: retryGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: retryGateway.chatUrl,
-          FX_TRACE_LOG: join(root, "trace-resume.log"),
-        },
-      });
-      await session.waitForComposer(TIMEOUT);
-      await Bun.sleep(1_500);
-      expect(retryGateway.requests).toHaveLength(0);
-      const resumedScrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");
-      expect(resumedScrollback).toContain("fx quit unexpectedly while this response was recovering");
-      expect(resumedScrollback).not.toContain("continues automatically");
-
-      // Quitting without choosing keeps the suppression sticky: the next
-      // resume asks again instead of silently re-arming the turn.
-      await session.sendText("/quit");
-      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
-      expect(existsSync(join(sessionDir, "owner.live"))).toBe(false);
-      expect(existsSync(join(sessionDir, "recovery.asked"))).toBe(true);
-      expect(readFileSync(join(root, "stderr-resume.log"), "utf8")).toBe("");
-      await session.kill();
-      session = null;
-
-      session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume ${sessionId}`,
-        cwd: realpathSync(workspace),
-        stderrPath: join(root, "stderr-resume2.log"),
-        width: 120,
-        height: 40,
-        isolated: true,
-        env: {
-          ...baseEnv,
-          FX_GATEWAY_BASE_URL: retryGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: retryGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: retryGateway.chatUrl,
-          FX_TRACE_LOG: join(root, "trace-resume2.log"),
-        },
-      });
-      await session.waitForComposer(TIMEOUT);
-      await Bun.sleep(1_500);
-      expect(retryGateway.requests).toHaveLength(0);
-      const reaskedScrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");
-      expect(reaskedScrollback).toContain("fx quit unexpectedly while this response was recovering");
-
-      await session.sendText("continue");
-      await session.waitForText("RECOVERY_RETRY_COMPLETE", TIMEOUT);
-      expect(retryGateway.requests.length).toBeGreaterThan(0);
-
-      await session.sendText("/quit");
-      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
-      expect(existsSync(join(sessionDir, "owner.live"))).toBe(false);
-      expect(existsSync(join(sessionDir, "recovery.asked"))).toBe(false);
-      expect(existsSync(join(sessionDir, "recovery.json"))).toBe(false);
-      expect(readFileSync(join(root, "stderr-resume2.log"), "utf8")).toBe("");
-    },
-    TIMEOUT * 3,
-  );
 });
 
 function heldPartialResponse(state: HoldState): Response {

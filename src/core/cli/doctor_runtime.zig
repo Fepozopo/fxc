@@ -6,7 +6,6 @@ const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -58,7 +57,6 @@ pub fn collect(
     default_model: []const u8,
     default_agent_step_limit: usize,
     mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
-    sessions_v2: bool,
 ) !Snapshot {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     debug_trace.configureFromEnv(alloc, workspace_root);
@@ -98,7 +96,7 @@ pub fn collect(
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendAuthCheck(&checks, alloc, snapshot.auth);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
-        try appendStateChecks(&checks, alloc, snapshot.workspace_root, sessions_v2);
+        try appendStateChecks(&checks, alloc);
         try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendGhCheck(&checks, alloc);
 
@@ -129,7 +127,7 @@ pub fn collect(
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc, snapshot.workspace_root, sessions_v2);
+    try appendStateChecks(&checks, alloc);
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendGhCheck(&checks, alloc);
 
@@ -252,75 +250,34 @@ fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) 
     return alloc.print("{s}: {s}", .{ prefix, @errorName(err) });
 }
 
-fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8, sessions_v2: bool) !void {
-    if (sessions_v2) return appendV2StateChecks(checks, alloc);
-    var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
-        const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
-        const detail = try alloc.print("failed to inspect workspace state: {s}", .{@errorName(err)});
-        try appendCheckOwned(checks, alloc, "state", status, detail);
-        return;
-    };
-    defer store.deinit(alloc);
-
-    if (store.canonical_root.sessions == null) {
-        try appendCheck(checks, alloc, "state", .warn, "durable state is not initialized");
-        try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
-        return;
-    }
-
-    const state_detail = try alloc.print("state dir ready at {s} (per-session managed state created on demand)", .{store.sessions_dir});
-    try appendCheckOwned(checks, alloc, "state", .ok, state_detail);
-
-    var inspection = try store.inspectForDoctorBounded(alloc, default_session_diagnostics_limit);
-    defer inspection.deinit(alloc);
-    try appendSessionDiagnosticChecks(
-        checks,
-        alloc,
-        &store,
-        inspection.diagnostics.items,
-    );
-    if (inspection.truncated) {
-        try appendSessionDiagnosticsTruncatedCheck(checks, alloc, inspection.inspected_count);
-    }
-
-    var summaries = store.list(alloc) catch {
-        try appendSessionsCountUnavailableCheck(checks, alloc);
-        return;
-    };
-    defer {
-        for (summaries.items) |*summary| summary.deinit(alloc);
-        summaries.deinit(alloc);
-    }
-    try appendSessionsCountCheck(
-        checks,
-        alloc,
-        summaries.items.len,
-        if (summaries.items.len > 0) summaries.items[0].id else "",
-    );
-}
-
-/// Doctor on v2 (D36): reports damaged sessions and removes side folders
-/// whose session is gone. Rebuilds nothing.
-fn appendV2StateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
+/// Reports damaged sessions and removes side folders whose session is gone
+/// (D36). Rebuilds nothing.
+fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
-        const detail = try alloc.print("failed to inspect sessions v2: {s}", .{@errorName(err)});
+        const detail = try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)});
         try appendCheckOwned(checks, alloc, "state", status, detail);
         return;
     };
     defer store.deinit(alloc);
     var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp()) catch |err| {
-        const detail = try alloc.print("failed to inspect sessions v2: {s}", .{@errorName(err)});
+        const detail = try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)});
         try appendCheckOwned(checks, alloc, "state", .fail, detail);
         return;
     };
     defer report.deinit(alloc);
-    try appendCheck(checks, alloc, "state", .ok, "sessions v2");
+    try appendCheck(checks, alloc, "state", .ok, "sessions ready");
     for (report.damaged.items) |id| {
         const detail = try alloc.print("session {s} has a damaged log; `fx session recover {s}` copies its good turns", .{ id, id });
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
-    if (report.checked < report.sessions) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
+    for (report.stuck.items) |stuck| try appendStuckCheck(checks, alloc, stuck);
+    for (report.kept_children) |kept| {
+        const detail = try alloc.print("session {s}, a subagent an older fx saved, is kept as it is: {s}", .{ kept.id, kept.reason });
+        try appendCheckOwned(checks, alloc, "session", .ok, detail);
+    }
+    // The limit covers v1's unconverted sessions too (D73).
+    if (report.checked < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
     if (report.removed > 0) {
         const detail = try alloc.print("removed {d} terminal or side folder(s) whose session is gone", .{report.removed});
         try appendCheckOwned(checks, alloc, "session", .ok, detail);
@@ -329,7 +286,36 @@ fn appendV2StateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         const detail = try alloc.print("{d} terminal or side folder(s) whose session is gone could not be removed", .{report.kept});
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
-    try appendSessionsCountCheck(checks, alloc, report.sessions, report.latest orelse "");
+    if (report.keeps_left_out > 0) {
+        const detail = try alloc.print("{d} earlier session folder(s) under ~/.fx/sessions keep files their conversion left out", .{report.keeps_left_out});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
+    const convertible = report.unconverted - report.stuck.items.len;
+    if (convertible > 0) {
+        const detail = try alloc.print("{d} session(s) saved by an older fx will be converted when first opened", .{convertible});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
+    try appendSessionsCountCheck(checks, alloc, report.sessions, report.latest orelse "", report.unconverted > 0);
+}
+
+/// A session an older fx saved that can't be converted, with what
+/// `fx session recover` copies of it (D73). Its v1 folder is kept.
+fn appendStuckCheck(checks: *std.ArrayList(Check), alloc: Allocator, stuck: session_adapter.Doctor.Stuck) !void {
+    const detail = switch (stuck.recover) {
+        .without_rules => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; `fx session recover {s}` copies its conversation without its saved permission rules",
+            .{ stuck.id, stuck.reason, stuck.id },
+        ),
+        .good_turns => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; `fx session recover {s}` copies its good turns",
+            .{ stuck.id, stuck.reason, stuck.id },
+        ),
+        .nothing => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; nothing in it can be copied, so it is kept as it is",
+            .{ stuck.id, stuck.reason },
+        ),
+    };
+    try appendCheckOwned(checks, alloc, "session", .warn, detail);
 }
 
 fn appendSessionDiagnosticsTruncatedCheck(
@@ -344,187 +330,21 @@ fn appendSessionDiagnosticsTruncatedCheck(
     try appendCheckOwned(checks, alloc, "session", .warn, detail);
 }
 
-fn appendSessionsCountUnavailableCheck(
-    checks: *std.ArrayList(Check),
-    alloc: Allocator,
-) !void {
-    try appendCheck(
-        checks,
-        alloc,
-        "sessions",
-        .warn,
-        "exact saved-session count unavailable without a full session scan",
-    );
-}
-
 fn appendSessionsCountCheck(
     checks: *std.ArrayList(Check),
     alloc: Allocator,
     count: usize,
     latest_id: []const u8,
+    older_saved: bool,
 ) !void {
     if (count == 0) {
-        try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
+        // Sessions only an older fx saved are not "no sessions" (D73).
+        if (!older_saved) try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
         return;
     }
 
     const detail = try alloc.print("{d} saved session(s); latest={s}", .{ count, latest_id });
     try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
-}
-
-fn appendSessionDiagnosticChecks(
-    checks: *std.ArrayList(Check),
-    alloc: Allocator,
-    read_store: *const session_store.Store,
-    diagnostics: []const session_store.DoctorDiagnostic,
-) !void {
-    for (diagnostics) |diagnostic| {
-        if (diagnostic.kind == .cleanup_candidate) {
-            const cleanup = read_store.cleanupForDoctor(
-                alloc,
-                diagnostic.session_id,
-            ) catch |err| {
-                const detail = try alloc.print(
-                    "session {s}: cleanup_candidate report_only=true error={s}",
-                    .{ diagnostic.session_id, @errorName(err) },
-                );
-                try appendCheckOwned(checks, alloc, "session", .warn, detail);
-                continue;
-            };
-            const detail = try alloc.print(
-                "session {s}: cleanup_candidate cleanup_removed={d} report_only={d} ignored={d}",
-                .{
-                    diagnostic.session_id,
-                    cleanup.removed,
-                    cleanup.report_only,
-                    cleanup.ignored,
-                },
-            );
-            try appendCheckOwned(
-                checks,
-                alloc,
-                "session",
-                if (cleanup.removed > 0) .ok else .warn,
-                detail,
-            );
-            continue;
-        }
-
-        const status: CheckStatus = switch (diagnostic.kind) {
-            .authority_less_creation_orphan,
-            .authority_transition_pending,
-            .commit_intent_pending,
-            .oversized_legacy_snapshot,
-            .projection_missing,
-            .projection_stale,
-            .canonical_log_large,
-            .canonical_log_compaction_overdue,
-            .canonical_log_compaction_failed,
-            .cleanup_candidate,
-            => .warn,
-            .invalid_authority_transition,
-            .missing_authority,
-            .invalid_authority,
-            .invalid_commit_intent,
-            .projection_invalid,
-            .commit_watermark_missing,
-            .commit_watermark_invalid,
-            .commit_watermark_mismatched,
-            .canonical_state_invalid,
-            .unsafe_path,
-            => .fail,
-        };
-
-        var recovery_buffer: [512]u8 = undefined;
-        const recovery = try recoveryActionForSessionDiagnostic(
-            diagnostic.kind,
-            diagnostic.session_id,
-            &recovery_buffer,
-        );
-        const detail = if (diagnostic.growth_bytes) |growth_bytes|
-            try alloc.print(
-                "session {s}: {s} bytes={d} growth_bytes={d} growth_frames={d}; recovery={s}",
-                .{
-                    diagnostic.session_id,
-                    @tagName(diagnostic.kind),
-                    diagnostic.bytes.?,
-                    growth_bytes,
-                    diagnostic.growth_frames.?,
-                    recovery,
-                },
-            )
-        else if (diagnostic.bytes) |bytes|
-            try alloc.print(
-                "session {s}: {s} bytes={d}; recovery={s}",
-                .{ diagnostic.session_id, @tagName(diagnostic.kind), bytes, recovery },
-            )
-        else
-            try alloc.print(
-                "session {s}: {s}{s}; recovery={s}",
-                .{
-                    diagnostic.session_id,
-                    @tagName(diagnostic.kind),
-                    if (diagnostic.kind == .authority_transition_pending)
-                        " report_only=true"
-                    else
-                        "",
-                    recovery,
-                },
-            );
-        try appendCheckOwned(checks, alloc, "session", status, detail);
-    }
-}
-
-fn recoveryActionForSessionDiagnostic(
-    kind: session_store.DoctorIssueKind,
-    session_id: []const u8,
-    buffer: []u8,
-) ![]const u8 {
-    return switch (kind) {
-        .authority_less_creation_orphan,
-        .authority_transition_pending,
-        .commit_intent_pending,
-        .cleanup_candidate,
-        => "rerun fx doctor after active writers exit; cleanup is guarded",
-
-        .canonical_log_large,
-        .canonical_log_compaction_overdue,
-        => "resume or update the session to trigger compaction",
-
-        .canonical_log_compaction_failed,
-        => "inspect the failed compaction artifact; keep it until no writer is active",
-
-        .oversized_legacy_snapshot,
-        => "rerun migration with --allow-large only after verifying the legacy snapshot",
-
-        .projection_missing,
-        .projection_stale,
-        => "open the session detail or resume it to rebuild projections",
-
-        .commit_watermark_missing,
-        .commit_watermark_invalid,
-        .commit_watermark_mismatched,
-        => std.mem.print(
-            buffer,
-            "run fx session recover {s}; it creates a separate resumable copy and leaves the source unchanged",
-            .{session_id},
-        ),
-
-        .projection_invalid,
-        .canonical_state_invalid,
-        .invalid_commit_intent,
-        => std.mem.print(
-            buffer,
-            "back up ~/.fx/sessions, then inspect this session with fx session {s} --json",
-            .{session_id},
-        ),
-
-        .missing_authority,
-        .invalid_authority,
-        .invalid_authority_transition,
-        .unsafe_path,
-        => "back up ~/.fx/sessions and avoid opening this session until the path is repaired",
-    };
 }
 
 fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {
@@ -822,8 +642,10 @@ test "session count check preserves empty and latest details" {
         checks.deinit(alloc);
     }
 
-    try appendSessionsCountCheck(&checks, alloc, 0, "");
-    try appendSessionsCountCheck(&checks, alloc, 2, "session-2");
+    try appendSessionsCountCheck(&checks, alloc, 0, "", false);
+    try appendSessionsCountCheck(&checks, alloc, 2, "session-2", false);
+    // Sessions only an older fx saved are not "no sessions" (D73).
+    try appendSessionsCountCheck(&checks, alloc, 0, "", true);
 
     try std.testing.expectEqual(@as(usize, 2), checks.items.len);
     try std.testing.expectEqualStrings("sessions", checks.items[0].name);
@@ -870,71 +692,14 @@ test "bounded doctor warnings use existing check stream" {
     }
 
     try appendSessionDiagnosticsTruncatedCheck(&checks, alloc, 64);
-    try appendSessionsCountUnavailableCheck(&checks, alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqualStrings("session", checks.items[0].name);
     try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
     try std.testing.expect(std.mem.find(
         u8,
         checks.items[0].detail,
         "truncated after 64 session directories",
-    ) != null);
-    try std.testing.expectEqualStrings("sessions", checks.items[1].name);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[1].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[1].detail,
-        "unavailable without a full session scan",
-    ) != null);
-}
-
-test "session doctor renders precise watermark and compaction diagnostics" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-    var unused_store: session_store.Store = undefined;
-    const diagnostics = [_]session_store.DoctorDiagnostic{
-        .{
-            .session_id = @constCast("missing-watermark"),
-            .kind = .commit_watermark_missing,
-        },
-        .{
-            .session_id = @constCast("failed-compaction"),
-            .kind = .canonical_log_compaction_failed,
-            .bytes = 1024,
-            .growth_bytes = 512,
-            .growth_frames = 9,
-        },
-    };
-
-    try appendSessionDiagnosticChecks(
-        &checks,
-        alloc,
-        &unused_store,
-        &diagnostics,
-    );
-
-    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
-    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[0].detail,
-        "commit_watermark_missing",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[0].detail,
-        "fx session recover missing-watermark",
-    ) != null);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[1].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[1].detail,
-        "growth_bytes=512 growth_frames=9",
     ) != null);
 }
 

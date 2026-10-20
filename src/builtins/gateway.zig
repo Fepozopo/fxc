@@ -2278,6 +2278,9 @@ pub fn fetchModelIdsCancellable(
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
+    // An active session refetches a stale catalog so newly released models
+    // appear without a restart. Only user activity starts the refetch.
+    .refresh_interval_ms = 5 * std.time.ms_per_min,
 };
 
 pub const ModelCatalogEntry = model_catalog.ModelCatalogEntry;
@@ -2375,10 +2378,15 @@ fn fetchModelCatalogResponse(
 
     const api_key = access.authorizationCredential();
     const gateway_team = modelCatalogHeaderTeam(access);
-    return if (cancel_flag) |flag|
-        gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, flag)
-    else
-        gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
+    // One-shot fetches pass no flag but still get the size cap and deadline.
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    return gateway_client.fetchGatewayJsonCancellable(
+        alloc,
+        api_key,
+        gateway_team,
+        model_catalog_url,
+        cancel_flag orelse &never_cancelled,
+    );
 }
 
 /// The catalog follows the same team contract as `/v1/credits`: it rejects an
@@ -2440,7 +2448,8 @@ fn catalogRequestFailure(err: anyerror) model_catalog.Failure {
     if (isInvalidGatewayResponse(err)) return .{ .category = .malformed_response };
     return .{
         .category = .transport,
-        .retryable = gateway_client.isRetryableGatewayError(err),
+        // A request that hit the fetch deadline is worth retrying.
+        .retryable = err == error.Timeout or gateway_client.isRetryableGatewayError(err),
     };
 }
 
@@ -2456,6 +2465,7 @@ fn isInvalidGatewayResponse(err: anyerror) bool {
         error.HttpChunkTruncated,
         error.HttpHeadersOversize,
         error.UnsupportedCompressionMethod,
+        error.GatewayJsonResponseTooLarge,
         => true,
         else => false,
     };
@@ -2467,12 +2477,19 @@ test "catalog request failures preserve transport and cancellation facts" {
     try std.testing.expect(network.http_status == null);
     try std.testing.expect(network.retryable);
 
+    const timed_out = catalogRequestFailure(error.Timeout);
+    try std.testing.expectEqual(model_catalog.FailureCategory.transport, timed_out.category);
+    try std.testing.expect(timed_out.retryable);
+
     const cancelled = catalogRequestFailure(error.Cancelled);
     try std.testing.expectEqual(model_catalog.FailureCategory.cancellation, cancelled.category);
     try std.testing.expect(!cancelled.retryable);
 
     const malformed = catalogRequestFailure(error.HttpHeadersInvalid);
     try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, malformed.category);
+
+    const oversized = catalogRequestFailure(error.GatewayJsonResponseTooLarge);
+    try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, oversized.category);
 }
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
@@ -2485,25 +2502,11 @@ fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]con
     return alloc.print("{s}{s}", .{ base_url, path });
 }
 
-var stable_models_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableModelsTestEnviron() !*const std.process.Environ.Map {
-    if (stable_models_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_models_test_environ = map;
-    return map;
-}
-
 const ModelsUrlTestEnv = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: std.mem.Allocator, models_url: []const u8) !*ModelsUrlTestEnv {
-        _ = try stableModelsTestEnviron();
-
         const self = try alloc.create(ModelsUrlTestEnv);
         errdefer alloc.destroy(self);
         self.* = .{
@@ -2517,7 +2520,7 @@ const ModelsUrlTestEnv = struct {
     }
 
     fn deinit(self: *ModelsUrlTestEnv) void {
-        if (stable_models_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

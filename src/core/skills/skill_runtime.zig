@@ -5941,25 +5941,11 @@ test "freeSkills accepts static empty slice" {
     freeSkills(std.testing.allocator, &.{});
 }
 
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
 const TestEnviron = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator) !*TestEnviron {
-        _ = try stableEmptyTestEnviron();
-
         const self = try alloc.create(TestEnviron);
         errdefer alloc.destroy(self);
 
@@ -5978,9 +5964,7 @@ const TestEnviron = struct {
     }
 
     fn deinit(self: *TestEnviron) void {
-        if (stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

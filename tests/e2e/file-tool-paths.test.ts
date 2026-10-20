@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
+import { sessionDir } from "./saved-sessions";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
@@ -700,8 +702,12 @@ describe("filesystem path handling", () => {
       } finally {
         firstGateway.stop();
       }
-      const artifact = join(root.home, ".fx", "sessions", sessionId, "tool-results", handle);
-      expect(existsSync(artifact)).toBe(true);
+      // The stored image is one of the session's blobs; damage it on disk.
+      const blobs = join(sessionDir(root.home, sessionId), "blobs");
+      const stored = readdirSync(blobs).filter((name) => readFileSync(join(blobs, name), "utf8").includes(pngBase64));
+      expect(stored).toHaveLength(1);
+      const artifact = join(blobs, stored[0]!);
+      chmodSync(artifact, 0o600);
       writeFileSync(artifact, "this is not valid stored image json");
 
       const secondGateway = startFakeGateway(
@@ -761,14 +767,6 @@ describe("filesystem path handling", () => {
       } finally {
         firstGateway.stop();
       }
-      // The edit snapshots are large, so they live behind a handle and stay
-      // out of the log that resume reads.
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
-      expect(events).toMatch(/"content_handle":"diff-[0-9a-f]{16}-[0-9a-f]{16}\.json"/);
-      expect(events).not.toContain("PARITY_LINE_001_");
 
       const secondGateway = startFakeGateway([finalText("parity follow-up done")]);
       try {

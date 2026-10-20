@@ -1625,20 +1625,25 @@ test "common Stop interruption keeps only completed calls from a partially attem
         turn.execution.tool_steps[1].tool_results[0].output,
     );
 
-    const session_log = @import("../../../session/session_log.zig");
-    var dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "session");
-    defer dir.close();
-    {
-        const file = try dir.dir.createFile(std.testing.io, "events.jsonl", .{
-            .read = true,
-            .permissions = .fromMode(0o600),
-        });
-        var writer = try session_log.ConversationWriter.init(alloc, file);
-        defer writer.deinit();
-        try writer.appendHistoryTurn(alloc, 1, deps.history_turns.items[0]);
-    }
-    const history = try session_log.loadConversationHistoryRange(alloc, &dir, 0, 1);
-    defer types.freeHistoryTurnSlice(alloc, history);
+    // The interrupted turn is saved and read back the way a resume reads it.
+    const session_adapter = @import("../../../session/session_adapter.zig");
+    var store = try session_adapter.Store.open(alloc, result_dir);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const saved = try session_adapter.Session.create(alloc, &store, fixture.workspace_root, .ask, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    try saved.commitTurn(deps.history_turns.items[0], types.ConversationLanguage.default());
+    const id = try alloc.dupe(u8, saved.id());
+    defer alloc.free(id);
+    saved.close();
+    const resumed = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = id }, fixture.workspace_root, .ask);
+    defer resumed.close();
+    var restored = try resumed.restore(alloc);
+    defer restored.deinit(alloc);
+    const history = restored.history;
     try std.testing.expectEqual(@as(usize, 1), history.len);
     var follow_gateway = FakeGateway.init(alloc, &.{.{ .content = "resumed" }});
     defer follow_gateway.deinit();

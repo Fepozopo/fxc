@@ -3311,29 +3311,11 @@ test "persisted file index paints a stale preview and the real scan replaces it"
         file.close(zio);
     }
 
-    const empty_environ = struct {
-        var map: ?*std.process.Environ.Map = null;
-        fn get() !*const std.process.Environ.Map {
-            if (map) |value| return value;
-            const value = try std.heap.page_allocator.create(std.process.Environ.Map);
-            value.* = std.process.Environ.Map.init(std.heap.page_allocator);
-            map = value;
-            return value;
-        }
-    };
-    {
-        const empty = try empty_environ.get();
-        io_mod.setEnvironMap(empty);
-    }
     var home_map = std.process.Environ.Map.init(alloc);
     defer home_map.deinit();
     try home_map.put("HOME", home);
     io_mod.setEnvironMap(&home_map);
-    defer {
-        if (empty_environ.get()) |empty| {
-            io_mod.setEnvironMap(empty);
-        } else |_| {}
-    }
+    defer io_mod.resetEnvironForTest();
 
     const scope = workspace_access.AccessScope.primaryOnly(root);
     const roots = [_][]const u8{root};

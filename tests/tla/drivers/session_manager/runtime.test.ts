@@ -22,7 +22,7 @@ function fixture(label: string) {
     AI_GATEWAY_API_KEY: "synthetic-tlc-runtime-fixture", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-    FX_MODEL: FAKE_GATEWAY_MODEL, FX_SESSIONS_V2: "1", FX_PERMISSION_MODE: "full-access",
+    FX_MODEL: FAKE_GATEWAY_MODEL, FX_PERMISSION_MODE: "full-access",
     FX_AUTO_UPGRADE: "0", FX_SOUND: "0", NO_COLOR: "1", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "wiring",
   });
   function start(gateway: any, args: string[]) {

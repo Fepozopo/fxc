@@ -105,7 +105,7 @@ lifecycle.
 - State is the fold of the log.
 - The manager assigns `seq`, enforces the turn rules and takes every lock.
 - fx reaches it through one adapter file.
-- v1 and v2 run side by side behind a backend switch until v1 is removed.
+- v2 is the only store; a v1 session converts when it is opened (D53, D59).
 
 **Preserved:** every binding contract above, the host entry points, the
 `sessionStore` SDK API, and the agent loop's existing callbacks.
@@ -320,8 +320,9 @@ manager:
 - **Settings:** `set` replaces the whole value, so the adapter writes fx's
   merged preferences. `title` holds a JSON string; whether a title was
   generated or typed stays in fx's `prefs`.
-- **Compaction:** `compacted.data` names the seq of the first kept line when
-  fx keeps a tail; the adapter reads back to it from `compaction_offset`.
+- **Compaction:** `compacted.data` names the first turn fx keeps, which the
+  adapter reads back to from `compaction_offset`, and how many of that
+  turn's steps and steering messages the summary covers (D87).
 - **Order:** `turn_started` comes before `put_blob`, which refuses earlier.
 - **Subagents (D22):** names, the agent, the request fingerprint and failure
   text go in child `data`; a child's instructions go in the child's own
@@ -354,8 +355,8 @@ manager:
   time is at least the marker's (D20, `Wiring.tla`).
 
   fx has since dropped its local usage ledger and these markers with it,
-  so this item and the usage steps in `Wiring.tla` describe the design
-  before that change.
+  so this item describes the design before that change, and `Wiring.tla`
+  no longer models it (D85).
 - **Checks the adapter keeps:** tool call and result pairing, and v1's
   per-piece size rules, before anything reaches `append`.
 
@@ -402,7 +403,7 @@ reused as ideas; no v1 code is shared.
 | Derived file `index.jsonl` | Listing and `.last` or `.last_opened` without opening every session | `session_catalog_cache.zig` (`.resume-catalog`), v1 `continue/` files | Keyed to stat fingerprints of v1 files; the remembered session lives in a separate file | Written by the manager on create, open, title, workspace or language change, close and delete; rebuilt by scanning logs | Replaces `.resume-catalog` and `continue/` |
 | Folder `blobs/` per session | Large bodies kept out of the log and shared with forks through hard links | `result_store.zig`, `command_replay_store.zig`, the `images/` dir, `web_fetch_artifacts.zig` | Four stores with their own formats, and no fork rule | Written before the line that references it; removed with its session | Replaces those four stores (D6) |
 | L0 `storage_js` | wasm persistence without changing the SDK (D9) | `js_host_session_store.zig` | It stores whole v1 state snapshots, not a log | Created by the wasm host profile; commits at durability points | Replaces `js_host_session_store.zig` |
-| fx v1 converter | Carry v1 sessions into v2 under the same ids (D8) | `session_store.zig::migrateLegacyStorageOnly` | It migrates only between v1 formats | fx background task on the first v2 run; writes through `open(.import)` | Temporary; deleted with the v1 reader one release after v2 becomes the default |
+| fx v1 converter | Carry v1 sessions into v2 under the same ids (D8) | `session_store.zig::migrateLegacyStorageOnly` | It migrates only between v1 formats | Converts a v1 family when it is first opened, or every family through `fx sessions convert` (D59, D61); writes through `open(.import)` | Kept with v1's read path, with no release set for its removal (D65) |
 
 ## Durable State And Schema
 
@@ -417,8 +418,9 @@ reused as ideas; no v1 code is shared.
   on wasm):
   - after a batch containing `turn_committed`, `turn_interrupted`,
     `set permissions`, `set usage`, `child_spawned` or `child_finished`
-    (`set usage` since the wiring check: fx clears its usage-recovery
-    marker only after the usage is durable, `Wiring.tla`);
+    (`set usage` since the wiring check, while fx cleared a usage-recovery
+    marker only after the usage was durable; `Wiring.tla` modeled it until
+    D85);
   - on `close()`;
   - on the first publish;
   - at the end of `open(.resume)` repair.
@@ -461,12 +463,13 @@ reused as ideas; no v1 code is shared.
     and children.
   - It is crash-safe (staged in `.tmp`) and safe to rerun (Exists means
     skip).
-  - v1 files are left untouched.
+  - A family's v1 folders are removed once its v2 copy is durable (D60),
+    except one that keeps a file the conversion left out (D56, D62).
   - wasm v1 snapshots are converted the same way through `sessionStore`.
   - A session converted earlier and then continued in an old fx binary is
     not re-imported, because its id already exists; the newer turns stay
     only in the v1 copy.
-  - v1 terminal state is not converted (D13).
+  - v1 hosted terminal state moves to `~/.fx/terminal/{id}/` (D13, D56).
   - It skips `~/.fx/sessions/v2` itself, the v2 root (D19).
   - v1 event kinds map one to one: `user`, `assistant`, `tool_call`,
     `tool_result` and `steering` become `item` lines with that `type`;
@@ -596,13 +599,14 @@ The figures are medians from 2026-09-27 on a Mac (APFS, SSD).
   - standalone first;
   - then side by side behind the switch;
   - then v2 by default, with the one-time conversion;
-  - then v1 removed one release later.
+  - then v1 removed, keeping the converter and v1's read path (D65).
 - **Mixed state:** v1 and v2 use separate roots, `~/.fx/sessions/{id}` and
   `~/.fx/sessions/v2/` (D19), and one process uses one backend.
 - **Switch (D26):** `--sessions-v2` on `fx` and `fx ask`, or
   `FX_SESSIONS_V2=1` for any host, including ACP launched by an editor and
-  the E2E suite. It is off by default. Subagents follow their parent's
-  process, and the wasm build stays on v1 until `storage_js` lands.
+  the E2E suite. It was off by default. Subagents followed their parent's
+  process, and the wasm build stayed on v1 until `storage_js` landed. D53
+  removed the switch with v1.
 - **Side files while the switch exists (D27):** per-session side folders
   (tool results, images, command logs, artifacts, background and terminal
   state) keep v1's layout under an fx-owned `~/.fx/session-files/{id}/`,
@@ -611,11 +615,12 @@ The figures are medians from 2026-09-27 on a Mac (APFS, SSD).
 - **Rollback:**
   - Before the default flips, switching back to v1 hides v2 sessions but
     loses nothing.
-  - After the conversion, a downgraded fx still sees every v1 session, but
-    nothing done in v2.
-- **Removal condition:** v1, the converter and the v1 reader are deleted one
-  release after v2 becomes the default. That requires the E2E session suite,
-  the SDK resume test and a dogfood window to pass with no v2 regression.
+  - After the conversion, a downgraded fx sees only the v1 folders a
+    conversion did not remove (D60): the sessions not yet converted and
+    those that keep a file the conversion left out (D56, D62). It sees nothing
+    done in v2.
+- **Removal condition:** none. The converter and v1's read path stay, so a
+  user can open a v1 session after any number of releases (D65).
 
 ## Reliability And Recovery
 
@@ -997,7 +1002,7 @@ Settled while moving off the side folder (2026-10-01):
   session is open. Prompt images are captured before the
   session is on disk, where no blob can be written, so they are saved
   inside the user's item, as libfx saves them; a large item is a blob
-  already. fx's own size limits stay where they are. **Why:** one folder per session,
+  already, and D79 also keeps each image as a blob. fx's own size limits stay where they are. **Why:** one folder per session,
   forks that hard-link instead of copying, no orphan side folders, and
   content addressing that makes a stored body unforgeable. **Alternative:**
   keep today's handle names with an index from name to blob, which grows
@@ -1135,7 +1140,11 @@ D59 replaces D55's import at start with conversion on open):
   carries what a user would otherwise lose: side files as blobs with old
   handles mapped as D47 maps them; ACP client prompts and tool identities
   as D46's settings; hosted terminal state into `~/.fx/terminal/{id}`
-  (D45); `-c`'s remembered app session as v2's last-opened when v2 has
+  (D45), whatever its folders' modes, as v1 made each private when it
+  opened it, while an entry the copy can't take (a link, a FIFO, a file
+  that does not open, or nesting deeper than 8 folders) is left out and
+  named, and the member's v1 folder keeps it, as D62 keeps a side file
+  (2026-10-19); `-c`'s remembered app session as v2's last-opened when v2 has
   none; and a `recovery.json` open turn as an interrupted turn with its
   saved pieces (D1), exactly when v1 would show it: v1 drops a checkpoint
   whose turn is not open in its log. It carried unsettled usage markers
@@ -1144,42 +1153,43 @@ D59 replaces D55's import at start with conversion on open):
   state a v1 session holds outside `session.json` and its event log.
   **Alternative:** convert the conversation only.
 - **D57 Decision:** v1 is removed in one step after the converter ships:
-  the writer, store, listing, catalog, migration, recovery and every host
-  branch, leaving only the converter's read path. One release later the
-  converter and that path go too (D8). wasm and libfx persistence is
-  decided separately and blocks only the JS-host snapshot
-  store and the codec parts it needs. **Why:** each release ships one
-  store and no unused code. **Alternative:** remove v1 module by module
-  across several releases.
+  the writer, store, listing, catalog, migration, recovery and every
+  host branch, leaving only the converter's read path. One release later
+  the converter and that path go too (D8); D65 keeps them. wasm and
+  libfx persistence is decided separately and blocks only the JS-host
+  snapshot store and the codec parts it needs. **Why:** each release
+  ships one store and no unused code. **Alternative:** remove v1 module
+  by module across several releases.
 
 Settled for `/fork` (2026-10-02):
-- **D58 Decision:** `/fork` in the interactive app, on v2, opens a menu of
-  the session's prompts, oldest at the top and the newest selected, each
-  shown up to three lines and then `…`. Picking one forks the session
-  before that prompt: the manager's `open(.fork)` copies the log to the
-  end of the previous turn under a new id and hard-links the blobs (D5),
-  so the source is never written. The app switches to the fork as a
-  resume does, opening it before it closes the source (D41), writes
-  `original session fx --sessions-v2 --resume` and the source's id in the
-  transcript, and puts the prompt back in the input box. The fork's title is the source's with
-  ` (fork)` once. `/fork` waits for a running turn to end, and without
-  v2 it says it needs `--sessions-v2`. Subagent children and hosted
-  terminals stay with the source, since the fold counts children only
-  after a fork point. The adapter adds two calls: `forkPoints`, each
-  turn's prompt and number, and `fork(before_turn, …)`. **Why:** the
-  manager already forks at turn boundaries, so the feature adds no
-  format and no new way to write a log. **Alternative:** fork after the
-  chosen turn's reply; or copy the log in fx instead of the manager.
-  `Fork.tla` models the manager's fork at a boundary with blob links.
-  `Wiring.tla` gains `Fork`: on v2, between turns and with no child
-  running, a session that never existed becomes the one to switch to,
-  and the source is not written (`ForkIsNewSession`, `ForkLeavesSource`,
-  `ForkBetweenTurns`). `trace/check_wiring_traces.py` checks the
-  `wiring` traces of `/fork` runs against `Wiring`, and
-  `trace/check_saved_logs.py` checks each saved log against
-  `TurnLifecycle` and, for a fork, `trace/ForkLog.tla`, which accepts
-  only a copy that is the source's first lines byte for byte, ending at a
-  turn boundary.
+- **D58 Decision:** `/fork` in the interactive app opens a menu
+  of the session's prompts, oldest at the top and the newest selected,
+  each shown up to three lines and then `…`. Picking one forks the
+  session before that prompt: the manager's `open(.fork)` copies the log
+  to the end of the previous turn under a new id and hard-links the
+  blobs (D5), so the source is never written. The app switches to the
+  fork as a resume does, opening it before it closes the source (D41),
+  writes `original session fx --resume` and the source's id in the
+  transcript, and puts the prompt back in the input box. The fork's title
+  is the source's with ` (fork)` once. `/fork` waits for a running turn
+  to end. (Until D53 removed the switch, the line named `--sessions-v2`
+  and `/fork` refused without it.)
+  Subagent children and hosted terminals stay with the source, since the
+  fold counts children only after a fork point. The adapter adds two
+  calls: `forkPoints`, each turn's prompt and number, and
+  `fork(before_turn, …)`. **Why:** the manager already forks at turn
+  boundaries, so the feature adds no format and no new way to write a
+  log. **Alternative:** fork after the chosen turn's reply; or copy the
+  log in fx instead of the manager. `Fork.tla` models the manager's fork
+  at a boundary with blob links. `Wiring.tla` gains `Fork`:
+  between turns and with no child running, a session that never existed
+  becomes the one to switch to, and the source is not written
+  (`ForkIsNewSession`, `ForkLeavesSource`, `ForkBetweenTurns`).
+  `trace/check_wiring_traces.py` checks the `wiring` traces of `/fork`
+  runs against `Wiring`, and `trace/check_saved_logs.py` checks each
+  saved log against `TurnLifecycle` and, for a fork,
+  `trace/ForkLog.tla`, which accepts only a copy that is the source's
+  first lines byte for byte, ending at a turn boundary.
 
 Settled for the converter (2026-10-06):
 - **D59 Decision (amends D55 and D57):** a v1 session converts when it
@@ -1256,13 +1266,229 @@ Settled for the converter (2026-10-06):
   family had peaked at 3.6 GB); families with children are read twice.
   A side file over v2's per-file limit (one real 16.8 GB command replay)
   is left out, named in the trace and the convert output, and the rest of
-  the family converts. The v2 listing must stay fast at the size
-  conversion creates (about 14,000 sessions took 1.9 s a page): fixed in
-  this change, gated by the manager's benchmark. A usage marker move came
-  with this decision and went with fx's usage ledger. **Why:** the real
-  run showed each
-  limit. **Alternative:** keep whole families in memory, refuse the
+  the family converts. That member's v1 folder is then kept rather than
+  removed (D60), so the file stays where it was, and the notice and the
+  convert output name the folder (2026-10-19). The copy names the first
+  32 files it left out and counts them all, in place of its v1
+  fingerprint, so a later open, or a reuse of the member after a crash,
+  keeps that folder whatever has changed in it since, a reuse names those
+  files again, an older fx finds no fingerprint to match and keeps the folder too, and `fx doctor` counts
+  such folders, a subagent's among them. `V1Conversion.tla`'s `keeps`
+  holds such members, and `NoLossOnDelete` checks that no conversion or
+  cleanup removes their folders. The v2 listing must stay fast at the
+  size conversion creates (about 14,000 sessions took 1.9 s a page):
+  fixed in this change, gated by the manager's benchmark. A usage marker
+  move came with this decision and went with fx's usage ledger. **Why:**
+  the real run showed each limit. **Alternative:** keep whole families in
+  memory, refuse the
   family, or fix the listing later.
+
+Settled for removing v1 (2026-10-16):
+- **D63 Decision:** libfx's `createFxTerminal({ sessionStore })` keeps
+  saving conversations as the snapshots `js_host_session_store` writes
+  through `session_codec`, unchanged, and so do the codec parts that
+  `sdk/durable.js` uses. Removing v1 removes v1's store on disk, not this
+  format: an app's store holds data fx cannot convert for it. **Why:** no
+  app's saved conversations are lost. **Alternative:** move the snapshots
+  to v2's log, with a conversion in the SDK.
+- **D64 Decision:** `fx session recover` on a v1 session salvages it as
+  v1's recover did: it copies the start that v1's validated prefix keeps
+  (a schema-3 session's manifest boundary) into a fresh v2 session with
+  a new id, and never changes the v1 session, which stays listed and can
+  be salvaged again. A healthy v1 session answers that no recovery is
+  needed, in an older format too, where v1 asked for `migrate` first;
+  damage v1 could not get past is reported as such, a busy one is
+  busy, and a subagent child is refused as v1 refused it.
+  `V1Conversion.tla` models it (`SBegin`, `SFinish`,
+  `SalvageLeavesSource`, `RefusedOnlyWithCause`) with two kinds of damage:
+  one v1's recover salvages and one it cannot. **Why:** a user with a
+  damaged v1 session keeps the way back v1 gave. **Alternative:** drop
+  salvage, which leaves such a session unreadable.
+- **D65 Decision (amends D8 and D57):** removing v1 keeps the converter
+  and v1's read path, with no release set for their removal: a user may
+  open a v1 session after any number of releases. Everything else of v1
+  goes in one change: the writer, the switch, the listing and catalog,
+  migration and every host branch. The converter's checks run against
+  v1 sessions written by a built v1 writer, the last commit with v1 and
+  older releases, since the new build writes no v1. **Why:** no user's
+  session becomes unreadable. **Alternative:** remove the converter one
+  release later, as D57 had it.
+- **D66 Decision:** a v1 session today's v1 cannot continue stays as it
+  is, read only: a schema-3 prompt that is not UTF-8, which v1 shows but
+  cannot continue or salvage (`InvalidConversationEvent`), is refused by
+  the converter with the file, the turn and the reason, and `fx session`
+  shows it. **Why:** the new build loses nothing v1 had, and adds no
+  rewriting of a prompt. **Alternative:** convert it with each invalid
+  sequence replaced by U+FFFD.
+
+Settled while removing v1 (2026-10-17):
+- **D67 Decision:** the v2 store checks `~/.fx`, `~/.fx/sessions` and
+  `v2` when it opens and refuses one that is not a real folder, such as
+  a file or a symlink, with `SessionPathUnsafe` before any session is
+  asked for: `fx ask` warns and runs without saving, as v1 did, and a
+  resume fails with that error. A missing folder is made by the first
+  write; one others can read converts (D61). **Why:** every write would
+  fail on such a path, and the user hears why before the turn.
+  **Alternative:** fail at the first write, mid-turn.
+- **D68 Decision:** the converter's tests read copies of sessions a v1
+  release wrote, committed under `tests/fixtures/v1-sessions/` and made
+  by its `generate.ts` with v0.0.14, instead of sessions a v1 writer in
+  the tree makes. Tests that could only set up through that writer are
+  deleted; the cases that still matter on the surviving path are kept as
+  fixture tests: a symlinked side folder, a legacy authority fence, zero
+  image ids and a FIFO in a session. **Why:** the writer goes with v1,
+  and a release's output is what users have on disk. **Alternative:**
+  keep the v1 writer for tests only.
+- **D69 Decision:** the converter repairs a schema-2 session's prompt
+  image ids as v1's resume did (`repair_legacy_zero_image_ids`): images
+  saved with id 0 get the numbers v1 gave them, and the prompt's text is
+  renumbered to match. **Why:** a converted session shows its images as
+  v1 showed them. **Alternative:** keep the zeros, which collide.
+- **D70 Decision:** a schema-2 snapshot with a pending `legacy_to_v3`
+  authority fence is refused (`InvalidSessionFormat`) and keeps its v1
+  folder for `fx session recover`; one whose upgrade already published
+  converts despite a leftover fence. **Why:** as in v1, an upgrade left
+  half done is not guessed at. **Alternative:** convert past the fence.
+- **D71 Decision:** resuming a subagent child's id directly, with `fx
+  ask --resume-id`, `fx --resume` or ACP `session/load`, fails with v1's
+  message: subagent child sessions cannot be resumed directly; message
+  the named agent from its parent session. **Why:** it tells the user
+  what to do instead. **Alternative:** a plain not-found.
+- **D72 Decision:** `fx session recover` on a v1 session whose
+  `permissions.json` is malformed or empty copies its conversation
+  without the saved permission rules, says so
+  (`permission_rules_dropped`), and leaves the v1 session as it was. A
+  resume still refuses to convert it. **Why:** a damaged file of rules
+  does not cost the conversation. **Alternative:** refuse, as conversion
+  does.
+- **D73 Decision:** `fx doctor` counts the v1 sessions not converted yet
+  and names each one that cannot be converted, with its reason and what
+  `fx session recover` would copy: the conversation without its rules,
+  its good turns, or nothing. It reads each with the converter's own
+  check, skips a busy one, and shares doctor's limit on sessions
+  checked. **Why:** a user sees which old sessions need attention before
+  opening them. **Alternative:** report only v2 sessions.
+- **D74 Decision:** salvage checks each side file that a kept tool
+  result or command replay names, by its size and the digest in its
+  handle. A missing or changed file is left out, its result says the
+  content is unavailable, and the recovery reports
+  `recovered_with_unverified_artifacts` and exits 1. v1 refused the
+  whole recovery. **Why:** a damaged side file costs one result, not the
+  session. **Alternative:** refuse, as v1 did.
+- **D75 Decision:** a v1 log whose context checkpoint splits a tool call
+  from its result keeps converting: the model gets the checkpoint's
+  summary, then the whole first turn, and `fx session recover` answers
+  that no recovery is needed. **Why:** nothing is lost. **Alternative:**
+  drop the split turn.
+- **D76 Decision:** `--resume last` and `fx session last`, when they
+  find nothing to open but skipped an unreadable v1 session, fail with
+  `NoReadableSessions` instead of `NoSavedSessions`. **Why:** the user
+  learns that a session exists and is damaged. **Alternative:** say
+  there are none.
+- **D77 Decision:** a converted v1 session whose last turn never ended
+  keeps that turn, marked interrupted as failed (D1). v1's next writable
+  open discarded it unless a checkpoint covered it. **Why:** no
+  truncation. **Alternative:** discard it, as v1 did.
+- **D78 Decision:** `fx session --id` on a damaged v1 session fails with
+  `InvalidSessionFormat`, the file and the reason the converter's check
+  gives, and points at `fx doctor`. **Why:** the user can act on it.
+  **Alternative:** a generic message that the session is corrupt.
+- **D79 Decision (amends D44):** prompt images are also kept as blobs.
+  When a turn's user item is written, by a stream, a commit or a
+  conversion's import, each inline prompt image is put as a blob of the
+  session and listed on that item, and the item saves its
+  `snapshot_path` as that blob's path; the bytes stay inside the item.
+  Each request names that blob for every prompt image it sends, as
+  `[Image #N (type) is saved at "<path>".]` ahead of the prompt, and the
+  notice for an image too large to send, or left out to keep a request
+  within its size limit, names the same file, in the running process and
+  after a resume alike: the blob is the file named by
+  the image's hash in the session's blob folder, and the turn writes it
+  with the user item before any of its tools runs, so the model can open
+  the file it is told about. Without a saved session the notice names the
+  copy fx captured in its temporary folder, which lasts while fx runs, and
+  the note is left out. A recalled image has the same bytes, so it names
+  the same blob. **Why:**
+  the model can read the original to make a smaller copy, or open the
+  image it sees with tools, as v1's `images/` folder let it.
+  **Alternative:** tell the model no local file is available.
+- **D80 Decision:** when fx is killed while a response is being retried,
+  the reopened session shows the turn's finished pieces, such as a tool
+  call and its result, and the turn as interrupted, but not the text
+  streamed by the attempt being retried, which v1 kept. With D54 an fx
+  session has no recovery to continue: ACP's `_meta.fx.continueRecovery`
+  answers that the session does not support durable recovery, and serves
+  only libfx sessions that keep a journal. **Why:** text from an attempt
+  being retried is not a result, and the next turn never sends it.
+  **Alternative:** save it in the open turn.
+- **D81 Decision:** when fx relaunches itself after an update and the
+  session it hands over had no turn, so that nothing of it was saved
+  (D2), the new build opens a fresh session with the update's notice
+  instead of failing to find it. Only that relaunch does so; a resume of
+  a missing id typed by a user still fails with `SessionNotFound`.
+  **Why:** v1 saved every session at startup, and an update must not
+  leave the user without fx. **Alternative:** exit with a message saying
+  there was nothing to resume.
+- **D82 Decision:** an image the oldest format (schema 2) saved only as
+  the path of its original file is captured from that file once when the
+  session converts, with the checks of any new capture, as v1's resume
+  did (`repair_legacy_image_snapshots`). One that cannot be captured,
+  because its file is gone, unreadable, not a supported image or too
+  large, is left out of that prompt with a trace line, and the prompt's
+  text stays as it was, as in v1. **Why:** the model sees the images v1
+  sent. **Alternative:** convert them without bytes, which the model
+  never sees.
+- **D83 Decision:** tests of a prompt with many images, one of them
+  damaged, run on a committed v1 fixture, `many-images`: one v0.0.14
+  session with twenty images. The fixture generator takes
+  `FX_FIXTURE_KINDS` to rebuild only the kinds it names. **Why:** a test
+  damages what a user can have, a v1 session's own files; damaging a v2
+  log tests the checksum on every line (D4) instead. **Alternative:**
+  write the damaged session by hand in each test.
+- **D84 Decision:** recalling a prompt from the input history uses the
+  image bytes saved with the prompt, checked against their digest, so a
+  damaged or deleted captured file no longer refuses the recall. The
+  recalled image keeps those bytes inline and writes no file, so its turn
+  saves it as a blob as it does any prompt image (D79); a copy in the
+  temporary folder would be gone once fx exits. The composer tests pin
+  that the recall succeeds and names the same blob. **Why:** the saved
+  bytes are the prompt's image; the captured file is a temporary copy.
+  **Alternative:** read the captured file again, as v1 did.
+- **D85 Decision:** `Wiring.tla` models one store. The backend choice
+  (`Backends`, `backend`, `wrote`, `OneBackend`) and the usage ledger
+  (`usageSplit`, `marker`, `UsageNeverSilent`) leave it, its trace
+  module and its mutants, and `profile_paths` loses the unused usage
+  names. The `rollout/` models keep their own `OneBackend` as the record
+  of the rollout. **Why:** with v1 and the usage ledger gone, those states
+  cannot happen. **Alternative:** keep them, checking states fx cannot
+  reach.
+- **D86 Decision:** `-c`, when the new store remembers no session for the
+  workspace and fx cannot read v1's bookmark (not a plain file, the wrong
+  mode, unreadable or malformed), exits 1 saying the remembered session ID
+  could not be read and naming `fx -r` and `fx --resume <id>`, as v1 did.
+  A missing bookmark still means no remembered session. **Why:** the user
+  learns what happened and what to do instead of seeing an error name.
+  **Alternative:** treat an unreadable bookmark as none.
+- **D87 Decision:** a compaction inside a turn keeps that turn from where
+  the summary ends. Its `compacted` line saves the steps and steering
+  messages of the first kept turn that the summary covers
+  (`keep_tool_steps`, `keep_steering`), and a resume leaves them out of
+  that turn, as fx's history does once it compacts; a later cut inside
+  the same turn counts on from there. The converter takes the same counts
+  from a v1 checkpoint's coverage, as v1's writer counted them, so a
+  converted session shows the model the turn's prompt and the steps after
+  the summary, as v1 did. A line without them, or a turn that no longer has
+  those steps, keeps the whole turn. **Why:** the steps the summary covers
+  reached the model a second time, up to 170 messages in real sessions,
+  enough to fill the window on resume. **Alternative:** keep whole turns.
+- **D88 Decision:** a v1 subagent whose parent is not a v1 root, such as
+  a subagent's own subagent from before v0.0.8 (since then a subagent has
+  no subagent tool, so no fx opens one), or one whose parent is gone or
+  does not list it, is kept as it is. `fx sessions convert` names each
+  under `kept` and `fx doctor` names each too, with the reason, and its
+  family converts without it. **Why:** no v1 session is left unexplained.
+  **Alternative:** convert descendants at every depth, for sessions no
+  build opens.
 
 ## Design Risks And Failure Behavior
 
@@ -1343,11 +1569,10 @@ Settled for the converter (2026-10-06):
   symlinked session path.
 - **Diagnostics:** every repair in the crash matrix emits exactly one
   diagnostics event.
-- **Real path:** fx built with v2 on, `./zig-out/bin/fx` exercised
-  interactively, through `fx ask` and through ACP; the fx E2E session suite
-  and `sdk/tests/test-term-session-resume.mjs` with v2 on.
-- **Regression:** the E2E suite on v1 and on v2; the startup benchmark
-  unchanged.
+- **Real path:** `./zig-out/bin/fx` exercised interactively, through
+  `fx ask` and through ACP; the fx E2E session suite and
+  `sdk/tests/test-term-session-resume.mjs`.
+- **Regression:** the E2E suite; the startup benchmark unchanged.
 
 ## Implementation Freedom
 

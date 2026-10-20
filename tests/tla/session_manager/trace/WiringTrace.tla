@@ -13,12 +13,10 @@
 (* (a process whose tracing starts after its store opened starts at its  *)
 (* first line);                                                          *)
 (* Crash is added by check_wiring_traces.py when a process's lines stop    *)
-(* without Exit. The usage steps (the marker, charges, checkpoints) happen *)
-(* in code the adapter does not see; they change only `usageSplit` and    *)
-(* `marker`, which no traced step reads, so they are left out. Accepted    *)
-(* when every line is an allowed step in turn: `NotDone` then fails.       *)
+(* without Exit. Accepted when every line is an allowed step in turn:     *)
+(* `NotDone` then fails.                                                   *)
 (***************************************************************************)
-EXTENDS Wiring, WiringData, Sequences, TLC
+EXTENDS Wiring, WiringData, Naturals, Sequences, TLC
 
 VARIABLE l
 tvars == <<vars, l>>
@@ -26,7 +24,7 @@ tvars == <<vars, l>>
 ASSUME TLCSet(1, 0)
 
 Act(e) ==
-    CASE e.a = "Start"     -> Start("v2")
+    CASE e.a = "Start"     -> Start
       [] e.a = "Open"      -> Open(e.s)
       [] e.a = "BeginTurn" -> BeginTurn
       [] e.a = "EndTurn"   -> EndTurn(e.e)

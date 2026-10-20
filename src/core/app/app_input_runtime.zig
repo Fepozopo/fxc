@@ -39,7 +39,7 @@ const permissions = @import("../permissions/permissions.zig");
 const session_commands = @import("../session/session_commands.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_runtime = @import("../session/session.zig");
-const session_store = @import("../session/session_store.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const usage = @import("../../usage/usage.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
@@ -2421,11 +2421,17 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Opens the model picker on the cached catalog and revalidates it in
+        /// the background, so models released mid-session appear once it lands.
+        fn openModelMenu(app: *App) !void {
+            if (comptime @hasDecl(App, "revalidateModelCache")) app.revalidateModelCache();
+            try app.model_cache.openMenu();
+        }
+
         fn openModelBrowseCatalog(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
-            if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            try app.model_cache.openMenu();
+            try openModelMenu(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             app.shell.render_requests.request(.footer);
@@ -2580,8 +2586,7 @@ pub fn Runtime(comptime App: type) type {
             const item = menu.selectedItem(&snapshot, query) orelse return;
             if (item.id == .model) {
                 if (delta > 0 and comptime @hasField(App, "model_cache")) {
-                    if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
-                    try app.model_cache.openMenu();
+                    try openModelMenu(app);
                     app.shell.render_requests.request(.footer);
                 }
                 return;
@@ -2622,8 +2627,7 @@ pub fn Runtime(comptime App: type) type {
                     app.input_runtime.edit_state.input.items,
                 ) orelse return true;
                 if (selected.id == .model) {
-                    if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
-                    try app.model_cache.openMenu();
+                    try openModelMenu(app);
                     app.shell.render_requests.request(.footer);
                 }
             }
@@ -5472,7 +5476,7 @@ test "app_input_runtime Tab toggles session picker scope before autocomplete" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.workspace_root = workspace;
-    app.session_persistence.store = try session_store.Store.initFromHome(alloc, home, workspace);
+    _ = try app.session_persistence.adoptStore(alloc, try session_adapter.Store.open(alloc, home));
     app.session_persistence.session_picker.active = true;
     app.session_persistence.session_picker.scope = .current_workspace;
     try app.input_runtime.textReplacementState().replace(alloc, "/sk");

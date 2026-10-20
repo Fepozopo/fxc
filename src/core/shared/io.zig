@@ -432,6 +432,19 @@ pub fn setLibcEnviron() void {
     global_libc_environ = true;
 }
 
+/// Test-only: removes the installed environment, returning to the state a
+/// test binary starts in. `getenv` then finds nothing, as with an empty map,
+/// but child processes inherit the test runner's environment instead of none.
+/// A fixture that installs its own environment calls this on teardown, so a
+/// later test sees the same environment whichever tests ran before it.
+pub fn resetEnvironForTest() void {
+    if (comptime !builtin.is_test) @compileError("resetEnvironForTest is test-only");
+    global_environ = null;
+    global_environ_block = null;
+    global_raw_environ = null;
+    global_libc_environ = false;
+}
+
 pub fn getenv(key: []const u8) ?[]const u8 {
     if (global_environ) |m| return m.get(key);
     if (global_environ_block) |block| return getenvFromBlock(block, key);
@@ -1242,6 +1255,33 @@ test "cloneEnvironMap falls back to the test runner environment" {
     defer expected.deinit();
     var cloned = try cloneEnvironMap(std.testing.allocator);
     defer cloned.deinit();
+    try std.testing.expectEqualStrings(expected.get("PATH").?, cloned.get("PATH").?);
+}
+
+test "resetEnvironForTest gives child processes the test runner environment again" {
+    const previous_map = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    const previous_libc = global_libc_environ;
+    defer {
+        global_environ = previous_map;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+        global_libc_environ = previous_libc;
+    }
+
+    var empty = std.process.Environ.Map.init(std.testing.allocator);
+    defer empty.deinit();
+    setEnvironMap(&empty);
+    resetEnvironForTest();
+
+    try std.testing.expect(environMap() == null);
+    try std.testing.expect(getenv("PATH") == null);
+    var expected = try std.process.Environ.createMap(std.testing.environ, std.testing.allocator);
+    defer expected.deinit();
+    var cloned = try cloneEnvironMap(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqual(expected.count(), cloned.count());
     try std.testing.expectEqualStrings(expected.get("PATH").?, cloned.get("PATH").?);
 }
 

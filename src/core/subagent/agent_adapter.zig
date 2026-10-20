@@ -27,13 +27,12 @@ const execution_memory = @import("../agent/execution_memory.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
-const io_mod = @import("../shared/io.zig");
-const session_codec = @import("../session/session_codec.zig");
 const types = @import("../shared/types.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const tool_host = @import("tool_host.zig");
+const child_state = @import("child_state.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -222,11 +221,6 @@ pub fn run(
         turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
         return error.ProviderFailed;
     };
-    const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));
-        return error.ProviderFailed;
-    };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
@@ -262,8 +256,6 @@ pub fn run(
             .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
             .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
         },
-        .recovery_checkpoint = recovery_checkpoint,
-        .recovery_source_already_presented = recovery_checkpoint != null,
     };
     const child_tool_names = try withoutSubagentNames(
         arena,
@@ -442,15 +434,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        // v2 keeps no paused-response checkpoint (D31), so a v2 child, like
-        // a v2 root, offers the orchestrator no place to save one.
-        .recovery_checkpoint = switch (context.turn.loaded) {
-            .v1 => .{
-                .set = setRecoveryCheckpoint,
-                .clear = clearRecoveryCheckpoint,
-            },
-            .v2 => null,
-        },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
         .push_text = pushLiveText,
@@ -490,7 +473,6 @@ fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8
 }
 
 test "child runtime capability callbacks preserve fallback and child cancellation" {
-    const session_store = @import("../session/session_store.zig");
     const catalog = @import("../gateway/model_catalog.zig");
     const authority = @import("authority.zig");
     const Fixture = struct {
@@ -519,30 +501,17 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
         fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
     };
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    var store = try session_store.Store.initFromHome(alloc, root, root);
-    defer store.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, .{
-        .id = @constCast("capability-parent"),
-        .origin_workspace_root = @constCast(root),
-        .workspace_root = @constCast(root),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
-    });
-    defer writable.deinit(alloc);
-    const host = try tool_host.Runtime.create(alloc, &store, "capability-parent", .{ .resolve_fn = Fixture.resolve }, .{});
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const root = parent.home;
+    const host = try tool_host.Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{});
     defer host.deinit();
-    var turn = try execution.TurnContext.init(alloc, &writable, 0);
+    const child = try parent.openChild("capability-child", &.{});
+    defer child.close();
+    var turn = try execution.TurnContext.init(alloc, child, 0);
     defer turn.deinit();
-    var admission = try domain.captureAdmission(alloc, .{ .parent_id = "capability-parent", .source_id = "capability-parent", .model = "parent-model", .effort = .auto });
+    var admission = try domain.captureAdmission(alloc, .{ .parent_id = parent.parent.id(), .source_id = parent.parent.id(), .model = "parent-model", .effort = .auto });
     defer admission.deinit(alloc);
     var fixture: Fixture = .{};
     var cancel = std.atomic.Value(bool).init(false);
@@ -932,13 +901,7 @@ fn executeToolCall(raw: *anyopaque, request: agent_runtime.ToolExecutionRequest)
 
 fn propagateHistoryTurn(raw: *anyopaque, turn: types.HistoryTurn) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.commit(
-        context.turn.active_work_id orelse return error.StaleWork,
-        turn,
-        context.input_tokens,
-        context.output_tokens,
-        io_mod.milliTimestamp(),
-    );
+    try context.turn.commit(context.turn.active_work_id orelse return error.StaleWork, turn);
 }
 
 fn commitContextCompaction(
@@ -948,20 +911,7 @@ fn commitContextCompaction(
     retained_from: ?types.ContextHistoryCut,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.commitContextCompaction(summary, active_prefix, retained_from, io_mod.milliTimestamp());
-}
-
-fn setRecoveryCheckpoint(
-    raw: *anyopaque,
-    checkpoint: session_codec.RecoveryCheckpoint,
-) !void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.setRecoveryCheckpoint(checkpoint, io_mod.milliTimestamp());
-}
-
-fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.clearRecoveryCheckpoint(io_mod.milliTimestamp());
+    try context.turn.commitContextCompaction(summary, active_prefix, retained_from);
 }
 
 fn reportUsage(raw: *anyopaque, usage: types.Usage) void {

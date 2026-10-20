@@ -85,63 +85,6 @@ pub const EventBoundary = struct {
     semantic: bool,
 };
 
-pub fn encodeManifest(alloc: Allocator, manifest: Manifest) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll(
-        "{\"schema_version\":3,\"storage_format\":\"event_log_v1\",\"id\":",
-    );
-    try writeJsonString(&out.writer, manifest.id);
-    try out.writer.writeAll(",\"authority_id\":");
-    try writeHexString(&out.writer, &manifest.authority_id);
-    try out.writer.writeAll(",\"log_generation\":");
-    try writeHexString(&out.writer, &manifest.log_generation);
-    try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d}", .{
-        manifest.created_at_ms,
-        manifest.updated_at_ms,
-    });
-    try out.writer.writeAll(",\"origin_workspace_root\":");
-    try writeJsonString(&out.writer, manifest.origin_workspace_root);
-    try out.writer.writeAll(",\"workspace_root\":");
-    try writeJsonString(&out.writer, manifest.workspace_root);
-    try out.writer.writeAll(",\"conversation_language\":");
-    try writeJsonString(&out.writer, manifest.conversation_language.view());
-    try out.writer.print(
-        ",\"history_len\":{d},\"total_input_tokens\":{d},\"total_output_tokens\":{d},\"last_event_seq\":{d},\"event_log_bytes\":{d},\"event_log_stat_fingerprint\":",
-        .{
-            manifest.history_len,
-            manifest.total_input_tokens,
-            manifest.total_output_tokens,
-            manifest.last_event_seq,
-            manifest.event_log_bytes,
-        },
-    );
-    try writeHexString(&out.writer, &manifest.event_log_stat_fingerprint);
-    try out.writer.print(",\"generation_base_seq\":{d},\"generation_base_bytes\":{d},\"checkpoint_seq\":", .{
-        manifest.generation_base_seq,
-        manifest.generation_base_bytes,
-    });
-    if (manifest.checkpoint_seq) |seq| {
-        try out.writer.print("{d}", .{seq});
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll(",\"checkpoint_sha256\":");
-    if (manifest.checkpoint_sha256) |digest| {
-        try writeHexString(&out.writer, &digest);
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll(",\"preferences\":");
-    try writePreferences(&out.writer, manifest.preferences);
-    try out.writer.writeByte('}');
-
-    if (out.written().len > manifest_max_bytes) return error.ManifestTooLarge;
-    try validateManifest(manifest);
-    return try out.toOwnedSlice();
-}
-
 pub fn decodeManifest(alloc: Allocator, bytes: []const u8) !Manifest {
     if (bytes.len == 0 or bytes.len > manifest_max_bytes) return error.ManifestTooLarge;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
@@ -427,25 +370,6 @@ fn validateCheckpoint(checkpoint: Checkpoint) !void {
     }
 }
 
-fn writePreferences(
-    writer: *std.Io.Writer,
-    preferences: session_codec.DurableSessionPreferences,
-) !void {
-    try writer.writeAll("{\"model\":");
-    try writeJsonString(writer, preferences.model);
-    try writer.writeAll(",\"effort\":");
-    try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s}", .{
-        if (preferences.fast_mode) "true" else "false",
-    });
-    if (preferences.ultrafast_mode) {
-        try writer.writeAll(",\"ultrafast_mode\":true");
-    }
-    try writer.writeAll(",\"provider\":");
-    try std.json.Stringify.value(preferences.provider, .{}, writer);
-    try writer.writeByte('}');
-}
-
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
     return session_codec.parse_preferences(alloc, value) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -546,48 +470,6 @@ fn writeHexString(writer: *std.Io.Writer, bytes: []const u8) !void {
 
 fn writeJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
     try std.json.Stringify.value(bytes, .{}, writer);
-}
-
-test "manifest serialization is deterministic and capped" {
-    const alloc = std.testing.allocator;
-    const manifest = testManifest();
-
-    const first = try encodeManifest(alloc, manifest);
-    defer alloc.free(first);
-    const second = try encodeManifest(alloc, manifest);
-    defer alloc.free(second);
-    try std.testing.expectEqualStrings(first, second);
-    try std.testing.expect(first.len <= manifest_max_bytes);
-    try std.testing.expect(first[first.len - 1] != '\n');
-
-    var decoded = try decodeManifest(alloc, first);
-    defer decoded.deinit(alloc);
-    try std.testing.expectEqualStrings(manifest.id, decoded.id);
-    try std.testing.expectEqualSlices(u8, &manifest.log_generation, &decoded.log_generation);
-    try std.testing.expectEqual(manifest.last_event_seq, decoded.last_event_seq);
-
-    const oversized_model = try alloc.alloc(u8, manifest_max_bytes);
-    defer alloc.free(oversized_model);
-    @memset(oversized_model, 'm');
-    var oversized = manifest;
-    oversized.preferences.model = oversized_model;
-    try std.testing.expectError(error.ManifestTooLarge, encodeManifest(alloc, oversized));
-}
-
-test "manifest decode semantic validation failure frees owned fields once" {
-    const alloc = std.testing.allocator;
-    const manifest = testManifest();
-    const bytes = try encodeManifest(alloc, manifest);
-    defer alloc.free(bytes);
-
-    var invalid = try alloc.dupe(u8, bytes);
-    defer alloc.free(invalid);
-    const needle = "\"last_event_seq\":9";
-    const replacement = "\"last_event_seq\":0";
-    const pos = std.mem.find(u8, invalid, needle) orelse return error.TestUnexpectedResult;
-    @memcpy(invalid[pos..][0..replacement.len], replacement);
-
-    try std.testing.expectError(error.InvalidManifest, decodeManifest(alloc, invalid));
 }
 
 test "checkpoint decode semantic validation failure frees owned fields once" {
