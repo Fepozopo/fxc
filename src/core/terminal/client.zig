@@ -542,6 +542,9 @@ pub const Runtime = struct {
         std.debug.assert(self.live_correlations.remove(correlation_id));
     }
 
+    /// Publishes a worker's completion and frees the worker and its intent.
+    /// It frees them before the broadcast that lets `deinit` finish, so a
+    /// detached worker never touches the allocator after its runtime stopped.
     fn finishActive(
         self: *Runtime,
         worker: *RequestWorker,
@@ -555,6 +558,9 @@ pub const Runtime = struct {
         self.active_count -= 1;
         self.observeProjectionLocked(worker.intent.request.value, completion);
         self.completions.push(completion);
+        const alloc = self.alloc.?;
+        worker.intent.deinit(alloc);
+        alloc.destroy(worker);
         self.wake.broadcast(zio);
     }
 
@@ -670,8 +676,6 @@ fn workerMain(runtime: *Runtime) void {
                 .kind = .disconnected,
                 .correlation_id = worker.intent.correlation_id,
             });
-            worker.intent.deinit(alloc);
-            alloc.destroy(worker);
             continue;
         };
         thread.detach();
@@ -686,11 +690,9 @@ const RequestWorker = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *RequestWorker) void {
-        const alloc = self.runtime.alloc.?;
-        const completion = self.complete(alloc);
+        const completion = self.complete(self.runtime.alloc.?);
+        // This frees the worker, so nothing here may use it afterwards.
         self.runtime.finishActive(self, completion);
-        self.intent.deinit(alloc);
-        alloc.destroy(self);
     }
 
     fn complete(self: *RequestWorker, alloc: Allocator) Completion {
@@ -957,13 +959,16 @@ test "runtime correlation stays reserved until its completion is taken" {
         admitTestIntent(&runtime, 23),
     );
 
-    var worker = RequestWorker{
+    // Finishing frees the worker and its intent; the testing allocator
+    // reports a leak or a double free if it doesn't free them exactly once.
+    const worker = try std.testing.allocator.create(RequestWorker);
+    worker.* = .{
         .runtime = &runtime,
         .intent = takeIntent(&runtime).?,
     };
     const zio = io_mod.getIo();
     runtime.mutex.lockUncancelable(zio);
-    worker.slot = runtime.registerWorkerLocked(&worker).?;
+    worker.slot = runtime.registerWorkerLocked(worker).?;
     runtime.mutex.unlock(zio);
     try std.testing.expectError(
         error.DuplicateCorrelation,
@@ -971,11 +976,10 @@ test "runtime correlation stays reserved until its completion is taken" {
     );
 
     const correlation_id = worker.intent.correlation_id;
-    runtime.finishActive(&worker, .{
+    runtime.finishActive(worker, .{
         .kind = .cancelled,
         .correlation_id = correlation_id,
     });
-    worker.intent.deinit(std.testing.allocator);
     try std.testing.expect(runtime.live_correlations.contains(correlation_id));
     var completion = runtime.takeCompletion().?;
     completion.deinit();
@@ -1139,6 +1143,15 @@ const LiveTerminalFixture = struct {
 
     /// Starts `command` in a clean bash and returns its owned session id.
     fn start(fixture: *LiveTerminalFixture, command: []const u8) ![]u8 {
+        return fixture.startInShell("/bin/bash", command);
+    }
+
+    /// Starts `command` in a clean `shell_path` and returns its owned session id.
+    fn startInShell(
+        fixture: *LiveTerminalFixture,
+        shell_path: []const u8,
+        command: []const u8,
+    ) ![]u8 {
         const alloc = std.testing.allocator;
         if (fixture.persistence) |*previous| previous.deinit();
         fixture.persistence = try operation.prepareStartPersistence(alloc, .{
@@ -1155,7 +1168,7 @@ const LiveTerminalFixture = struct {
         var started = try fixture.run(.{ .start = .{
             .cwd = fixture.home,
             .command = command,
-            .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+            .shell = .{ .executable = .{ .path = shell_path, .clean_start = true } },
             .backend = .native,
             .return_when = .started,
             .wait_ceiling_ms = 15_000,
@@ -1373,6 +1386,42 @@ test "in-process registry starts writes to and stops a real terminal" {
         contracts.Lifecycle.closed,
         try fixture.recordedLifecycle(sleeper),
     );
+}
+
+test "zsh terminal commands keep words that start with = literal" {
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    const session_id = try fixture.startInShell(
+        "/bin/zsh",
+        "echo before; echo ======; [ x == x ] && echo same; echo after",
+    );
+    defer alloc.free(session_id);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .exited = 0 },
+        try fixture.waitForExit(session_id),
+    );
+
+    var read = try fixture.run(.{ .read = .{
+        .session_id = session_id,
+        .cursor = .{ .segment = 1, .offset = 0 },
+        .authority = fixture.claim(),
+    } });
+    defer read.deinit(alloc);
+    const output = switch (read.view()) {
+        .success => |success| switch (success) {
+            .read => |value| value.output,
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.find(u8, output, "======") != null);
+    try std.testing.expect(std.mem.find(u8, output, "same") != null);
+    try std.testing.expect(std.mem.find(u8, output, "after") != null);
 }
 
 test "closing owned terminals for exit leaves no orphan and records them ended" {

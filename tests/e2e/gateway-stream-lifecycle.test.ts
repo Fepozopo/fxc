@@ -674,7 +674,7 @@ function handle(message) {
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        protocolVersion: "2024-11-05",
+        protocolVersion: "2025-03-26",
         capabilities: { tools: {} },
         serverInfo: { name: "fixture", version: "1.0.0" },
         instructions: "SECRET_SERVER_INSTRUCTION_SENTINEL",
@@ -800,21 +800,20 @@ async function waitForMcpServerReady(
     throw new Error(`Timed out waiting for MCP fixture startup: ${serverName}`);
   }
 
-  const hasServerState = (pane: string, state: "Ready" | "Failed") =>
+  // `/mcp list` prints one row per server, with its status.
+  const hasServerState = (pane: string, state: "ready" | "failed") =>
     pane.split("\n").some((line) =>
-      line.includes(`${serverName} `) && line.includes(state)
+      line.includes(`${serverName} `) && new RegExp(`\\b${state}\\b`).test(line)
     );
   await session.sendText("/mcp list");
   const status = await session.waitForPane(
-    (pane) => hasServerState(pane, "Ready") || hasServerState(pane, "Failed"),
+    (pane) => hasServerState(pane, "ready") || hasServerState(pane, "failed"),
     timeoutMs,
   );
-  await session.sendKeys("Escape");
-  await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
   if (!isProcessAlive(pid)) {
     throw new Error(`MCP fixture process ${pid} exited after startup.\n${status}`);
   }
-  if (hasServerState(status, "Failed")) {
+  if (hasServerState(status, "failed")) {
     throw new Error(`MCP server ${serverName} failed after startup.\n${status}`);
   }
 }
@@ -1181,10 +1180,10 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(16);
+      expect(request.tools).toHaveLength(15);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-        providerToolIndices: [13],
+        providerToolIndices: [12],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
@@ -1192,7 +1191,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors, and quote words that begin with =.",
+        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -7674,37 +7673,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("required MCP server advertises only its ready count before lazy search", async () => {
-    const root = createFixtureRoot("mcp-ready-server-summary");
-    const tracePath = join(root.root, "trace.log");
-    const mcp = writeMcpFixture(root, { required: true, toolCount: 30 });
-    const gateway = startGateway(() => fakeGatewayFinalText("MCP ready summary complete."));
-    try {
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Inspect configured MCP availability."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 20_000,
-        },
-      );
-      const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
-      const initialPrompt = promptText(gateway.requests[0]!.body);
-
-      expect(result.code).toBe(0);
-      expect(initialPrompt).toContain(
-        '<server name="fixture" state="ready" tools="30" />',
-      );
-      expect(gateway.requests[0]!.body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
-      expect(gateway.requests[0]!.body).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
-      expect(gateway.requests[0]!.body).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
-      await waitForProcessExit(pid);
-    } finally {
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  });
-
   test.each([0, 4_000])("canonical subagent executes through parent MCP adapters after %d ms", async (initializeDelayMs) => {
     const root = createFixtureRoot("subagent-mcp-inheritance");
     const tracePath = join(root.root, "trace.log");
@@ -7739,8 +7707,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         return fakeGatewayFinalText("Parent observed child MCP completion.");
       }
       if (body.includes(childPrompt)) {
+        // The parent hasn't used MCP yet, so the child sees the server it
+        // inherits as available on demand.
         expect(promptText(body)).toContain(
-          '<server name="fixture" state="ready" tools="1" />',
+          '<server name="fixture" state="available_on_demand" />',
         );
         expect(body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
         return fakeGatewayToolCall("child_mcp_select_1", "mcp_select_tool", {
@@ -7824,8 +7794,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequested = true;
         return fakeGatewayFinalText("Child with large MCP catalog complete.");
       }
-      return fakeGatewayToolCall("parent_subagent_large_1", "subagent", {
-        request: { action: "run", task: childPrompt },
+      // Servers start when first needed, so the parent searches first: that
+      // loads all 257 tools before the child is made.
+      if (body.includes('"toolCallId":"parent_load_large_1"')) {
+        return fakeGatewayToolCall("parent_subagent_large_1", "subagent", {
+          request: { action: "run", task: childPrompt },
+        });
+      }
+      return fakeGatewayToolCall("parent_load_large_1", "capability_search", {
+        query: "fixture tools",
+        server: "fixture",
       });
     }, {
       classifierDecision: "clear",
@@ -7845,6 +7823,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(parentResult).toContain("Child with large MCP catalog complete.");
       expect(childRequested).toBe(true);
       expect(parseAskJson(result.stdout).tool_calls).toEqual([
+        { name: "capability_search", status: "success" },
         { name: "subagent", status: "success" },
       ]);
     } finally {
@@ -7857,9 +7836,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-mcp-startup-cancel");
     const tracePath = join(root.root, "trace.log");
     const mcp = writeMcpFixture(root, { initializeDelayMs: 4_000 });
-    const gateway = startDynamicFakeGateway(() => fakeGatewayToolCall("cancelled_child", "subagent", {
-      request: { action: "run", task: "Call the inherited MCP echo tool." },
-    }), {
+    // The parent delegates; the child's search starts the server, whose
+    // initialize is still pending when fx is interrupted.
+    let requests = 0;
+    const gateway = startDynamicFakeGateway(() => requests++ === 0
+      ? fakeGatewayToolCall("cancelled_child", "subagent", {
+        request: { action: "run", task: "Call the inherited MCP echo tool." },
+      })
+      : fakeGatewayToolCall("child_starts_mcp", "capability_search", {
+        query: "fixture echo",
+        server: "fixture",
+      }), {
       classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
@@ -7879,14 +7866,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       while (!existsSync(mcp.pidPath) && !exited && Date.now() < startedDeadline) await Bun.sleep(25);
       expect(existsSync(mcp.pidPath)).toBe(true);
       expect(existsSync(mcp.readyPath)).toBe(false);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
       const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
       proc.kill("SIGINT");
       const exitDeadline = Date.now() + 10_000;
       while (!exited && Date.now() < exitDeadline) await Bun.sleep(25);
       expect(exited).toBe(true);
       await waitForProcessExit(pid, 8_000);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
       expect(existsSync(mcp.callLogPath)).toBe(false);
       expect(await stderr).not.toContain("panic:");
       expect(await stdout).not.toContain("state_unavailable");
@@ -10085,6 +10072,100 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
+    }
+  });
+
+  test("a restarted reply refused as too long compacts and finishes the turn", async () => {
+    const root = createFixtureRoot("restarted-reply-overflow");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "seed-notes.txt"), "RESTARTED_OVERFLOW_SEED_NOTES\n");
+    let phase: "seed" | "attempt" = "seed";
+    let attempt = 0;
+    const gateway = startDynamicFakeGateway((raw) => {
+      const body = JSON.parse(raw);
+      if (body.toolChoice?.type === "none" && body.tools?.length === 0) {
+        return fakeGatewayFinalText("Facts:\nF1: RESTARTED_OVERFLOW_SUMMARY: the earlier turn read seed-notes.txt.");
+      }
+      if (phase === "seed") {
+        // The earlier turn reads a file, which leaves work to compact.
+        return raw.includes('"seed-read"')
+          ? fakeGatewayFinalText("SEED_DONE")
+          : fakeGatewayToolCall("seed-read", "read_file", { path: "seed-notes.txt" });
+      }
+      attempt += 1;
+      // The reply is cut off before its finish, so fx restarts it.
+      if (attempt === 1) return sse('data: {"type":"text-delta","id":"answer","delta":"visible partial text"}\n\n');
+      // The provider refuses the restart for its size, before any output.
+      if (attempt === 2) {
+        return Response.json({ error: {
+          type: "invalid_request_error",
+          code: "context_length_exceeded",
+          message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
+        } }, { status: 400 });
+      }
+      return fakeGatewayFinalText("RESTARTED_OVERFLOW_RECOVERED");
+    }, {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128_000, max_tokens: 8192 }],
+    });
+    try {
+      const seed = await runFx(["ask", "--json", "--auto", "Read seed-notes.txt and reply."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 15_000,
+      });
+      expect(seed.code).toBe(0);
+      const sessionId = parseAskJson(seed.stdout).session_id;
+      const seedRequests = gateway.requests.length;
+      phase = "attempt";
+
+      const result = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Continue."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction" },
+        timeoutMs: 15_000,
+      });
+      const json = parseAskJson(result.stdout);
+
+      expect(result.stderr).toContain("Response interrupted. Restarting.");
+      expect(result.stderr).not.toContain("HTTP 400");
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toBe("RESTARTED_OVERFLOW_RECOVERED");
+
+      // The cut-off reply, its refused restart, the compaction's summary
+      // requests, and the restart sent again over the compacted conversation.
+      const requests = gateway.requests.slice(seedRequests).map((request) => request.body);
+      const restart = "Restart that response from the beginning";
+      const isSummary = (raw: string) => {
+        const body = JSON.parse(raw);
+        return body.toolChoice?.type === "none" && body.tools?.length === 0;
+      };
+      expect(requests.length).toBeGreaterThanOrEqual(4);
+      expect(promptText(requests[0]!)).not.toContain(restart);
+      expect(promptText(requests[1]!)).toContain(restart);
+      expect(requests[1]).not.toContain("compacted_conversation");
+      const summaries = requests.slice(2, -1);
+      expect(summaries.every(isSummary)).toBe(true);
+      expect(summaries[0]).toContain("seed-notes.txt");
+      const retry = requests.at(-1)!;
+      expect(isSummary(retry)).toBe(false);
+      expect(promptText(retry)).toContain(restart);
+      expect(retry).toContain("compacted_conversation");
+      expect(retry).toContain("RESTARTED_OVERFLOW_SUMMARY");
+      expect(retry).not.toContain("RESTARTED_OVERFLOW_SEED_NOTES");
+
+      // The session keeps the compaction and the finished reply.
+      const saved = await savedSession(root.home, sessionId);
+      expect(saved.history.some((turn) => turn.kind === "compacted_summary")).toBe(true);
+      expect(saved.history.at(-1)).toEqual(expect.objectContaining({
+        kind: "assistant",
+        user: expect.objectContaining({ text: "Continue." }),
+        assistant: "RESTARTED_OVERFLOW_RECOVERED",
+      }));
+      expect(readFileSync(tracePath, "utf8")).toContain("provider_overflow_recovery");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
     }
   });
 

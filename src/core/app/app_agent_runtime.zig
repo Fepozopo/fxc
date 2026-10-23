@@ -305,7 +305,6 @@ pub fn Runtime(comptime App: type) type {
                 .mcp_search_tools = if (comptime runtime_profile.allows(App, .mcp)) searchMcpTools else null,
                 .mcp_tool_schema = if (comptime runtime_profile.allows(App, .mcp)) mcpToolSchemaJson else null,
                 .mcp_snapshot_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpSnapshotTool else null,
-                .mcp_call_feature = if (comptime runtime_profile.allows(App, .mcp)) callMcpFeature else null,
                 .mcp_progress_ctx = @ptrCast(app),
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .tool_progress_ctx = @ptrCast(app),
@@ -479,10 +478,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: @import("../config/context_limits.zig").Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasDecl(App, "acquireMcpRuntime")) {
-                var lease = app.acquireMcpRuntime() orelse return .unavailable;
-                defer lease.deinit();
-                return lease.runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
+            if (comptime @hasField(App, "mcp")) {
+                return app.mcp.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
             }
             return .unavailable;
         }
@@ -493,21 +490,6 @@ pub fn Runtime(comptime App: type) type {
                 return app.mcpToolSchemaJson(arena, name, permission_rules, access, cancel_flag);
             }
             return null;
-        }
-
-        fn callMcpFeature(
-            raw_ctx: *anyopaque,
-            arena: Allocator,
-            request: tool_mcp_runtime.FeatureRequest,
-            options: tool_mcp_runtime.FeatureCallOptions,
-        ) anyerror!tool_mcp_runtime.FeatureResult {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpRuntimeUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpRuntimeUnavailable;
-            defer lease.deinit();
-            return lease.runtime.callFeatureForModel(arena, request, options);
         }
 
         pub fn resolveToolActionDisplayTarget(
@@ -837,11 +819,7 @@ pub fn Runtime(comptime App: type) type {
                 .project_context = project_context orelse modelVisibleProjectContext(app),
             }, arena, messages);
             var report = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
-                try app.snapshotMcpModelCatalog(
-                    arena,
-                    if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
-                    false,
-                )
+                try app.snapshotMcpModelCatalog(arena)
             else
                 mcp_model_catalog.Report{ .snapshot = try mcp_model_catalog.Snapshot.empty(arena) };
             // The request arena retains the change notice, which outlives this
@@ -999,21 +977,6 @@ pub fn Runtime(comptime App: type) type {
                     .body = preflight_context_notices.written(),
                     .visibility = .full_only,
                 });
-            }
-            if (comptime @hasDecl(App, "waitForRequiredMcp")) {
-                const failure = try app.waitForRequiredMcp(
-                    std.heap.c_allocator,
-                    &app.worker.worker_cancel_requested,
-                );
-                if (failure) |message| {
-                    defer std.heap.c_allocator.free(message);
-                    try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
-                        .topic = "mcp",
-                        .tone = .warning,
-                        .body = message,
-                    });
-                    return error.McpRequiredServerUnavailable;
-                }
             }
             var tool_projection = try app.snapshotModelToolProjection(
                 std.heap.c_allocator,
@@ -1653,8 +1616,6 @@ const FakeApp = struct {
     pub fn snapshotMcpModelCatalog(
         self: *FakeApp,
         alloc: Allocator,
-        _: types.PermissionRuleSet,
-        _: bool,
     ) !mcp_model_catalog.Report {
         return .{
             .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),

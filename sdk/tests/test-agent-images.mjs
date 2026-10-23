@@ -1234,6 +1234,29 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   await restored.close();
 }
 
+// A host tool's image reaches a model the catalog lists with vision but not
+// file-input, as it lists the default spacexai/grok-4.7: file-input covers
+// documents such as PDFs, and image input needs only vision.
+{
+  const model = "sdk/vision-only-model";
+  const modelCatalog = [{ id: model, type: "language", tags: ["reasoning", "tool-use", "implicit-caching", "vision", "structured-output"] }];
+  const gateway = mockGateway((body, step) => {
+    if (step === 1) return toolResponse("load_image", {});
+  });
+  const agent = await createAgent(gateway, {
+    model,
+    modelCatalog,
+    tools: [{ name: "load_image", description: "Load the host image", inputSchema: { type: "object" }, execute: () => ({ type: "libfx.tool-result", text: "host image", images: [{ type: "image", data: pngData, mimeType: "image/png" }] }) }],
+  });
+  assert.equal((await runPrompt(agent, "load the image")).stopReason, "end_turn");
+  assert.equal(gateway.state.chatBodies.length, 2);
+  const followup = gateway.state.chatBodies[1];
+  assert.deepEqual(fileParts(followup), [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }]);
+  assert.doesNotMatch(JSON.stringify(followup.prompt), /Tool images were retained but not sent/);
+  assert.ok(!followup.tools.some((item) => item.name === "vision"), "a native image model is not offered the vision tool");
+  await agent.close();
+}
+
 // Rich host results share the existing data/count/frame limits. Referenced
 // overflow falls back to metadata; no-ref and malformed results remain errors.
 {

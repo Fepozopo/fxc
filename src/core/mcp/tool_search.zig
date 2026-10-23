@@ -1,12 +1,6 @@
-const server_views = @import("server_views.zig");
 const std = @import("std");
-const server_connection = @import("server_connection.zig");
-const io_mod = @import("../shared/io.zig");
-const mem_utils = @import("../shared/mem_utils.zig");
 const selected_schema = @import("selected_schema.zig");
 const tool_names = @import("tool_names.zig");
-const tool_catalog = @import("tool_catalog.zig");
-const tool_snapshot = @import("tool_snapshot.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
@@ -18,105 +12,44 @@ const Allocator = std.mem.Allocator;
 const mcp_server_instruction_search_bytes = context_limits.Name.mcp_server_instructions_bytes.defaultBytes();
 const mcp_tool_description_search_bytes: usize = 2 * 1024;
 const mcp_tool_schema_search_bytes: usize = 4 * 1024;
-const operation_authority = @import("operation_authority.zig");
 const catalog_state = @import("catalog_state.zig");
 const McpTool = catalog_state.McpTool;
-const OperationAccessGuard = operation_authority.Guard;
-const bindingForSnapshot = tool_snapshot.binding;
-const serverAuthenticationState = server_views.serverAuthenticationState;
-const McpServer = server_connection.Server;
-const CatalogAuthWitness = tool_catalog.CatalogAuthWitness;
-const catalogAuthWitness = tool_catalog.catalogAuthWitness;
-const validateCatalogAuthWitnesses = tool_catalog.validateCatalogAuthWitnesses;
-
-pub fn search(
-    alloc: Allocator,
-    runtime_generation: u64,
-    server_handles: []const *McpServer,
-    request: capability_retrieval.Request,
-    permission_rules: types.PermissionRuleSet,
-    limits: context_limits.Values,
-    operation_access: *const OperationAccessGuard,
-) !tool_mcp_runtime.SearchResult {
-    if (try renderAuthenticationRequired(
-        alloc,
-        server_handles,
-        operation_access,
-        request.server orelse request.query.raw,
-    )) |output| {
-        return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
-    }
-    if (request.server) |name| {
-        if (try renderServerFailure(alloc, server_handles, operation_access, name)) |output| {
-            return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
-        }
-    }
-    var candidate_capacity: usize = 0;
-    var server_configured = request.server == null;
-    for (server_handles) |server| {
-        if (request.server) |name| {
-            if (!std.mem.eql(u8, server.config.name, name)) continue;
-            server_configured = true;
-        }
-        if (!server.isPublished()) continue;
-        candidate_capacity = try std.math.add(
-            usize,
-            candidate_capacity,
-            server.tool_catalog.tools.items.len,
-        );
-    }
-    if (!server_configured) return .{ .model_output = try alloc.dupe(u8, server_not_found_output) };
-    const candidates = try alloc.alloc(Candidate, candidate_capacity);
-    defer alloc.free(candidates);
-    // The catalog is read here, so each candidate's auth generation is too.
-    const witnesses = try alloc.alloc(?CatalogAuthWitness, candidate_capacity);
-    defer alloc.free(witnesses);
-    var identity_scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer mem_utils.deinit_arena(identity_scratch_state);
-    const identity_scratch = identity_scratch_state.allocator();
-    var candidate_count: usize = 0;
-    for (server_handles) |server| {
-        if (request.server) |name| {
-            if (!std.mem.eql(u8, server.config.name, name)) continue;
-        }
-        if (!server.isPublished() or server.state.load(.acquire) != .ready) continue;
-        if (!tool_catalog.serverCatalogAvailable(server)) continue;
-        if (!operation_access.allows(.{ .tool_server = server.config.name })) continue;
-        if (!server.isPublished()) continue;
-        for (server.tool_catalog.tools.items) |*tool| {
-            if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
-            if (!try searchable(identity_scratch, permission_rules, server.config.name, tool)) continue;
-            candidates[candidate_count] = .{
-                .server_name = server.config.name,
-                .instructions = server.instructions,
-                .tool = tool,
-                .binding = bindingForSnapshot(runtime_generation, server, tool.*),
-            };
-            witnesses[candidate_count] = if (catalogAuthWitness(server)) |generation| .{ .server = server, .generation = generation } else null;
-            candidate_count += 1;
-        }
-    }
-    var matched: std.ArrayList(usize) = .empty;
-    defer matched.deinit(alloc);
-    var result = try rank(alloc, candidates[0..candidate_count], request, limits, &matched);
-    errdefer result.deinit(alloc);
-    var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
-    defer auth_witnesses.deinit(alloc);
-    for (matched.items) |index| {
-        const witness = witnesses[index] orelse continue;
-        for (auth_witnesses.items) |seen| {
-            if (seen.server == witness.server) break;
-        } else try auth_witnesses.append(alloc, witness);
-    }
-    try validateCatalogAuthWitnesses(auth_witnesses.items);
-    return result;
-}
 
 const server_not_found_output = "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_not_found\"}";
 
 /// The page a search names no configured server for.
 pub fn renderServerNotFound(alloc: Allocator) ![]u8 {
     return alloc.dupe(u8, server_not_found_output);
+}
+
+/// `page`, a search's JSON object, with why each server it couldn't look in
+/// was skipped, so a model that found nothing hears why. Takes `page`.
+pub fn withUnavailable(alloc: Allocator, page: []u8, reasons: []const []const u8) ![]u8 {
+    if (page.len == 0 or page[page.len - 1] != '}') return page;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll(page[0 .. page.len - 1]);
+    try out.writer.writeAll(",\"unavailable\":[");
+    for (reasons, 0..) |reason, i| {
+        if (i > 0) try out.writer.writeByte(',');
+        try writeEncodedJsonScalar(alloc, &out.writer, reason);
+    }
+    try out.writer.writeAll("]}");
+    const result = try out.toOwnedSlice();
+    alloc.free(page);
+    return result;
+}
+
+test "a page that matched nothing names the servers the search couldn't look in" {
+    const alloc = std.testing.allocator;
+    const page = try alloc.dupe(u8, "{\"tools\":[],\"count\":0}");
+    // Text for the model is encoded as everywhere else on the page.
+    const out = try withUnavailable(alloc, page, &.{ "MCP server 'linear' needs a login.", "MCP server 'say \"hi\"' is unavailable: it did not start" });
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0,\"unavailable\":[\"MCP server 'linear' needs a login.\",\"MCP server 'say &quot;hi&quot;' is unavailable: it did not start\"]}",
+        out,
+    );
 }
 
 /// One tool a search may return. The strings and the tool are borrowed for
@@ -403,7 +336,7 @@ const BoundedEncodedScalar = struct {
     observed_bytes: usize,
 };
 
-pub fn boundedEncodedScalar(alloc: Allocator, value: []const u8, max_bytes: usize) !BoundedEncodedScalar {
+fn boundedEncodedScalar(alloc: Allocator, value: []const u8, max_bytes: usize) !BoundedEncodedScalar {
     const encoded = try encodeScalarAlloc(alloc, value);
     errdefer alloc.free(encoded);
     const observed = encoded.len;
@@ -432,32 +365,6 @@ pub fn queryContainsCompleteIdentity(query: []const u8, identity: []const u8) bo
         return true;
     }
     return false;
-}
-
-pub fn renderAuthenticationRequired(
-    alloc: Allocator,
-    servers: []const *McpServer,
-    access: *const OperationAccessGuard,
-    query: []const u8,
-) !?[]u8 {
-    for (servers) |server| {
-        if (!server.isPublished()) continue;
-        if (!access.allows(.{ .tool_server = server.config.name })) continue;
-        if (!queryContainsCompleteIdentity(query, server.config.name)) continue;
-        const authentication = serverAuthenticationState(server);
-        server.status_lock.lockUncancelable(io_mod.getIo());
-        const failed = server.state.load(.acquire) == .failed;
-        server.status_lock.unlock(io_mod.getIo());
-        if (authentication == .required) {
-            const guidance = try alloc.print("Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
-            defer alloc.free(guidance);
-            return try writeAuthenticationRequired(alloc, server.config.name, .{ .oauth = guidance });
-        }
-        if (failed and server.config.bearer_token_env != null and io_mod.getenv(server.config.bearer_token_env.?) == null) {
-            return try writeAuthenticationRequired(alloc, server.config.name, .{ .bearer_environment = server.config.bearer_token_env.? });
-        }
-    }
-    return null;
 }
 
 pub const AuthenticationRequired = union(enum) {
@@ -490,27 +397,6 @@ pub fn writeAuthenticationRequired(alloc: Allocator, server_name: []const u8, re
     return try out.toOwnedSlice();
 }
 
-/// Tells the model why the server a search names is down, so it can report
-/// the cause instead of an empty result.
-pub fn renderServerFailure(
-    alloc: Allocator,
-    servers: []const *McpServer,
-    access: *const OperationAccessGuard,
-    name: []const u8,
-) !?[]u8 {
-    for (servers) |server| {
-        if (!std.mem.eql(u8, server.config.name, name)) continue;
-        if (!server.isPublished()) continue;
-        if (!access.allows(.{ .tool_server = server.config.name })) continue;
-        server.status_lock.lockUncancelable(io_mod.getIo());
-        defer server.status_lock.unlock(io_mod.getIo());
-        if (server.state.load(.acquire) != .failed) continue;
-        const failure = server.last_error orelse continue;
-        return try writeServerFailure(alloc, server.config.name, failure);
-    }
-    return null;
-}
-
 /// The page a search returns when the server it names is down.
 pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []const u8) ![]u8 {
     const message = try alloc.print("MCP server '{s}' is unavailable: {s}", .{ server_name, failure });
@@ -527,28 +413,11 @@ pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []
 
 test "MCP search names why the server it names is down" {
     const alloc = std.testing.allocator;
-    var servers = [_]McpServer{.{
-        .config = .{ .name = "devtools" },
-        .state = .init(.failed),
-    }};
-    defer if (servers[0].last_error) |value| alloc.free(value);
-    var access = try OperationAccessGuard.init(alloc, .unrestricted, 1);
-    defer access.deinit();
-    const handles = [_]*McpServer{&servers[0]};
-
-    // Without a recorded reason the ordinary search runs.
-    try std.testing.expectEqual(@as(?[]u8, null), try renderServerFailure(alloc, &handles, &access, "devtools"));
-
-    servers[0].setFailed(alloc, "MCP server exited with code 1 before completing startup: npm error code E401");
-    const output = (try renderServerFailure(alloc, &handles, &access, "devtools")).?;
+    const output = try writeServerFailure(alloc, "devtools", "MCP server exited with code 1 before completing startup: npm error code E401");
     defer alloc.free(output);
     try std.testing.expectEqualStrings(
         "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_failed\"," ++
             "\"error\":\"MCP server 'devtools' is unavailable: MCP server exited with code 1 before completing startup: npm error code E401\"}",
         output,
     );
-    try std.testing.expectEqual(@as(?[]u8, null), try renderServerFailure(alloc, &handles, &access, "devtoolsx"));
-
-    servers[0].state.store(.ready, .release);
-    try std.testing.expectEqual(@as(?[]u8, null), try renderServerFailure(alloc, &handles, &access, "devtools"));
 }

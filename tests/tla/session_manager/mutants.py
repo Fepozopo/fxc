@@ -137,6 +137,52 @@ MUTANTS = [
     ("Lifecycle", "ack before fsync of the directory",
      'Advance(s, "renamed", "done")', 'Advance(s, "synced", "done")',
      "AckedIsVisible"),
+    ("PromptImages", "the note names an image the store refused",
+     'noted |-> {d \\in turn.asked : turn.form[d] = "ref"} \\cup Earlier(turn.s, "ref")',
+     'noted |-> turn.asked \\cup Earlier(turn.s, "ref")',
+     "NoteNamesBlob"),
+    ("PromptImages", "the request is built before its images are saved",
+     '    /\\ Saved\n'
+     '    /\\ requests\' = Append(requests,\n'
+     '         [s |-> turn.s,\n'
+     '          asked |-> turn.asked,\n'
+     '          sent |-> {d \\in turn.asked : turn.form[d] \\in Forms}\n'
+     '                   \\cup Earlier(turn.s, "ref") \\cup Earlier(turn.s, "inline"),\n'
+     '          noted |-> {d \\in turn.asked : turn.form[d] = "ref"} \\cup Earlier(turn.s, "ref")])',
+     '    /\\ requests\' = Append(requests,\n'
+     '         [s |-> turn.s,\n'
+     '          asked |-> turn.asked,\n'
+     '          sent |-> turn.asked \\cup Earlier(turn.s, "ref") \\cup Earlier(turn.s, "inline"),\n'
+     '          noted |-> {d \\in turn.asked : turn.form[d] \\in {"ref", "unsaved"}} \\cup Earlier(turn.s, "ref")])',
+     "NoteNamesBlob"),
+    ("PromptImages", "the item names blobs it does not list",
+     'listed |-> pending[turn.s]])]', 'listed |-> {}])]',
+     "RefHasBlob"),
+    ("PromptImages", "bytes already stored are not listed again",
+     "    /\\ pending' = [pending EXCEPT ![turn.s] = @ \\cup {d}]",
+     "    /\\ pending' = [pending EXCEPT ![turn.s] = IF d \\in blobs[turn.s] THEN @ ELSE @ \\cup {d}]",
+     "RefHasBlob"),
+    ("PromptImages", "a fork hard-links no blobs",
+     '    /\\ blobs\' = [blobs EXCEPT !["fork"] =\n'
+     '         UNION {log["source"][k].listed : k \\in 1..Len(log["source"])}]',
+     '    /\\ blobs\' = [blobs EXCEPT !["fork"] = {}]',
+     "RefHasBlob"),
+    ("PromptImages", "an import names an image it never saved",
+     'form |-> [d \\in Digests |-> IF d \\in asked THEN "unsaved" ELSE "none"],\n'
+     '                requested |-> TRUE',
+     'form |-> [d \\in Digests |-> IF d \\in asked THEN "ref" ELSE "none"],\n'
+     '                requested |-> TRUE',
+     "RefHasBlob"),
+    # A failed save losing the image, once per place that keeps it, so each
+    # mutant fails only its own invariant.
+    ("PromptImages", "a request leaves out an image kept inline",
+     'sent |-> {d \\in turn.asked : turn.form[d] \\in Forms}',
+     'sent |-> {d \\in turn.asked : turn.form[d] = "ref"}',
+     "RequestSendsAll"),
+    ("PromptImages", "an item leaves out an image kept inline",
+     'images |-> [d \\in Digests |-> IF d \\in turn.asked THEN turn.form[d] ELSE "none"]',
+     'images |-> [d \\in Digests |-> IF d \\in turn.asked /\\ turn.form[d] = "ref" THEN "ref" ELSE "none"]',
+     "ItemKeepsImages"),
 ]
 
 
@@ -162,8 +208,12 @@ def main():
         print("needs a Java runtime and tla2tools.jar (see check.sh)", file=sys.stderr)
         return 2
     survivors = 0
+    # Spec names on the command line run only their mutants.
+    wanted = set(sys.argv[1:])
     with tempfile.TemporaryDirectory(prefix="session-manager-mutants-") as tmp:
         for index, (spec, desc, old, new, expected) in enumerate(MUTANTS):
+            if wanted and spec not in wanted:
+                continue
             work = pathlib.Path(tmp) / f"{index:02d}-{spec}"
             work.mkdir()
             text = (HERE / f"{spec}.tla").read_text()

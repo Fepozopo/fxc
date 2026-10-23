@@ -377,4 +377,36 @@ await assert.rejects(
 );
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", refreshLock: async (_info, refresh) => refresh() }), /refreshLock needs provider "codex" or "grok"/);
 
+// fx's default model is an AI Gateway id, which xAI doesn't serve, so a Grok
+// agent must name its model, and nothing is requested without one.
+{
+  const world = grokWorld({});
+  await assert.rejects(
+    createFxEngine({ ...backendOptions, provider: "grok", fetch: world.fetch, credentials: () => credentialsFor("at-first") }),
+    /provider "grok" needs a model; fx's default model is an AI Gateway id/,
+  );
+  assert.deepEqual(world.log, []);
+}
+
+// A durable Grok agent may leave the model to each session. A session that
+// names one runs on it; a session without one is refused before xAI hears of it.
+{
+  const world = grokWorld({});
+  const agent = createFxAgent({ ...backendOptions, durability: memory(), provider: "grok", fetch: world.fetch, credentials: () => credentialsFor("at-durable") });
+  try {
+    const named = agent.session(undefined, { model: "grok-4.5" }).prompt("say ok");
+    for await (const event of named) void event;
+    assert.equal((await named.result).stopReason, "end_turn");
+    assert.deepEqual(replyRequests(world.log).map((entry) => JSON.parse(entry.body).model), ["grok-4.5"]);
+    const unnamed = agent.session().prompt("say ok");
+    for await (const event of unnamed) void event;
+    const refused = await unnamed.result;
+    assert.equal(refused.stopReason, "error");
+    assert.match(refused.error.message, /provider "grok" needs a model; fx's default model is an AI Gateway id/);
+    assert.equal(replyRequests(world.log).length, 1, "nothing is sent for the session without a model");
+  } finally {
+    await agent.close();
+  }
+}
+
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Grok agent passed`);

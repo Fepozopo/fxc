@@ -44,7 +44,6 @@ const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig"
 const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
-const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
@@ -253,7 +252,6 @@ pub const Config = struct {
     max_tool_result_bytes: usize,
     max_history_turns: usize,
     mode_registry: mode_registry.Registry,
-    load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     load_mcp_host: ?mcp_host.LoadFn = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
@@ -457,7 +455,6 @@ const RunDeps = struct {
     load_skills: LoadSkillsFn = app_runtime_setup.loadSkills,
     context_registry: context_contract.Registry,
     tool_set: tool_set_contract.ToolSet,
-    load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     load_mcp_host: ?mcp_host.LoadFn = null,
     process_queued_prompt: ProcessQueuedPromptFn = processQueuedPromptDefault,
     persist_yolo_acknowledgment: PersistYoloAcknowledgmentFn = persistYoloAcknowledgmentDefault,
@@ -618,8 +615,7 @@ const AskContext = struct {
     skills_dir: []u8 = &.{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     context_enabled: bool = true,
-    mcp: ?*mcp_runtime.McpRuntime = null,
-    /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `mcp` then stays null.
+    /// The ask's MCP servers; null when none are configured.
     mcp_host: ?*mcp_host.Host = null,
     mcp_elicitation_capabilities: @import("../mcp/elicitation.zig").Capabilities = .{},
     failed: bool = false,
@@ -788,11 +784,6 @@ const AskContext = struct {
         self.session.deinit(self.alloc);
         if (self.skills_dir.len > 0) self.alloc.free(self.skills_dir);
         self.context_snapshot.deinit(self.alloc);
-        if (self.mcp) |m| {
-            m.retireAndWait();
-            m.deinit();
-            self.alloc.destroy(m);
-        }
         // `fx ask` exits next, so nothing waits for its servers.
         if (self.mcp_host != null) mcp_host.signalServersForExit();
         if (self.image_snapshot_temp_dir) |path| {
@@ -1091,20 +1082,9 @@ const AskContext = struct {
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
         };
-        if (self.mcp_host) |h| {
-            h.catalog.wire(&tc);
-        } else if (self.mcp != null) {
-            tc.mcp_ctx = @ptrCast(self);
-            tc.mcp_has_tool = mcpHasTool;
-            tc.mcp_validate_tool = mcpValidateTool;
-            tc.mcp_call_tool = mcpCallTool;
-            tc.mcp_search_tools = mcpSearchTools;
-            tc.mcp_tool_schema = mcpToolSchemaJson;
-            tc.mcp_snapshot_tool = mcpSnapshotTool;
-            tc.mcp_call_feature = mcpCallFeature;
-        }
-        // Either engine: on a terminal, a server's question is put to the user.
-        if ((self.mcp_host != null or self.mcp != null) and self.mcp_elicitation_capabilities.any()) {
+        if (self.mcp_host) |h| h.catalog.wire(&tc);
+        // On a terminal, a server's question is put to the user.
+        if (self.mcp_host != null and self.mcp_elicitation_capabilities.any()) {
             tc.mcp_input_responder = .{
                 .context = @ptrCast(self),
                 .capabilities = self.mcp_elicitation_capabilities,
@@ -1169,7 +1149,6 @@ pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_re
         .load_startup_state = loadStartupStateDefault,
         .context_registry = context_registry,
         .tool_set = tool_set,
-        .load_mcp_runtime = cfg.load_mcp_runtime,
         .load_mcp_host = cfg.load_mcp_host,
         .install_headless_interrupt = true,
     });
@@ -1413,7 +1392,6 @@ pub fn runPrompt(alloc: Allocator, prompt: []const u8, auto_permission: bool, cf
         .deps = .{
             .context_registry = context_registry,
             .tool_set = tool_set,
-            .load_mcp_runtime = cfg.load_mcp_runtime,
             .load_mcp_host = cfg.load_mcp_host,
         },
     });
@@ -1428,7 +1406,6 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
         .deps = .{
             .context_registry = context_registry,
             .tool_set = tool_set,
-            .load_mcp_runtime = cfg.load_mcp_runtime,
             .load_mcp_host = cfg.load_mcp_host,
         },
     });
@@ -1739,55 +1716,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(
-        alloc,
-        startup.workspace_root,
-        ctx.mcp_elicitation_capabilities,
-    );
-    if (ctx.mcp) |mcp| {
-        var health_snapshot = try mcp.snapshotHealth(
-            alloc,
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
-        defer health_snapshot.deinit(alloc);
-        for (health_snapshot.configuration_issues) |issue| {
-            try ctx.writeStderr("fx ask: ");
-            try ctx.writeStderr(issue.message);
-            try ctx.writeStderr("\n");
-        }
-        const project_names = try mcp.pendingWorkspaceNames(alloc);
-        defer mcp_contract.freeOwnedStrings(alloc, project_names);
-        if (project_names.len > 0) {
-            try ctx.writeStderr("fx ask: skipped unapproved project MCP servers: ");
-            for (project_names, 0..) |name, index| {
-                if (index > 0) try ctx.writeStderr(", ");
-                try ctx.writeStderr(name);
-            }
-            try ctx.writeStderr(". Approve with fx mcp trust approve <name> before retrying.\n");
-        }
-        if (options.output_mode.isTerminal()) {
-            mcp.connectAllCancellable(ctx.toolRegistry(), ctx.cancelFlag());
-        } else {
-            mcp.connectRequiredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
-        }
-    }
     if (options.deps.load_mcp_host) |load_host| {
         ctx.mcp_host = try load_host(alloc, startup.workspace_root, ctx.toolRegistry(), .{ .questions = ctx.mcp_elicitation_capabilities });
         if (ctx.mcp_host) |h| try reportUnapprovedMcpServers(&ctx, h);
     }
     try ctx.checkCancellation();
-    if (ctx.mcp) |mcp| {
-        if (try mcp.requiredStartupFailure(
-            alloc,
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        )) |failure| {
-            defer alloc.free(failure);
-            try ctx.writeStderr("fx ask: ");
-            try ctx.writeStderr(failure);
-            try ctx.writeStderr("\n");
-            return failPromptRunResult(error.McpRequiredServerUnavailable);
-        }
-    }
     const session_child_capability = ctx.sessionChildCapability();
     var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
@@ -2051,7 +1984,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
-        .image_blob_dir = if (ctx.v2) |v2| v2.blobsPath() else null,
+        .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
         .push_text = pushText,
@@ -2225,8 +2158,6 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     }, arena, messages);
     var snapshot = if (ctx.mcp_host) |h|
         try h.catalog.modelSnapshot(arena)
-    else if (ctx.mcp) |mcp|
-        try mcp.snapshotModelCatalog(arena, ctx.permission_rules, true)
     else
         try mcp_model_catalog.Snapshot.empty(arena);
     defer snapshot.deinit(arena);
@@ -2567,8 +2498,7 @@ fn lifecycleDynamicMcpToolAvailable(ctx: *AskContext, name: []const u8, advertis
 
 fn lifecycleDynamicMcpAvailability(ctx: *AskContext) tool_mcp_runtime.RuntimeCapabilities {
     if (ctx.mcp_host) |h| return h.catalog.runtimeCapabilities();
-    if (ctx.mcp == null) return .{};
-    return .{ .context = @ptrCast(ctx), .has_tool = mcpHasTool };
+    return .{};
 }
 
 fn dynamicMcpToolAvailable(registry: tool_dispatch.Registry, name: []const u8, advertised_dynamic_tool_names: []const []const u8, mcp_ctx: ?*anyopaque, has_tool: ?McpHasToolFn, access: tool_mcp_runtime.Access) bool {
@@ -2987,6 +2917,19 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     ctx.prompt_snapshot_committed = true;
 }
 
+/// The prompt's images become the session's blobs before its first request
+/// (D89). A failure leaves the rest inline, with no path, as the adapter
+/// does for one image the store refuses.
+fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    v2.savePromptImages(alloc, images) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_prompt_images_inline session={s} err={s}", .{ v2.id(), @errorName(err) });
+    };
+}
+
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
 
 fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
@@ -3344,98 +3287,24 @@ fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text:
     };
 }
 
-/// The same warning v1 gives for project servers still waiting for approval.
+/// Why a configured server isn't there, one `note:` line each, as `fx mcp
+/// list` says it; then one line naming the project servers still waiting
+/// for approval.
 fn reportUnapprovedMcpServers(ctx: *AskContext, h: *mcp_host.Host) !void {
+    for (h.notes) |note| {
+        try ctx.writeStderr("note: ");
+        try ctx.writeStderr(note);
+        try ctx.writeStderr("\n");
+    }
     var listed = false;
     for (h.runtime.servers()) |s| {
         if (s.held != .waiting_for_approval) continue;
         try ctx.writeStderr(if (listed) ", " else "fx ask: skipped unapproved project MCP servers: ");
+        // Printable: `loadHost` skips a server whose name isn't.
         try ctx.writeStderr(s.name);
         listed = true;
     }
     if (listed) try ctx.writeStderr(". Approve with fx mcp approve <name> before retrying.\n");
-}
-
-fn activateAskMcp(ctx: *AskContext) anyerror!*mcp_runtime.McpRuntime {
-    const runtime = ctx.mcp orelse return error.McpRuntimeUnavailable;
-    try runtime.connectDeferredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
-    return runtime;
-}
-
-fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = ctx.mcp orelse return false;
-    mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, ctx.cancelFlag()) catch return false;
-    return mcp.hasToolWithAccess(name, access);
-}
-
-fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
-    const self: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = self.mcp orelse return .not_available;
-    try runtime.connectDeferredToolForAsk(self.toolRegistry(), name, access, self.cancelFlag());
-    return runtime.validateToolArgumentsByNameWithAccess(arena, name, arguments_json, access);
-}
-
-fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = ctx.mcp orelse return null;
-    try mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, options.access, options.cancel_flag orelse ctx.cancelFlag());
-    return mcp.callToolByNameWithOptions(
-        arena,
-        name,
-        arguments_json,
-        max_tool_result_bytes,
-        options,
-    );
-}
-
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
-    if (request.server) |server_name| {
-        mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag()) catch |err| switch (err) {
-            error.McpAuthenticationRequired => {}, // Search renders the observed challenge with named login guidance.
-            error.Cancelled, error.OutOfMemory, error.McpAccessDenied, error.McpAuthorityChanged => return err,
-            else => {
-                if (!mcp.hasRecordedFailure(server_name)) return err;
-                // Search reports the recorded reason instead of the error name.
-                debug_trace.logf(
-                    "mcp",
-                    "deferred ask connection failed server={s} err={s}; search reports the recorded failure",
-                    .{ server_name, @errorName(err) },
-                );
-            },
-        };
-    } else {
-        try mcp.connectDeferredForAsk(ctx.toolRegistry(), cancel_flag orelse ctx.cancelFlag());
-    }
-    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
-}
-
-fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = ctx.mcp orelse return .unavailable;
-    return runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
-}
-
-fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = ctx.mcp orelse return null;
-    try runtime.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, cancel_flag orelse ctx.cancelFlag());
-    return runtime.toolSchemaJsonByNameWithAccess(arena, name, permission_rules, limits, access, cancel_flag);
-}
-
-fn mcpCallFeature(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    request: tool_mcp_runtime.FeatureRequest,
-    options: tool_mcp_runtime.FeatureCallOptions,
-) anyerror!tool_mcp_runtime.FeatureResult {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
-    if (!options.access.allowsFeatureServer(mcp.generation, request.server_name)) return error.McpServerNotFound;
-    try mcp.connectDeferredServerForAsk(ctx.toolRegistry(), request.server_name, options.access, .features, options.cancel_flag orelse ctx.cancelFlag());
-    return mcp.callFeatureForModel(arena, request, options);
 }
 
 fn respondToAskMcpInput(
@@ -3623,13 +3492,8 @@ fn resolveAskSubagentAuthority(
     if (!std.mem.eql(u8, active_id, root_id)) {
         return error.HostAuthorityUnavailable;
     }
-    if (ctx.mcp != null) {
-        _ = activateAskMcp(ctx) catch return error.HostAuthorityUnavailable;
-    }
     const integrations = if (ctx.mcp_host) |h|
         h.catalog.snapshotToolNames(alloc, ctx.permission_rules)
-    else if (ctx.mcp) |mcp|
-        mcp.snapshotToolNames(alloc, ctx.permission_rules)
     else
         alloc.alloc([]u8, 0);
     const owned_integrations = integrations catch return error.OutOfMemory;
@@ -3638,16 +3502,7 @@ fn resolveAskSubagentAuthority(
         alloc.free(owned_integrations);
     }
     var mcp_view = if (ctx.mcp_host) |h|
-        try h.catalog.snapshotAccessView(alloc, root_id, root_id, ctx.permission_rules, false)
-    else if (ctx.mcp) |mcp|
-        try mcp.snapshotAccessView(
-            alloc,
-            root_id,
-            root_id,
-            ctx.permission_rules,
-            ctx.cfg.mode_registry.toolAllowed(ctx.deps.tool_set, ctx.mode_id, "mcp_features") and
-                !permissions.rulesDenyAllTargetsForTool(ctx.permission_rules, "mcp_features"),
-        )
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id, ctx.permission_rules)
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
@@ -4282,7 +4137,6 @@ fn testConfig() Config {
         .max_tool_result_bytes = 4096,
         .max_history_turns = 2,
         .mode_registry = test_mode_registry,
-        .load_mcp_runtime = testNoMcpRuntime,
     };
 }
 
@@ -4790,10 +4644,6 @@ fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.P
     return state;
 }
 
-fn testNoMcpRuntime(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
-    return null;
-}
-
 fn testPromptRunDeps(stdout_capture: *TestCapture, stderr_capture: *TestCapture, load_startup_state: LoadStartupStateFn) RunDeps {
     return .{
         .stdout_ctx = stdout_capture,
@@ -4805,7 +4655,6 @@ fn testPromptRunDeps(stdout_capture: *TestCapture, stderr_capture: *TestCapture,
         .load_skills = testLoadNoSkills,
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
-        .load_mcp_runtime = testNoMcpRuntime,
         .process_queued_prompt = testProcessQueuedPrompt,
     };
 }
@@ -4863,114 +4712,6 @@ test "CLI lifecycle action preserves dynamic MCP availability boundaries" {
     const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"shell"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
     try std.testing.expect(!builtin);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-}
-
-test "CLI lifecycle dynamic MCP capability preserves its callback context" {
-    var ctx: AskContext = undefined;
-    var mcp = mcp_runtime.McpRuntime.init(std.testing.allocator);
-    defer mcp.deinit();
-    ctx.mcp = &mcp;
-    ctx.mcp_host = null;
-
-    const capability = lifecycleDynamicMcpAvailability(&ctx);
-
-    try std.testing.expect(capability.context != null);
-    try std.testing.expectEqual(
-        @intFromPtr(&ctx),
-        @intFromPtr(capability.context.?),
-    );
-    try std.testing.expect(capability.has_tool == mcpHasTool);
-}
-
-test "Ask MCP adapters revalidate scoped authority before catalog access" {
-    const alloc = std.testing.allocator;
-    const ViewFactory = struct {
-        fn init(factory_alloc: Allocator, runtime_generation: u64) !mcp_access_policy.View {
-            const owner_id = try factory_alloc.dupe(u8, "child");
-            errdefer factory_alloc.free(owner_id);
-            const parent_id = try factory_alloc.dupe(u8, "parent");
-            errdefer factory_alloc.free(parent_id);
-            const servers = try factory_alloc.alloc(mcp_access_policy.ServerIdentity, 1);
-            errdefer factory_alloc.free(servers);
-            servers[0] = .{
-                .name = try factory_alloc.dupe(u8, "fixture"),
-                .source = .profile,
-                .scope = .profile,
-                .connection_generation = 1,
-                .catalog_generation = 1,
-                .auth_generation = 0,
-            };
-            errdefer servers[0].deinit(factory_alloc);
-            const tools = try factory_alloc.alloc(mcp_access_policy.ToolIdentity, 1);
-            errdefer factory_alloc.free(tools);
-            const tool_name = try factory_alloc.dupe(u8, "mcp_fixture_echo");
-            errdefer factory_alloc.free(tool_name);
-            const tool_server_name = try factory_alloc.dupe(u8, "fixture");
-            errdefer factory_alloc.free(tool_server_name);
-            tools[0] = .{
-                .name = tool_name,
-                .server_name = tool_server_name,
-            };
-            return .{
-                .runtime_generation = runtime_generation,
-                .owner_id = owner_id,
-                .parent_id = parent_id,
-                .features_visible = false,
-                .servers = servers,
-                .tools = tools,
-            };
-        }
-    };
-    const LiveProvider = struct {
-        view: *const mcp_access_policy.View,
-        calls: usize = 0,
-
-        fn resolve(raw: *anyopaque, provider_alloc: Allocator) !tool_mcp_runtime.ResolvedLiveView {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            const view = try self.view.clone(provider_alloc);
-            return .{
-                .authority_generation = mcp_access_policy.authorityGeneration(view),
-                .view = view,
-            };
-        }
-    };
-
-    var runtime = mcp_runtime.McpRuntime.init(alloc);
-    defer runtime.deinit();
-    var ctx: AskContext = undefined;
-    ctx.mcp = &runtime;
-    var captured = try ViewFactory.init(alloc, runtime.generation);
-    defer captured.deinit(alloc);
-    var live = try captured.clone(alloc);
-    defer live.deinit(alloc);
-    live.tools[0].deinit(alloc);
-    alloc.free(live.tools);
-    live.tools = try alloc.alloc(mcp_access_policy.ToolIdentity, 0);
-    var provider = LiveProvider{ .view = &live };
-    const access = tool_mcp_runtime.Access{ .scoped = .{
-        .captured = &captured,
-        .admission_authority_generation = mcp_access_policy.authorityGeneration(captured),
-        .live = .{
-            .context = @ptrCast(&provider),
-            .resolve_fn = LiveProvider.resolve,
-        },
-    } };
-
-    try std.testing.expect(!mcpHasTool(@ptrCast(&ctx), "mcp_fixture_echo", access));
-    try std.testing.expectEqual(@as(usize, 1), provider.calls);
-    provider.calls = 0;
-    try std.testing.expectError(
-        error.McpAuthorityChanged,
-        mcpValidateTool(@ptrCast(&ctx), alloc, "mcp_fixture_echo", "{}", access),
-    );
-    try std.testing.expectEqual(@as(usize, 1), provider.calls);
-    provider.calls = 0;
-    try std.testing.expectError(
-        error.McpAuthorityChanged,
-        mcpToolSchemaJson(@ptrCast(&ctx), alloc, "mcp_fixture_echo", .{}, .{}, access, null),
-    );
-    try std.testing.expectEqual(@as(usize, 1), provider.calls);
 }
 
 test "fx ask deps validate malformed registered calls" {
@@ -6036,7 +5777,7 @@ const test_startup_cancellation_context_registry = context_contract.Registry{ .d
     .append_transient_fn = testNoTransientContext,
 } };
 
-fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testLoadMcpHostWithCancellation(_: Allocator, _: []const u8, _: tool_dispatch.Registry, _: mcp_host.Extras) anyerror!?*mcp_host.Host {
     test_startup_cancellation_mcp_calls += 1;
     if (test_startup_cancellation_stage == .during_mcp_load) {
         requestTestHeadlessInterrupt();
@@ -6255,7 +5996,7 @@ test "headless ask startup cancellation prevents later hooks" {
         deps.load_startup_state = testLoadStartupStateWithCancellation;
         deps.initialize_session_stores = testInitializeSessionStoresWithCancellation;
         deps.context_registry = test_startup_cancellation_context_registry;
-        deps.load_mcp_runtime = testLoadMcpRuntimeWithCancellation;
+        deps.load_mcp_host = testLoadMcpHostWithCancellation;
         deps.install_headless_interrupt = true;
 
         const exit_code = try runWithDeps(alloc, &.{"hello"}, testConfig(), deps);
@@ -7905,7 +7646,6 @@ test "fx ask JSON preserves shell action and runtime error identity" {
     var ctx = AskContext.init(alloc, testConfig(), .{
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
-        .load_mcp_runtime = testNoMcpRuntime,
     }, root);
     defer ctx.deinit();
     ctx.output_mode = .json;
@@ -8049,7 +7789,6 @@ test "fx ask JSON permission-denied capture is best effort under allocation fail
         .{
             .context_registry = test_no_context_registry,
             .tool_set = builtin_tools.advertisement_set,
-            .load_mcp_runtime = testNoMcpRuntime,
         },
         "/tmp/workspace",
     );
@@ -8162,7 +7901,6 @@ fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
     var ctx = AskContext.init(alloc, testConfig(), .{
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
-        .load_mcp_runtime = testNoMcpRuntime,
     }, "/tmp/workspace");
     defer ctx.deinit();
     ctx.output_mode = .json;
@@ -8250,7 +7988,6 @@ test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
     var ctx = AskContext.init(alloc, testConfig(), .{
         .context_registry = test_no_context_registry,
         .tool_set = builtin_tools.advertisement_set,
-        .load_mcp_runtime = testNoMcpRuntime,
     }, "/tmp/workspace");
     defer ctx.deinit();
     ctx.output_mode = .json;

@@ -699,6 +699,10 @@ pub const FakeAgentRuntimeDeps = struct {
     immediate_steering_messages: []const []const u8 = &.{},
     immediate_steering_cancel_flag: ?*std.atomic.Value(bool) = null,
     immediate_steering_take_count: usize = 0,
+    /// A real worker wired as the app wires it: the turn takes its steering
+    /// from it and publishes its events and tool lifecycle to it. Its queue,
+    /// events, and taken steering use `alloc`.
+    steering_worker: ?*worker_runtime.WorkerRuntime = null,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -824,7 +828,9 @@ pub const FakeAgentRuntimeDeps = struct {
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_unavailable = catalogUnavailable,
-            .take_steering_boundary = if (self.steering_messages.len > 0 or
+            .take_steering_boundary = if (self.steering_worker != null)
+                takeWorkerSteeringBoundary
+            else if (self.steering_messages.len > 0 or
                 self.immediate_steering_messages.len > 0)
                 takeSteeringBoundary
             else
@@ -948,6 +954,32 @@ pub const FakeAgentRuntimeDeps = struct {
         const messages = try arena.alloc([]u8, source.len);
         for (source, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
         return .{ .continue_turn = messages };
+    }
+
+    /// Takes steering from `steering_worker` and copies it into the turn's
+    /// arena, as the app's callback does.
+    fn takeWorkerSteeringBoundary(
+        raw: *anyopaque,
+        arena: Allocator,
+        turn_id: u64,
+        kind: worker_runtime.SteeringBoundaryKind,
+    ) !worker_runtime.SteeringBoundaryResult {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const result = try self.steering_worker.?.takeSteeringBoundary(self.alloc, turn_id, kind);
+        return switch (result) {
+            .continue_turn => |owned| blk: {
+                defer {
+                    for (owned) |text| self.alloc.free(text);
+                    self.alloc.free(owned);
+                }
+                const messages = try arena.alloc([]u8, owned.len);
+                for (owned, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+                break :blk .{ .continue_turn = messages };
+            },
+            .none => .none,
+            .handoff => .handoff,
+            .interrupt => .interrupt,
+        };
     }
 
     fn requestRouteRecovery(raw: *anyopaque, _: Allocator, request: runtime_deps.RouteRecoveryRequest) !runtime_deps.RouteRecoveryDecision {
@@ -1676,6 +1708,7 @@ pub const FakeAgentRuntimeDeps = struct {
     fn pushEvent(raw: *anyopaque, event: WorkerEvent) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+        if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, event);
         switch (event) {
             .full_detail_record => |notice| {
                 const owned = try types.dupeSemanticNotice(self.alloc, notice);
@@ -1764,6 +1797,7 @@ pub const FakeAgentRuntimeDeps = struct {
         event: types.ToolLifecycleEvent,
     ) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, .{ .tool_lifecycle = event });
         switch (event) {
             .provisional, .authoritative_started => try self.record("status:started", .{}),
             .terminal => |terminal| {

@@ -3,14 +3,12 @@ const question_prompt = @import("../../core/agent/question_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const credentials = @import("../../core/auth/credentials.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
-const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const types = @import("../../core/shared/types.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
-const paste_blocks = @import("../../core/input/pasted_blocks.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const ui_render = @import("../render.zig");
@@ -635,75 +633,6 @@ pub fn composeVariantHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
     try row_text.appendClipped(alloc, &row, hint, width);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
-}
-
-pub fn composeMcpMenuHintRow(
-    alloc: Allocator,
-    width: u16,
-    ctrl_c_pending: bool,
-    projection: render_input.McpMenuProjection,
-) !std.ArrayList(u8) {
-    const state = projection.state;
-
-    const root_variants = [_][]const u8{
-        "↑↓ move  tab section  enter inspect  s add Slack  a add  r reload  c help  esc close",
-        "↑↓ move  tab section  enter  s Slack  a add  r reload  c help  esc",
-        "tab enter s a r c esc",
-    };
-    const catalog_variants = [_][]const u8{
-        "↑↓ navigate     tab section     enter open     / filter     esc back",
-        "↑↓ move  tab section  enter  / filter  esc",
-        "tab enter / esc",
-    };
-    const preview_variants = [_][]const u8{
-        "↑↓ scroll     i insert     esc back",
-        "↑↓ scroll  i insert  esc",
-        "↑↓ i esc",
-    };
-    const add_variants = [_][]const u8{
-        "type field     enter next/save     tab transport     esc cancel",
-        "type  enter next/save  tab transport  esc",
-        "enter tab esc",
-    };
-    const argument_variants = [_][]const u8{
-        "type value  enter next/preview  tab complete  esc cancel",
-        "type  enter next  tab complete  esc",
-        "enter tab esc",
-    };
-    var details: std.ArrayList(u8) = .empty;
-    defer details.deinit(alloc);
-    if (projection.selectedServer()) |server| {
-        const labels = [_]struct { action: mcp_menu_state.Action, label: []const u8 }{
-            .{ .action = .authenticate, .label = "enter sign in  " },
-            .{ .action = .trust_approve, .label = "a approve  " },
-            .{ .action = .trust_reject, .label = "x reject  " },
-            .{ .action = .remove, .label = "d remove  " },
-            .{ .action = .logout, .label = "l logout  " },
-        };
-        for (labels) |item| if (mcp_menu_state.serverActionAvailable(item.action, server)) try details.appendSlice(alloc, item.label);
-    }
-    try details.appendSlice(alloc, "c help  esc back");
-    const details_variants = [_][]const u8{ details.items, "c help  esc back", "c esc" };
-    const confirm_variants = [_][]const u8{
-        "enter confirm     esc cancel",
-        "enter confirm  esc",
-        "enter esc",
-    };
-    const info_variants = [_][]const u8{
-        "esc back",
-        "esc",
-        "esc",
-    };
-    const variants = switch (state.screen) {
-        .browse => if (state.section == .servers) root_variants else catalog_variants,
-        .preview => preview_variants,
-        .add => add_variants,
-        .arguments => argument_variants,
-        .info => info_variants,
-        .details => details_variants,
-        .confirm => confirm_variants,
-    };
-    return composeVariantHintRow(alloc, width, ctrl_c_pending, &variants);
 }
 
 pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {

@@ -172,7 +172,7 @@ fn warning_at_command_position(command: []const u8) ?DestructiveEffect {
     var cursor = command_classification.skip_whitespace(command, 0);
     while (command_classification.next_token(command, cursor)) |token| {
         if (!command_classification.is_env_assignment(token.text)) break;
-        cursor = token.end;
+        cursor = command_classification.word_end(command, token.start) orelse return null;
     }
     const first = command_classification.next_token(command, cursor) orelse return null;
 
@@ -204,7 +204,7 @@ fn sudo_like_command_tail(command: []const u8, start: usize) ?[]const u8 {
             return command[next.start..];
         }
         if (command_classification.is_env_assignment(token.text)) {
-            cursor = token.end;
+            cursor = command_classification.word_end(command, token.start) orelse return null;
             continue;
         }
         if (std.mem.startsWith(u8, token.text, "-")) {
@@ -723,6 +723,24 @@ test "command risk note detects privilege-wrapped removal" {
 
 test "command risk note detects privilege-wrapped git reset" {
     try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("sudo git reset --hard").?);
+}
+
+test "command risk note sees past quoted and escaped assignment values" {
+    // Each value hides a space from a split on whitespace, so `ls` looked
+    // like the command and the removal like its arguments.
+    for ([_][]const u8{
+        "CI='x ls' rm -rf /tmp/x",
+        "CI=\"x ls\" rm -rf /tmp/x",
+        "CI=x\\ ls rm -rf /tmp/x",
+        "env CI=x\\ ls rm -rf /tmp/x",
+        "sudo CI='x ls' rm -rf /tmp/x",
+    }) |command| {
+        try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for(command).?);
+        try std.testing.expectEqualStrings("safer: inspect targets first", command_safer_alternative_for(command).?);
+    }
+    try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("CI='x ls' git reset --hard").?);
+    // An assignment whose quote never closes names no command.
+    try std.testing.expect(command_risk_note_for("CI='x ls rm -rf /tmp/x") == null);
 }
 
 test "command risk note detects quoted su command payload" {

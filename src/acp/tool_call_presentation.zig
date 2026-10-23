@@ -10,7 +10,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const host_target = @import("../core/hosts/target.zig");
 const types = @import("../core/shared/types.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const catalog_state = @import("../core/mcp/catalog_state.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -70,7 +70,7 @@ pub fn describeToolCall(
     registry: tool_dispatch.Registry,
     arena: Allocator,
     call: ToolCall,
-    mcp_identity: ?mcp_runtime.McpRuntime.ToolIdentity,
+    mcp_identity: ?catalog_state.ToolIdentity,
 ) ToolCallPresentation {
     if (registry.lookup(call.name)) |tool| {
         return .{

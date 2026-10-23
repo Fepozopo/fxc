@@ -762,6 +762,49 @@ const streamReadRetries = 5;
 const missingStreamPollMs = 50;
 const missingStreamFastMs = 2000;
 
+// Runs whose log views one backend keeps, and the characters of JSON they
+// may hold together, least recently read dropped first.
+const maxLogViews = 32;
+const maxLogViewChars = 32 * 1024 * 1024;
+
+// Whether a newest-first listing showed every slot from the lowest it
+// listed to the newest. Pure.
+const gapless = (read) => read.listed === 0 || read.newest - read.lowest + 1 === read.listed;
+
+// The slot of a run's first event: a World numbers each run's events densely
+// from 1.
+const firstEventSlot = 1;
+
+// Whether a newest-first listing reached slot `floor`, or the checkpoint it
+// stopped at, which stands for every slot through its `through`. Pure.
+const listedDownTo = (read, floor) => read.lowest === floor || (read.through !== null && read.lowest <= read.through);
+
+/**
+ * A run's log view extended by the entries listed after it, as a full read
+ * returns the log: every entry after the newest checkpoint's `through`.
+ * Null when that checkpoint covers less than the view starts after, which
+ * only a full read can answer. `head` is the chain's head as a full read
+ * notes it: the newest chained entry, or the checkpoint's `through`. Pure.
+ */
+export function extendLogView(view, newer) {
+  const combined = [...view.entries, ...newer];
+  let through = view.through;
+  for (let index = combined.length - 1; index >= 0; index -= 1) {
+    const entry = combined[index].entry;
+    if (entry?.k === "checkpoint") {
+      through = entry.through === null || entry.through === undefined ? 0 : Number(entry.through);
+      break;
+    }
+  }
+  if (through < view.through) return null;
+  const entries = combined.filter((item) => Number(item.cursor) > through);
+  let head = null;
+  for (let index = entries.length - 1; index >= 0 && head === null; index -= 1) {
+    if (chainedKind(entries[index].entry?.k)) head = entries[index].cursor;
+  }
+  return { entries, through, head: head ?? (through ? String(through) : "null") };
+}
+
 // Events a session-log read lists per page: the first page, then the rest.
 const firstPageEvents = 10;
 const laterPageEvents = 100;
@@ -908,6 +951,35 @@ function createWorldBackend(world, durability) {
   // poll.
   const watchers = new Map();
   const changed = (runId) => { for (const watcher of watchers.get(runId) ?? []) watcher(); };
+  // Each run's log as this process last read it: the entries read() returned,
+  // the newest slot seen, and the checkpoint's `through` they start after.
+  // The log only appends, so a later read lists only slots after `known`.
+  // The entries are kept as the JSON the World stores, so every read hands
+  // out its own copy, as reading the World does, and the views' size is
+  // bounded in characters as well as in runs.
+  const logViews = new Map();
+  let logViewChars = 0;
+  const forgetView = (runId) => {
+    const view = logViews.get(runId);
+    if (!view) return;
+    logViewChars -= view.text.length;
+    logViews.delete(runId);
+  };
+  const rememberView = (runId, entries, known, through) => {
+    forgetView(runId);
+    const text = JSON.stringify(entries);
+    if (text.length > maxLogViewChars) return;
+    logViews.set(runId, { text, known, through });
+    logViewChars += text.length;
+    for (const oldest of logViews.keys()) {
+      if (logViews.size <= maxLogViews && logViewChars <= maxLogViewChars) break;
+      forgetView(oldest);
+    }
+  };
+  const viewOf = (runId) => {
+    const view = logViews.get(runId);
+    return view && { entries: JSON.parse(view.text), known: view.known, through: view.through };
+  };
   let handler = null;
   const route = typeof world.registerHandler !== "function";
   const listEvents = (runId, cursor, limit) => world.events.list({
@@ -1053,11 +1125,17 @@ function createWorldBackend(world, durability) {
         // The newest chained entry read: the chain's head, unless the read
         // stopped before reaching any.
         let newestChained;
+        // The newest and lowest slots this read listed above `stopBelow`,
+        // entries or not, and how many. Unlike `known`, which this object's
+        // own writes also raise, these say only what the listing showed.
+        let newest = stopBelow;
+        let lowest = Infinity;
+        let listed = 0;
         // Ends the read. `head` is where the chain's head is when the read
         // found no chained entry, or undefined when the read does not show.
         const done = (head) => {
           noteSnapshot(snapshot, newestChained ?? head);
-          return { events, through };
+          return { events, through, snapshot, newest, lowest, listed };
         };
         // A session's newest checkpoint is usually among its last few
         // entries, so a read starts with a small page and fetches more only
@@ -1071,13 +1149,16 @@ function createWorldBackend(world, durability) {
             if (!missingRun(error)) throw error;
             // The run's creation starts its count.
             if (stopBelow === 0) noteSnapshot({ seq: 0, seqInBand: inBandAtRunCreation }, "null");
-            return { events, through };
+            return { events, through, newest, lowest, listed, missing: true };
           }
           snapshot ??= page.snapshot;
           for (const event of page.data) {
             const slot = slotOf(event);
             if (slot > known) known = slot;
             if (slot <= stopBelow) return done(undefined);
+            if (slot > newest) newest = slot;
+            if (slot < lowest) lowest = slot;
+            listed += 1;
             // The checkpoint stands for the entries through its `through`,
             // the last of them the chain's head.
             if (through !== null && slot <= through) return done(through === 0 ? "null" : String(through));
@@ -1094,10 +1175,50 @@ function createWorldBackend(world, durability) {
           cursor = page.cursor;
         }
       };
+      // The newest slot the last read() returned every entry through, or
+      // null when that read could not show it had them all.
+      let covered = null;
+      const fullRead = async () => {
+        const read = await newestFirst(0, true);
+        const entries = read.events.reverse();
+        // A listing that skipped a slot may show a later write before an
+        // earlier one lands. The entries go back as they are, as every read
+        // returned them before, but no view keeps the gap for later reads.
+        // The listing must also reach the run's first event or the checkpoint
+        // it stopped at, so no slot below what it listed is missing.
+        if (!read.missing && listedDownTo(read, firstEventSlot) && gapless(read)) {
+          rememberView(runId, entries, read.newest, read.through ?? 0);
+          covered = read.newest;
+        } else {
+          forgetView(runId);
+          covered = null;
+        }
+        return entries;
+      };
       return {
+        newest: () => covered,
         async read() {
-          const { events } = await newestFirst(0, true);
-          return events.reverse();
+          const view = viewOf(runId);
+          if (!view) return fullRead();
+          if (view.known > known) known = view.known;
+          const since = await newestFirst(view.known, true);
+          if (since.missing) {
+            forgetView(runId);
+            covered = null;
+            return [];
+          }
+          // The newer listing must have skipped no slot and must reach the
+          // view or a checkpoint that stands for what lies between; and a
+          // checkpoint covering less than the view starts after is not one
+          // the view can stand for. Otherwise read the log whole.
+          const reaches = since.listed === 0 || listedDownTo(since, view.known + 1);
+          const next = reaches && gapless(since) ? extendLogView(view, since.events.reverse()) : null;
+          if (!next) return fullRead();
+          // The in-band count at the chain's head, as a full read notes it.
+          noteSnapshot(since.snapshot, next.head);
+          rememberView(runId, next.entries, since.newest, next.through);
+          covered = since.newest;
+          return next.entries;
         },
         async readSince(cursor) {
           const { events } = await newestFirst(Number(cursor), false);
@@ -1459,14 +1580,33 @@ const messageIdInUse = (message) => Object.assign(
   { code: "FX_MESSAGE_ID_IN_USE" },
 );
 
-// Writes what a message adds to its session, in order, and returns how many
-// entries it wrote. Only the sender calls it, before it queues the message.
+// Writes what a message adds to its session, in order, and returns each
+// entry it wrote with the slot it took. Only the sender calls it, before it
+// queues the message.
 // A message that reuses another input's id writes nothing and throws.
 async function recordMessage(log, state, message) {
   if (idInUse(state, message)) throw messageIdInUse(message);
   const entries = messageEntries(state, message);
-  for (const entry of entries) await log.append(entry);
-  return entries.length;
+  const appended = [];
+  for (const entry of entries) appended.push({ cursor: await log.append(entry), entry });
+  return appended;
+}
+
+/**
+ * The log a sender read and then extended with its own entries, as the
+ * worker it starts in the same request may use it instead of reading the
+ * log again. Only when the sender's read showed every entry through slot
+ * `newestSeen`, and every entry the sender then wrote took the next slot:
+ * then nothing landed in between, so the view holds every input that comes
+ * before this message's. The sender's entries go on as the JSON the World
+ * stored, not as the objects it wrote. Null otherwise. Pure.
+ */
+export function handoffEntries(read, newestSeen, appended) {
+  if (!Number.isSafeInteger(newestSeen) || appended.length === 0) return null;
+  for (const [index, item] of appended.entries()) {
+    if (Number(item.cursor) !== newestSeen + index + 1) return null;
+  }
+  return [...read, ...appended.map(({ cursor, entry }) => ({ cursor, entry: JSON.parse(JSON.stringify(entry)) }))];
 }
 
 /**
@@ -1551,9 +1691,12 @@ class SessionWorker {
   // (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns). Then it runs the
   // session when no live worker holds it. Returns `{ timeoutSeconds }` to
   // have the same message delivered again later.
-  async consume(message, delivery = null) {
-    const log = await this.backend.session(this.sessionId);
-    let entries = await log.read();
+  // `handoff` is the sender's own session object and the log it read and
+  // extended, when the request that took the prompt runs it (see
+  // handoffEntries); the worker starts from them instead of reading again.
+  async consume(message, delivery = null, handoff = null) {
+    const log = handoff?.log ?? await this.backend.session(this.sessionId);
+    let entries = handoff?.entries ?? await log.read();
     let state = this.fold(entries, delivery);
     if (!knownMessage(state, message)) {
       this.agent.emit("session.refused", { sessionId: this.sessionId, messageId: message.messageId, reason: "unknown message" });
@@ -2547,14 +2690,14 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     // One delivery of `message` to the session's worker here: from the
     // queue, with `delivery` naming the queue's message and attempt, or with
     // `inRequest` from the request that took the prompt.
-    const receive = (created, message, delivery, { inRequest = false } = {}) => {
+    const receive = (created, message, delivery, { inRequest = false, handoff = null } = {}) => {
       let worker = workers.get(message.sessionId);
       if (!worker) {
         worker = new SessionWorker(agent, created, message.sessionId);
         workers.set(message.sessionId, worker);
       }
       worker.deliveries += 1;
-      let work = worker.consume(message, delivery);
+      let work = worker.consume(message, delivery, handoff);
       if (inRequest) {
         // No queue delivered this message, so none delivers it again: a turn
         // that must go on later continues in a fresh message. One whose
@@ -2620,7 +2763,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         // OnlySentRuns), and a queue that ends with the process loses no
         // input.
         const log = await created.session(sessionId);
-        await recordMessage(log, foldSessionLog(await log.read()), full);
+        const read = await log.read();
+        const newestSeen = log.newest?.();
+        const appended = await recordMessage(log, foldSessionLog(read), full);
         const queued = queuedMessage(full, created.store);
         const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
         if (inRequest && created.runInRequest) {
@@ -2637,7 +2782,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
             seeded = true;
             const delivery = backstop ? { messageId: backstop, attempt: 0 } : null;
             // receive() reports a failure to the host; the backstop retries it.
-            const work = receive(created, queued, delivery, { inRequest: true }).then(() => {}, () => {});
+            const entries = handoffEntries(read, newestSeen, appended);
+            const handoff = entries ? { log, entries } : null;
+            const work = receive(created, queued, delivery, { inRequest: true, handoff }).then(() => {}, () => {});
             created.waitUntil?.(work);
             return;
           }

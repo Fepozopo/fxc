@@ -1,12 +1,13 @@
-//! fx's side of MCP-v2 in one place: the runtime that owns the
-//! engine, and the catalog the model sees. Chosen with FX_MCP_ENGINE=v2
-//! until v1 is removed.
+//! fx's side of the MCP engine in one place: the runtime that owns the
+//! engine, and the catalog the model sees.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const runtime_mod = @import("runtime.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const model = @import("model.zig");
 
 const Allocator = std.mem.Allocator;
@@ -17,8 +18,8 @@ pub const Catalog = model.Catalog;
 pub const Notify = runtime_mod.Notify;
 pub const Notice = runtime_mod.Notice;
 pub const Status = runtime_mod.Status;
-pub const selected = runtime_mod.selected;
 pub const signalServersForExit = runtime_mod.signalServersForExit;
+pub const waitRetired = runtime_mod.waitRetired;
 pub const menu = @import("menu.zig");
 
 pub const Extras = struct {
@@ -26,9 +27,11 @@ pub const Extras = struct {
     questions: elicitation.Capabilities = .{},
     /// Gets sign-in notices.
     notify: ?runtime_mod.Notify = null,
+    /// See `runtime.Options.slash_commands`.
+    slash_commands: bool = false,
 };
 
-/// Loads the host for a workspace, or null when MCP-v2 isn't selected or no
+/// Loads the host for a workspace, or null when there is no home folder or no
 /// server is configured.
 pub const LoadFn = *const fn (
     gpa: Allocator,
@@ -78,6 +81,26 @@ pub const Host = struct {
         h.catalog.deinit();
         h.runtime.deinit();
         gpa.destroy(h);
+    }
+
+    /// Replaced: until this host is gone, no other host starts a server, so
+    /// none runs twice. Calls that began on it still finish here.
+    pub fn retire(h: *Host) void {
+        h.runtime.retire();
+    }
+
+    /// Retires the host and destroys it on a thread of its own, so whoever
+    /// lets it go never waits for its servers to stop. Nothing else
+    /// may use `h` after this.
+    pub fn stop(h: *Host) void {
+        h.retire();
+        // Without threads, as in the wasm builds, it is destroyed in place.
+        if (comptime builtin.single_threaded) return h.destroy();
+        const thread = std.Thread.spawn(.{}, destroy, .{h}) catch |err| {
+            debug_trace.logf("mcp", "MCP host stopped in place err={s}", .{@errorName(err)});
+            return h.destroy();
+        };
+        thread.detach();
     }
 };
 

@@ -298,6 +298,33 @@ function writeMarkedImage(imagePath: string, marker: string) {
   return readFileSync(imagePath).toString("base64");
 }
 
+// Damages image 1 of a copied v1 session past repair: its file no longer
+// holds the image, and its digest is one no other image there shares, so
+// an identical copy saved as a blob cannot restore it (D89).
+function damageFirstV1Image(home: string, sessionId: string): void {
+  const folder = join(home, ".fx", "sessions", sessionId);
+  const snapshot = readdirSync(join(folder, "images")).find((name) => name.startsWith("image-1-"));
+  expect(snapshot).toBeDefined();
+  writeFileSync(join(folder, "images", snapshot!), "corrupt");
+  const log = join(folder, "events.jsonl");
+  const lines = readFileSync(log, "utf8").split("\n");
+  const first = JSON.parse(lines[0]!);
+  first.event.user.images[0].snapshot_sha256 = createHash("sha256").update("an image no other copy holds").digest("hex");
+  lines[0] = JSON.stringify(first);
+  writeFileSync(log, lines.join("\n"));
+}
+
+// A prompt image session `id` saved: its blob, which the saved prompt names
+// by hash, without the image's bytes (D89).
+function expectSavedBlob(home: string, id: string, base64: string): void {
+  const bytes = Buffer.from(base64, "base64");
+  const hash = createHash("sha256").update(bytes).digest("hex");
+  expect(readFileSync(join(sessionDir(home, id), "blobs", hash))).toEqual(bytes);
+  const saved = savedText(home, id);
+  expect(saved).toContain(hash);
+  expect(saved).not.toContain(base64);
+}
+
 function writeLegacyZeroImageSession(
   root: ReturnType<typeof createIsolatedRoot>,
   sessionId: string,
@@ -2388,10 +2415,7 @@ describe("Vision route fake Gateway", () => {
       // Twenty prompt images only an older fx's session file holds; one is
       // damaged before the session converts on its next open.
       const [sessionId] = copyV1Fixture(root.home, "many-images", 1, root.workspace) as [string];
-      const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-      const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
-      expect(firstSnapshot).toBeDefined();
-      writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
+      damageFirstV1Image(root.home, sessionId);
       const gateway = startImageGateway([
         sseToolCall("vision", { image_ids: [1, 2], focus: "inspect both" }, "vision_partial"),
         sseText(visionBatchResult([2])),
@@ -2457,10 +2481,7 @@ describe("Vision route fake Gateway", () => {
       // Twenty prompt images only an older fx's session file holds; one is
       // damaged before the session converts on its next open.
       const [sessionId] = copyV1Fixture(root.home, "many-images", 1, root.workspace) as [string];
-      const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-      const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
-      expect(firstSnapshot).toBeDefined();
-      writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
+      damageFirstV1Image(root.home, sessionId);
       const allIds = Array.from({ length: 20 }, (_, index) => index + 1);
       const gateway = startImageGateway([
         sseToolCall("vision", { image_ids: allIds, focus: "inspect all" }, "vision_partial_twenty"),
@@ -3233,8 +3254,8 @@ for (const sourceChange of ["removed", "changed"] as const) {
       expect(failed.code).toBe(1);
       expect(failed.stdout).toContain("RequiredVisionToolCallMissing");
       const id = JSON.parse(failed.stdout).session_id;
-      // The failed turn keeps the captured image inside its saved prompt (D44).
-      expect(savedText(root.home, id)).toContain(original);
+      // The failed turn keeps the captured image as its session's blob (D89).
+      expectSavedBlob(root.home, id, original);
       if (sourceChange === "removed") rmSync(input);
       else writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
       const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Describe the saved image again."], options);
@@ -3275,8 +3296,8 @@ test.skipIf(!tmuxAvailable())("TUI keeps a failed turn's image through a cold re
     await session.waitForText("RequiredVisionToolCallMissing", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     const [id] = rootSessionIds(root.home) as [string];
-    // The failed turn keeps the captured image inside its saved prompt (D44).
-    expect(savedText(root.home, id)).toContain(original);
+    // The failed turn keeps the captured image as its session's blob (D89).
+    expectSavedBlob(root.home, id, original);
     await session.sendText("/quit");
     await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
     expect(session.paneStatus().status).toBe(0);
@@ -3303,7 +3324,7 @@ test.skipIf(!tmuxAvailable())("TUI keeps a failed turn's image through a cold re
     await session.sendText("/quit");
     await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
     expect(session.paneStatus().status).toBe(0);
-    expect(savedText(root.home, id)).toContain(original);
+    expectSavedBlob(root.home, id, original);
   } finally {
     await session?.kill();
     gateway.stop();

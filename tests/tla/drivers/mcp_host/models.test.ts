@@ -14,9 +14,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins joined the four.
-  expect(count("smoke", "PASS")).toBe(5);
-  expect(count("stress", "PASS")).toBe(5);
+  // SharedLogins, SubagentAccess, UrlRetry and MixedBuilds joined the four.
+  expect(count("smoke", "PASS")).toBe(8);
+  expect(count("stress", "PASS")).toBe(8);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -24,25 +24,26 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // so it is no longer an expected finding and needs no separate witness.
   // SignIn's three did too, with the hold while another host is alive: its smoke and stress
   // configs now check IndicatorImpliesListener, OneSignInPerServer and
-  // IndicatorClears.
-  expect(count("finding", "FINDING")).toBe(2);
+  // IndicatorClears. UrlRetry's finding is the code before the held call:
+  // it ended the call at the -32042 error.
+  expect(count("finding", "FINDING")).toBe(3);
   expect(count("repair", "PASS")).toBe(1);
 }, 1_800_000);
 
 const controls: { name: string; module: string; constants: Record<string, never> | Record<string, unknown>; good: TraceRecord[]; bad: TraceRecord[]; badAt: number }[] = [
   {
     name: "credentials", module: "Credentials",
-    constants: { ObsNames: ["web"], ObsFaults: ["unreadable"], ObsInitKinds: ["absent"], ObsInitEntries: [], ObsInitImported: [false], ObsInitMarked: [false], ObsInitV1: ["web"] },
+    constants: { ObsNames: ["web"], ObsFaults: ["unreadable"], ObsInitKinds: ["absent"], ObsInitEntries: [], ObsInitV1: ["web"] },
     good: [
-      { event: "observe", data: { kind: "absent", entries: [], imported: false, marked: false, v1: ["web"] } },
+      { event: "observe", data: { kind: "absent", entries: [], v1: ["web"] } },
       { event: "run", data: { cmd: "get", server: "" } },
-      { event: "observe", data: { kind: "ok", entries: ["web"], imported: true, marked: true, v1: ["web"] } },
+      { event: "observe", data: { kind: "absent", entries: [], v1: ["web"] } },
     ],
-    // A read that took over v1's login but didn't save the flag.
+    // A read that took over v1's login.
     bad: [
-      { event: "observe", data: { kind: "absent", entries: [], imported: false, marked: false, v1: ["web"] } },
+      { event: "observe", data: { kind: "absent", entries: [], v1: ["web"] } },
       { event: "run", data: { cmd: "get", server: "" } },
-      { event: "observe", data: { kind: "ok", entries: ["web"], imported: false, marked: true, v1: ["web"] } },
+      { event: "observe", data: { kind: "ok", entries: ["web"], v1: ["web"] } },
     ],
     badAt: 2,
   },
@@ -91,6 +92,38 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "answer", data: { q: 1 } }, { event: "delivered", data: { target: 2, from: 1 } },
     ],
     badAt: 4,
+  },
+  {
+    name: "URL retry", module: "UrlRetry",
+    constants: { ObsUrls: 2, ObsSlots: 4, ObsMaxCalls: 2, ObsGuard: true },
+    good: [
+      { event: "call", data: { n: 1 } }, { event: "required" }, { event: "consent_shown" }, { event: "accept" },
+      { event: "waiting_shown" }, { event: "complete", data: { url: 1 } }, { event: "ignored" },
+      { event: "complete", data: { url: 2 } }, { event: "call", data: { n: 2 } }, { event: "result" },
+      { event: "end", data: { how: "result" } },
+    ],
+    // Calling again after only the first URL came: the signal waits for both.
+    bad: [
+      { event: "call", data: { n: 1 } }, { event: "required" }, { event: "consent_shown" }, { event: "accept" },
+      { event: "waiting_shown" }, { event: "complete", data: { url: 1 } }, { event: "call", data: { n: 2 } },
+    ],
+    badAt: 6,
+  },
+  {
+    name: "mixed builds", module: "MixedBuilds",
+    constants: { ObsRevokeOnReplay: false },
+    good: [
+      { event: "observe", data: { v2kind: "v1", v2: true, v3: false } },
+      { event: "run", data: { cmd: "get" } }, { event: "observe", data: { v2kind: "v1", v2: true, v3: false } },
+      { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v1", v2: true, v3: true } },
+      { event: "older", data: { op: "remove" } }, { event: "observe", data: { v2kind: "v1", v2: false, v3: true } },
+    ],
+    // A sign-in saved in the older build's store, as version 2.
+    bad: [
+      { event: "observe", data: { v2kind: "v1", v2: true, v3: false } },
+      { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v2", v2: true, v3: false } },
+    ],
+    badAt: 2,
   },
 ];
 

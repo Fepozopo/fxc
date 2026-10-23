@@ -257,9 +257,14 @@ pub const AgentRuntimeDeps = struct {
     /// Called at every model-request boundary with the turn so far, so each
     /// completed piece is saved as it happens rather than at the turn's end.
     append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
-    /// The saved session's blob folder, where its turns keep each prompt
-    /// image as the file named by its hash; requests name that file (D79).
-    image_blob_dir: ?[]const u8 = null,
+    /// Saves the turn's prompt images in the session before its first
+    /// request is built, so the note naming each saved file is true when
+    /// that request is sent (D89). It sets `blob_path`, allocated with
+    /// `alloc`, which owns `images`, on each image it saves and clears its
+    /// `inline_data`, so the turn holds only the handle; those bytes stay
+    /// the caller's. An image the session cannot save keeps its bytes
+    /// inline and gets no path.
+    save_prompt_images: ?*const fn (ctx: *anyopaque, alloc: Allocator, images: []types.ImageAttachment) anyerror!void = null,
     /// Confirms, without writing, that this process still owns the saved
     /// session after a main-model completion and before its tool calls run.
     /// Another process may have taken the session over.

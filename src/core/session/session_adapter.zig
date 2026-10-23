@@ -41,6 +41,7 @@ const sm = @import("session_manager");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_event = @import("session_event.zig");
@@ -1207,10 +1208,6 @@ pub const Session = struct {
     /// `~/.fx/session-files/{id}`, owned: where an older session kept its
     /// side files, read once by the move (D47).
     files_path: []u8,
-    /// The folder of this session's blobs once it is published, owned, as
-    /// `Manager.blobPath` joins it: each prompt image is the file named by
-    /// its hash there (D79).
-    blobs_path: []u8,
     /// The session's blobs, shared with every capability over it (D44).
     host: *BlobHost,
     capability: ?session_child_store.SessionChildCapability = null,
@@ -1223,6 +1220,10 @@ pub const Session = struct {
     stored_results: std.StringHashMapUnmanaged([]u8) = .empty,
     /// Ids of the open turn's calls already saved as running (D28), owned.
     running: std.ArrayList([]u8) = .empty,
+    /// Prompt images saved as blobs (D89), digest to blob path, both owned.
+    /// The store deletes no blob of a live session, so an entry stays true,
+    /// and every copy of a turn the host passes encodes its images alike.
+    prompt_blobs: std.array_hash_map.String([]u8) = .empty,
     turn_open: bool = false,
     /// Highest turn number started; the manager numbers turns the same way.
     last_turn: u64 = 0,
@@ -1441,23 +1442,15 @@ pub const Session = struct {
     fn init(alloc: Allocator, store: *Store, handle: sm.Session, fresh: bool) !*Session {
         const files_path = try std.Io.Dir.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
         errdefer alloc.free(files_path);
-        const blobs_path = try std.Io.Dir.path.join(alloc, &.{ store.manager.root_path, handle.id(), "blobs" });
-        errdefer alloc.free(blobs_path);
         const host = try BlobHost.create(alloc, store, handle);
         errdefer BlobHost.release(host);
         const self = try alloc.create(Session);
-        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .blobs_path = blobs_path, .host = host, .fresh = fresh };
+        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh };
         return self;
     }
 
     pub fn id(self: *const Session) []const u8 {
         return self.handle.id();
-    }
-
-    /// Where requests say a prompt image is saved (D79): the blob a turn's
-    /// user item keeps it as, written before any of the turn's tools run.
-    pub fn blobsPath(self: *const Session) []const u8 {
-        return self.blobs_path;
     }
 
     /// Appends through the manager; a host session also traces the turn and
@@ -1564,12 +1557,16 @@ pub const Session = struct {
         self.streamed.deinit(alloc);
         self.stored_results.deinit(alloc);
         self.running.deinit(alloc);
+        for (self.prompt_blobs.keys(), self.prompt_blobs.values()) |digest, path| {
+            alloc.free(digest);
+            alloc.free(path);
+        }
+        self.prompt_blobs.deinit(alloc);
         self.turn_numbers.deinit(alloc);
         if (self.language) |value| alloc.free(value);
         if (self.instructions) |value| alloc.free(value);
         if (self.first_title) |value| alloc.free(value);
         alloc.free(self.files_path);
-        alloc.free(self.blobs_path);
         alloc.destroy(self);
     }
 
@@ -1610,35 +1607,6 @@ pub const Session = struct {
 
     /// Opens the turn on disk if it is not open yet, so a body stored for it
     /// is a blob of a session on disk (D44). Caller holds the mutex.
-    /// Keeps each inline prompt image as one of the session's blobs too and
-    /// saves the prompt naming that file, which every request names for the
-    /// model and an image too large to send names in its notice (D79). The
-    /// bytes stay in the item (D44), and `promptImageBlobs` lists the blob
-    /// on it. Storing the same bytes again costs one stat, so a streamed
-    /// prompt encodes the same each time. The path
-    /// is the one `blobPath` gives once the session is published, so an
-    /// import's staged blobs (D59) get theirs too. The caller holds the
-    /// mutex.
-    fn keepPromptImages(self: *Session, a: Allocator, events: []Event) !void {
-        for (events) |*event| switch (event.*) {
-            .user => |*user| {
-                var kept: ?[]types.ImageAttachment = null;
-                for (user.images, 0..) |image, index| {
-                    const bytes = image.inline_data orelse continue;
-                    if (kept == null) {
-                        // A blob needs the turn on disk first (D44).
-                        try self.openTurnLocked();
-                        kept = try a.dupe(types.ImageAttachment, user.images);
-                    }
-                    const hash = try self.handle.putBlob(bytes);
-                    kept.?[index].snapshot_path = try std.Io.Dir.path.join(a, &.{ self.blobs_path, &hash });
-                }
-                if (kept) |list| user.images = list;
-            },
-            else => {},
-        };
-    }
-
     fn openTurnLocked(self: *Session) !void {
         if (self.turn_open) return;
         _ = try self.write(&.{.turn_started});
@@ -1708,14 +1676,13 @@ pub const Session = struct {
         var events: std.ArrayList(Event) = .empty;
         try session_event.appendHistoryTurnConversationEvents(a, &events, turn);
         if (events.items.len < 2) return error.InvalidConversationFrame;
-        try self.keepPromptImages(a, events.items);
         const pieces = events.items[0 .. events.items.len - 1];
         const end = events.items[events.items.len - 1];
 
         // The end piece joins the others; its line ends the turn.
         const all = events.items;
         const encoded = try a.alloc([]u8, all.len);
-        for (all, encoded) |piece, *bytes| bytes.* = try encodePiece(a, piece);
+        for (all, encoded) |piece, *bytes| bytes.* = try self.encodeEvent(a, piece);
         const start = try self.streamedPrefix(encoded[0..pieces.len]);
 
         var tail: std.ArrayList(sm.Event) = .empty;
@@ -1755,6 +1722,96 @@ pub const Session = struct {
         self.fresh = false;
     }
 
+    /// Saves each prompt image of the turn as a blob named by its digest
+    /// before the turn's first request is built, and gives the image that
+    /// blob's path for the model's note (`AgentRuntimeDeps.save_prompt_images`,
+    /// D89, `tests/tla/session_manager/PromptImages.tla`). Each save lists
+    /// the blob again on the turn's next item, so a fork hard-links it even
+    /// after a crash lost an earlier listing. A saved image then keeps only
+    /// that handle, and readers load its bytes from the blob. An image the
+    /// store refuses keeps its bytes inline, as before D89, and gets no
+    /// path. An image that arrives as only a handle, perhaps to another
+    /// session's blob, is saved from that file. `alloc` owns `images` and
+    /// what this sets on them; the bytes an image arrived with are the
+    /// caller's and are not freed.
+    pub fn savePromptImages(self: *Session, alloc: Allocator, images: []types.ImageAttachment) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (images) |*image| {
+            // Bytes this read from the file a handle names, which `alloc` owns.
+            var loaded: ?[]u8 = null;
+            if (image.inline_data == null) {
+                const verified = image_attachments.loadVerifiedSnapshot(alloc, image.*, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        debug_trace.logf("session", "event=sessions_v2_prompt_image_unreadable session={s} image={d} reason={s}", .{ self.id(), image.id, @errorName(err) });
+                        image.blob_path = null;
+                        continue;
+                    },
+                };
+                loaded = verified.bytes;
+                image.inline_data = verified.bytes;
+            }
+            image.blob_path = null;
+            const bytes = image.inline_data.?;
+            const digest = image.snapshot_sha256 orelse continue;
+            const path = self.savePromptImageLocked(bytes, digest) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    debug_trace.logf("session", "event=sessions_v2_prompt_image_inline session={s} image={d} reason={s}", .{ self.id(), image.id, @errorName(err) });
+                    continue;
+                },
+            };
+            image.blob_path = try alloc.dupe(u8, path);
+            image.inline_data = null;
+            if (loaded) |value| alloc.free(value);
+        }
+    }
+
+    /// The path of the blob holding `bytes`, owned by `prompt_blobs`. A turn
+    /// the store cannot start fails the save, as a refused blob does, so the
+    /// image stays inline and the prompt goes on.
+    fn savePromptImageLocked(self: *Session, bytes: []const u8, digest: []const u8) ![]const u8 {
+        // A blob needs the turn on disk (D44).
+        try self.openTurnLocked();
+        const hash = try BlobHost.put(self.host, bytes);
+        // The digest names the blob: bytes that do not match it are not
+        // saved under it.
+        if (!std.mem.eql(u8, &hash, digest)) return error.ImageDigestMismatch;
+        if (self.prompt_blobs.get(digest)) |path| return path;
+        // The blob's path once the session is published, as
+        // `Manager.blobPath` joins it, so a conversion's staged import (D59)
+        // names its images too. The put above just stored the file.
+        const path = try std.Io.Dir.path.join(self.alloc, &.{ self.store.manager.root_path, self.id(), "blobs", &hash });
+        errdefer self.alloc.free(path);
+        const key = try self.alloc.dupe(u8, digest);
+        errdefer self.alloc.free(key);
+        try self.prompt_blobs.put(self.alloc, key, path);
+        return path;
+    }
+
+    /// `event` as this session writes it: an image is written as a blob
+    /// exactly when this session saved it as one, whichever copy of the turn
+    /// the host passes and whatever path the copy carries. So a commit
+    /// matches what was streamed, and an item never names another session's
+    /// blob (D89, `tests/tla/session_manager/PromptImages.tla` RefHasBlob).
+    fn encodeEvent(self: *Session, a: Allocator, event: Event) ![]u8 {
+        const user = switch (event) {
+            .user => |value| value,
+            else => return encodePiece(a, event),
+        };
+        if (user.images.len == 0) return encodePiece(a, event);
+        const images = try a.dupe(types.ImageAttachment, user.images);
+        for (images) |*image| {
+            const digest = image.snapshot_sha256 orelse {
+                image.blob_path = null;
+                continue;
+            };
+            image.blob_path = self.prompt_blobs.get(digest);
+        }
+        return encodePiece(a, .{ .user = .{ .text = user.text, .images = images, .work_id = user.work_id } });
+    }
+
     /// Streams the turn so far (`AgentRuntimeDeps.append_turn_piece`): the
     /// first call starts the turn, later calls append only the pieces
     /// completed since. A tool result gets the side file the commit would
@@ -1776,7 +1833,6 @@ pub const Session = struct {
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
-        try self.keepPromptImages(a, events.items);
         // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked();
         // On a missing handle the list keeps the pieces before it.
@@ -1785,7 +1841,7 @@ pub const Session = struct {
             else => return err,
         };
         const encoded = try a.alloc([]u8, events.items.len);
-        for (events.items, encoded) |event, *bytes| bytes.* = try encodePiece(a, event);
+        for (events.items, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
         const start = try self.streamedPrefix(encoded);
         if (!self.turn_open or start < encoded.len) {
             try self.writePieces(a, events.items[start..], encoded[start..], &.{});
@@ -1877,32 +1933,12 @@ pub const Session = struct {
             }
         }
         for (events, encoded) |event, bytes| {
-            var piece = try self.item(a, std.meta.activeTag(event), bytes);
-            if (event == .user) piece.blobs = try self.promptImageBlobs(a, piece.blobs, event.user.images);
-            try batch.append(a, .{ .item = piece });
+            try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
         }
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
         _ = try self.write(batch.items);
         if (!self.turn_open) self.startedTurn();
-    }
-
-    /// `blobs` and the blob each kept prompt image names, so every blob is
-    /// listed on an item of the turn that stored it (D44, D79).
-    fn promptImageBlobs(self: *Session, a: Allocator, blobs: []const []const u8, images: []const types.ImageAttachment) ![]const []const u8 {
-        const folder = self.blobs_path;
-        var list: std.ArrayList([]const u8) = .empty;
-        for (images) |image| {
-            const path = image.snapshot_path orelse continue;
-            if (path.len != folder.len + 1 + @sizeOf(sm.BlobHash) or !std.mem.startsWith(u8, path, folder) or path[folder.len] != '/') continue;
-            const hash = path[folder.len + 1 ..];
-            if (list.items.len == 0) try list.appendSlice(a, blobs);
-            const listed = for (list.items) |ref| {
-                if (std.mem.eql(u8, ref, hash)) break true;
-            } else false;
-            if (!listed) try list.append(a, hash);
-        }
-        return if (list.items.len == 0) blobs else list.items;
     }
 
     fn startedTurn(self: *Session) void {
@@ -1937,13 +1973,32 @@ pub const Session = struct {
         try self.importTurn(a, events.items);
     }
 
+    /// Saves each image of `events`' user items as this session's blob, as
+    /// a turn's start saves a prompt's (D89), so a converted session names
+    /// its images by blob too. An image the store refuses keeps its bytes
+    /// inline. The caller holds the mutex.
+    fn saveImportedImages(self: *Session, events: []const Event) !void {
+        for (events) |event| switch (event) {
+            .user => |user| for (user.images) |image| {
+                const bytes = image.inline_data orelse continue;
+                const digest = image.snapshot_sha256 orelse continue;
+                _ = self.savePromptImageLocked(bytes, digest) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    debug_trace.logf("session", "event=sessions_v2_prompt_image_inline session={s} image={d} reason={s}", .{ self.id(), image.id, @errorName(err) });
+                    continue;
+                };
+            },
+            else => {},
+        };
+    }
+
     /// `events`, a turn's pieces, ended by the last one.
     fn importTurn(self: *Session, a: Allocator, turn_events: []const Event) !void {
         if (turn_events.len < 2) return error.InvalidConversationFrame;
         const events = try a.dupe(Event, turn_events);
-        try self.keepPromptImages(a, events);
+        try self.saveImportedImages(events);
         const encoded = try a.alloc([]u8, events.len);
-        for (events, encoded) |event, *bytes| bytes.* = try encodePiece(a, event);
+        for (events, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
         const end: sm.Event = switch (events[events.len - 1]) {
             .turn_completed => .turn_committed,
             .interrupted => |interruption| .{ .turn_interrupted = switch (interruption.reason) {
@@ -2732,10 +2787,10 @@ const Source = struct {
         }
     }
 
-    /// `user` with the bytes of each image an older session kept in its side
-    /// folder (D47), from its blob: inside the turn, as a v2 session keeps
-    /// images now (D44). Other images are unchanged; an unreadable one keeps
-    /// its old path, as a lost snapshot does.
+    /// `user` with the blob path of each image an older session kept in its
+    /// side folder (D47), as a v2 session's own prompt images have it
+    /// (D89). Other images are unchanged; one whose blob is gone keeps its
+    /// old path, as a lost snapshot does.
     fn withMovedImages(src: Source, pa: Allocator, user: session_event.ConversationUser) !session_event.ConversationUser {
         const host = src.host orelse return user;
         const files_path = src.files_path orelse return user;
@@ -2746,18 +2801,47 @@ const Source = struct {
             const path = image.snapshot_path orelse continue;
             if (path.len <= files_path.len + 1 or !std.mem.startsWith(u8, path, files_path) or path[files_path.len] != '/') continue;
             const hash = host.moved.get(path[files_path.len + 1 ..]) orelse continue;
-            const bytes = src.store.manager.getBlob(pa, src.id, &hash) catch |err| {
-                debug_trace.logf("session", "event=sessions_v2_moved_image_unreadable session={s} err={s}", .{ src.id, @errorName(err) });
-                continue;
+            // The image is its own blob now, which readers load and the
+            // model's note names (D89).
+            const blob_path = src.store.manager.blobPath(pa, src.id, &hash) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    debug_trace.logf("session", "event=sessions_v2_moved_image_unreadable session={s} err={s}", .{ src.id, @errorName(err) });
+                    continue;
+                },
             };
             if (images == null) images = try pa.dupe(types.ImageAttachment, user.images);
-            images.?[index].inline_data = bytes;
-            // The v1 file went with its folder; the blob is the original now
-            // (D79).
-            images.?[index].snapshot_path = try src.store.manager.blobPath(pa, src.id, &hash);
+            images.?[index].blob_path = blob_path;
         }
         const list = images orelse return user;
         return .{ .text = user.text, .images = list, .work_id = user.work_id };
+    }
+
+    /// A `user` item, each image saved as its own blob given only that
+    /// blob's path, from which readers load its bytes when they need them
+    /// (D89). A fork reads the blobs it hard-linked here too.
+    fn decodeUser(src: Source, pa: Allocator, data: []const u8) !session_event.ConversationUser {
+        const wire = try std.json.parseFromSliceLeaky(WireUser, pa, data, .{ .allocate = .alloc_if_needed });
+        const images = try wire.toImages(pa);
+        for (wire.images, images) |image, *out| {
+            const hash = image.blob orelse continue;
+            out.blob_path = src.store.manager.blobPath(pa, src.id, hash) catch |err| return imageBlobFailed(src, image.id, err);
+        }
+        return .{ .text = wire.text, .images = images, .work_id = wire.work_id };
+    }
+
+    /// An image blob the log names that is gone or misnamed damages the
+    /// session, as a piece's blob does (D39). One whose bytes were damaged is
+    /// found by `verify`, and by any reader, which checks them against the
+    /// image's digest (D89).
+    fn imageBlobFailed(src: Source, image_id: usize, err: sm.BlobError) (sm.BlobError || error{InvalidSessionFormat}) {
+        return switch (err) {
+            error.NotFound, error.Corrupt, error.InvalidArgument => {
+                debug_trace.logf("session", "event=sessions_v2_prompt_image_unreadable session={s} image={d} err={s}", .{ src.id, image_id, @errorName(err) });
+                return error.InvalidSessionFormat;
+            },
+            else => |e| e,
+        };
     }
 
     /// A piece's bytes, from its blob when the line holds a reference. The
@@ -4186,8 +4270,13 @@ noinline fn replay(
                     const data = try src.pieceData(pa, piece);
                     // The builder copies what it keeps, as it does for v1's
                     // reader, so strings may point into the page.
+                    if (kind == .user) {
+                        try builder.begin(try src.withMovedImages(pa, try src.decodeUser(pa, data)));
+                        continue;
+                    }
                     switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
-                        .user => |value| try builder.begin(try src.withMovedImages(pa, value)),
+                        // Read above, with its images' blobs.
+                        .user => unreachable,
                         .assistant => |value| {
                             running_text = null;
                             try builder.appendAssistant(value);
@@ -4656,7 +4745,9 @@ const WireUser = struct {
     images: []const WireImage = &.{},
     work_id: ?[]const u8 = null,
 
-    /// `types.ImageAttachment` field for field, with `inline_data` in base64.
+    /// `types.ImageAttachment` field for field, with `inline_data` in base64,
+    /// or the image's own blob (D89): `blob` names it by its digest, and the
+    /// bytes, the digest, and the snapshot are not written again.
     const WireImage = struct {
         id: usize = 0,
         path: []const u8,
@@ -4665,11 +4756,20 @@ const WireUser = struct {
         snapshot_sha256: ?[]const u8 = null,
         inline_data: ?[]const u8 = null,
         source_ref: ?[]const u8 = null,
+        blob: ?[]const u8 = null,
 
         pub fn jsonStringify(self: WireImage, writer: *std.json.Stringify) !void {
             try writer.beginObject();
             inline for (@typeInfo(WireImage).@"struct".field_names) |field_name| {
-                if (!std.mem.eql(u8, field_name, "source_ref") or self.source_ref != null) {
+                // Written only when set, so an image without them encodes
+                // as it did before they existed.
+                const optional = comptime std.mem.eql(u8, field_name, "source_ref") or std.mem.eql(u8, field_name, "blob");
+                // An image in its blob has no bytes, digest or snapshot here.
+                const in_blob = comptime std.mem.eql(u8, field_name, "snapshot_path") or
+                    std.mem.eql(u8, field_name, "snapshot_sha256") or
+                    std.mem.eql(u8, field_name, "inline_data");
+                const write = if (optional) @field(self, field_name) != null else !(in_blob and self.blob != null);
+                if (write) {
                     try writer.objectField(field_name);
                     try writer.write(@field(self, field_name));
                 }
@@ -4685,6 +4785,16 @@ const WireUser = struct {
         for (user.images, images) |image, *wire| {
             if (image.source_ref) |value| {
                 if (!image_data.validSourceRef(value)) return error.InvalidSessionFormat;
+            }
+            if (image.blob_path != null) {
+                wire.* = .{
+                    .id = image.id,
+                    .path = image.path,
+                    .media_type = image.media_type,
+                    .source_ref = image.source_ref,
+                    .blob = image.snapshot_sha256 orelse return error.InvalidSessionFormat,
+                };
+                continue;
             }
             wire.* = .{
                 .id = image.id,
@@ -4703,10 +4813,27 @@ const WireUser = struct {
     }
 
     fn toUser(wire: WireUser, a: Allocator) !session_event.ConversationUser {
+        return .{ .text = wire.text, .images = try wire.toImages(a), .work_id = wire.work_id };
+    }
+
+    /// The images, without the bytes of those in blobs: `Source.decodeUser`
+    /// reads those.
+    fn toImages(wire: WireUser, a: Allocator) ![]types.ImageAttachment {
         const images = try a.alloc(types.ImageAttachment, wire.images.len);
         for (wire.images, images) |image, *out| {
             if (image.source_ref) |value| {
                 if (!image_data.validSourceRef(value)) return error.InvalidSessionFormat;
+            }
+            if (image.blob) |hash| {
+                if (image.inline_data != null or image.snapshot_path != null or image.snapshot_sha256 != null) return error.InvalidSessionFormat;
+                out.* = .{
+                    .id = image.id,
+                    .path = try a.dupe(u8, image.path),
+                    .media_type = try a.dupe(u8, image.media_type),
+                    .snapshot_sha256 = try a.dupe(u8, hash),
+                    .source_ref = if (image.source_ref) |value| try a.dupe(u8, value) else null,
+                };
+                continue;
             }
             out.* = .{
                 .id = image.id,
@@ -4723,7 +4850,7 @@ const WireUser = struct {
                 .source_ref = if (image.source_ref) |value| try a.dupe(u8, value) else null,
             };
         }
-        return .{ .text = wire.text, .images = images, .work_id = wire.work_id };
+        return images;
     }
 };
 
@@ -6392,11 +6519,24 @@ test "an older session moves off its side folder on its first writable open, and
         for (try records.list(arena)) |name| count += @intFromBool(std.mem.eql(u8, name, "compacted-T9.txt"));
         try testing.expectEqual(@as(usize, 1), count);
     }
-    // The image is inside the turn now, and the client's settings are settings.
+    // The image is its blob now, read back on demand, and the client's
+    // settings are settings.
     var restored = try r.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
     const image = restored.history[0].assistant.user.images[0];
-    try testing.expectEqualSlices(u8, &OldSideFolder.png, image.inline_data.?);
+    try testing.expectEqual(@as(?[]u8, null), image.inline_data);
+    {
+        var read = try image_attachments.loadVerifiedSnapshot(testing.allocator, image, .{});
+        defer read.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, &OldSideFolder.png, read.bytes);
+    }
+    // Its blob is the file the model's note names (D89).
+    {
+        const hash = r.host.moved.get("images/" ++ OldSideFolder.image_name).?;
+        const path = try t.store.manager.blobPath(testing.allocator, id, &hash);
+        defer testing.allocator.free(path);
+        try testing.expectEqualStrings(path, image.blob_path.?);
+    }
     const prompt = (try r.clientPrompt(testing.allocator)).?;
     defer testing.allocator.free(prompt);
     try testing.expectEqualStrings("You run inside Mini.", prompt);
@@ -6414,6 +6554,7 @@ test "an older session moves off its side folder on its first writable open, and
     defer without.deinit(testing.allocator);
     const lost = without.history[0].assistant.user.images[0];
     try testing.expectEqual(@as(?[]u8, null), lost.inline_data);
+    try testing.expectEqual(@as(?[]u8, null), lost.blob_path);
     try testing.expect(std.mem.endsWith(u8, lost.snapshot_path.?, "images/" ++ OldSideFolder.image_name));
 }
 
@@ -6574,7 +6715,7 @@ fn userItemLists(t: *TestHome, id: []const u8, hash: []const u8) !bool {
     return error.TestUnexpectedResult;
 }
 
-test "a prompt image's bytes ride inside the user's item, its saved path names its blob, and an image without them encodes as v1's (D44, D79)" {
+test "a prompt image's bytes ride inside the user's item, and an image without them encodes as v1's (D44)" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
@@ -6613,16 +6754,7 @@ test "a prompt image's bytes ride inside the user's item, its saved path names i
         try testing.expectEqualSlices(u8, &bytes, image.inline_data.?);
         try testing.expectEqualStrings(&digest_hex, image.snapshot_sha256.?);
         try testing.expectEqualStrings(images[0].path, image.path);
-        // The saved prompt names the session's blob of the image, which the
-        // notice for an image too large to send names after a resume (D79).
-        const blob_path = try t.store.manager.blobPath(testing.allocator, id, &digest_hex);
-        defer testing.allocator.free(blob_path);
-        try testing.expectEqualStrings(blob_path, image.snapshot_path.?);
-        const kept = try t.store.manager.getBlob(testing.allocator, id, &digest_hex);
-        defer testing.allocator.free(kept);
-        try testing.expectEqualSlices(u8, &bytes, kept);
-        // Every blob is listed on an item of its turn (D44).
-        try testing.expect(try userItemLists(&t, id, &digest_hex));
+        try testing.expectEqualStrings(images[0].snapshot_path.?, image.snapshot_path.?);
         if (source_ref) |value| {
             try testing.expectEqualStrings(value, image.source_ref.?);
         } else try testing.expectEqual(@as(?[]u8, null), image.source_ref);
@@ -6645,6 +6777,240 @@ test "a prompt image's bytes ride inside the user's item, its saved path names i
             try testing.expectEqualStrings(value, decoded.source_ref.?);
         } else try testing.expectEqual(@as(?[]u8, null), decoded.source_ref);
     }
+}
+
+/// Session `id`'s first `user` item, whether it lists blob `hash`, and how
+/// many turns were superseded. The caller frees `data`.
+const UserItem = struct { data: []u8, lists: bool, superseded: usize };
+
+fn firstUserItem(manager: *sm.Manager, id: []const u8, hash: []const u8) !UserItem {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 1000);
+    defer page.deinit();
+    var found: ?UserItem = null;
+    var superseded: usize = 0;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body != .item) continue;
+        if (std.mem.eql(u8, body.item.type, superseded_type)) superseded += 1;
+        if (found != null or !std.mem.eql(u8, body.item.type, itemType(.user).?)) continue;
+        const lists = for (body.item.blobs) |ref| {
+            if (std.mem.eql(u8, ref, hash)) break true;
+        } else false;
+        found = .{ .data = try testing.allocator.dupe(u8, body.item.data), .lists = lists, .superseded = 0 };
+    }
+    var item = found orelse return error.TestUnexpectedResult;
+    item.superseded = superseded;
+    return item;
+}
+
+test "a prompt image is saved as its own blob before the request, named in the user's item, and read back with its path (D89)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const bytes = OldSideFolder.png ++ [_]u8{ 0x00, 0xff };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    var digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const original = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/Users/example/shot.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/fx-image-snapshots-0000000000000001/image-1.bin"),
+        .snapshot_sha256 = &digest_hex,
+        .inline_data = @constCast(&bytes),
+    }};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+
+    var images = original;
+    try s.savePromptImages(arena.allocator(), &images);
+    const blob_path = try t.store.manager.blobPath(testing.allocator, id, &digest_hex);
+    defer testing.allocator.free(blob_path);
+    try testing.expectEqualStrings(blob_path, images[0].blob_path.?);
+    // The turn keeps only the handle; the host's copy keeps its bytes.
+    try testing.expectEqual(@as(?[]u8, null), images[0].inline_data);
+    try testing.expect(original[0].inline_data != null);
+    // Before any request: the file the note names already holds the image.
+    {
+        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), blob_path, .{});
+        defer file.close(io_mod.getIo());
+        var buffer: [256]u8 = undefined;
+        const len = try file.readPositionalAll(io_mod.getIo(), &buffer, 0);
+        try testing.expectEqualSlices(u8, &bytes, buffer[0..len]);
+    }
+    // Saving the handle again reads it back and keeps the one blob and its
+    // path.
+    try s.savePromptImages(arena.allocator(), &images);
+    try testing.expectEqualStrings(blob_path, images[0].blob_path.?);
+    try testing.expectEqual(@as(?[]u8, null), images[0].inline_data);
+
+    // Streamed from the saved copy, committed from the host's copy without
+    // paths: the same item, so the turn is not superseded.
+    try s.appendProgress(.{ .text = @constCast("look"), .images = &images }, .{}, .{});
+    var turn = assistantTurn("look", "a png");
+    var host_copy = original;
+    turn.assistant.user.images = &host_copy;
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    s.close();
+
+    const item = try firstUserItem(t.store.manager, id, &digest_hex);
+    defer testing.allocator.free(item.data);
+    try testing.expectEqual(@as(usize, 0), item.superseded);
+    try testing.expect(item.lists);
+    const blob_field = try arena.allocator().print("\"blob\":\"{s}\"", .{&digest_hex});
+    try testing.expect(std.mem.find(u8, item.data, blob_field) != null);
+    // Neither the bytes nor the process's temporary snapshot are written.
+    try testing.expect(std.mem.find(u8, item.data, "inline_data") == null);
+    try testing.expect(std.mem.find(u8, item.data, "fx-image-snapshots") == null);
+    try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
+
+    // Resumed, and in a fork that hard-links the blob, the image has only
+    // the path of its own session's blob, which reads back as its bytes.
+    const fork = try t.store.manager.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+    const fork_id = try testing.allocator.dupe(u8, fork.id());
+    defer testing.allocator.free(fork_id);
+    fork.release();
+    for ([_][]const u8{ id, fork_id }) |which| {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = which }, "/w", .app);
+        defer r.close();
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), restored.history.len);
+        const image = restored.history[0].assistant.user.images[0];
+        try testing.expectEqual(@as(?[]u8, null), image.inline_data);
+        try testing.expectEqualStrings(&digest_hex, image.snapshot_sha256.?);
+        try testing.expectEqual(@as(?[]u8, null), image.snapshot_path);
+        try testing.expectEqualStrings(original[0].path, image.path);
+        const path = try t.store.manager.blobPath(testing.allocator, which, &digest_hex);
+        defer testing.allocator.free(path);
+        try testing.expectEqualStrings(path, image.blob_path.?);
+        var read = try image_attachments.loadVerifiedSnapshot(testing.allocator, image, .{});
+        defer read.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, &bytes, read.bytes);
+    }
+
+    // A blob the item names that is gone damages the session (D39).
+    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), blob_path);
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    try testing.expectError(error.InvalidSessionFormat, r.restore(testing.allocator));
+}
+
+test "a prompt image the store does not save keeps its bytes inline and gets no path (D89)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const bytes = OldSideFolder.png;
+    // A digest that is not the bytes' cannot name their blob.
+    const wrong_digest: [32]u8 = @splat(0xab);
+    var wrong = std.fmt.bytesToHex(wrong_digest, .lower);
+    var images = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("/Users/example/a.png"), .media_type = @constCast("image/png"), .snapshot_sha256 = &wrong, .inline_data = @constCast(&bytes) },
+        // Bytes the session does not hold are not its to save.
+        .{ .id = 2, .path = @constCast("/Users/example/b.png"), .media_type = @constCast("image/png"), .snapshot_path = @constCast("/Users/example/.fx/sessions/s/images/image-2.bin") },
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try s.savePromptImages(arena.allocator(), &images);
+    try testing.expectEqual(@as(?[]u8, null), images[0].blob_path);
+    try testing.expectEqual(@as(?[]u8, null), images[1].blob_path);
+    var turn = assistantTurn("look", "two");
+    turn.assistant.user.images = &images;
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    s.close();
+
+    const item = try firstUserItem(t.store.manager, id, &wrong);
+    defer testing.allocator.free(item.data);
+    try testing.expect(std.mem.find(u8, item.data, "\"blob\"") == null);
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const kept = restored.history[0].assistant.user.images;
+    try testing.expectEqualSlices(u8, &bytes, kept[0].inline_data.?);
+    try testing.expectEqual(@as(?[]u8, null), kept[0].blob_path);
+    try testing.expectEqual(@as(?[]u8, null), kept[1].blob_path);
+    try testing.expectEqualStrings(images[1].snapshot_path.?, kept[1].snapshot_path.?);
+}
+
+test "a turn the store cannot start keeps its prompt images inline and does not fail the prompt (D89)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const bytes = OldSideFolder.png;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    var digest_hex = std.fmt.bytesToHex(digest, .lower);
+    var images = [_]types.ImageAttachment{.{ .id = 1, .path = @constCast("/Users/example/a.png"), .media_type = @constCast("image/png"), .snapshot_sha256 = &digest_hex, .inline_data = @constCast(&bytes) }};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // A new session reaches the disk with its first line, the turn's start,
+    // which a read-only store refuses.
+    const io = io_mod.getIo();
+    try std.Io.Dir.cwd().createDirPath(io, t.store.manager.root_path);
+    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{});
+    defer root.close(io);
+    root.setPermissions(io, .fromMode(0o500)) catch return error.SkipZigTest;
+    defer root.setPermissions(io, .fromMode(0o700)) catch {};
+    try s.savePromptImages(arena.allocator(), &images);
+    try testing.expectEqual(@as(?[]u8, null), images[0].blob_path);
+    try testing.expectEqualSlices(u8, &bytes, images[0].inline_data.?);
+}
+
+test "an image that arrives with another session's blob path is saved here or written without a blob (D89)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const bytes = OldSideFolder.png;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    var digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const other_digest: [32]u8 = @splat(0xcd);
+    var other_hex = std.fmt.bytesToHex(other_digest, .lower);
+    const elsewhere = "/Users/example/.fx/sessions/v2/other/blobs/elsewhere";
+    const original = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("/Users/example/a.png"), .media_type = @constCast("image/png"), .snapshot_sha256 = &digest_hex, .inline_data = @constCast(&bytes), .blob_path = @constCast(elsewhere) },
+        // No bytes here to save, only another session's blob.
+        .{ .id = 2, .path = @constCast("/Users/example/b.png"), .media_type = @constCast("image/png"), .snapshot_path = @constCast("/Users/example/b.bin"), .snapshot_sha256 = &other_hex, .blob_path = @constCast(elsewhere) },
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    var images = original;
+    try s.savePromptImages(arena.allocator(), &images);
+    const own = try t.store.manager.blobPath(testing.allocator, id, &digest_hex);
+    defer testing.allocator.free(own);
+    try testing.expectEqualStrings(own, images[0].blob_path.?);
+    try testing.expectEqual(@as(?[]u8, null), images[1].blob_path);
+
+    // Committed from a copy that still carries the other session's paths.
+    var turn = assistantTurn("look", "two");
+    var host_copy = original;
+    turn.assistant.user.images = &host_copy;
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    s.close();
+    const item = try firstUserItem(t.store.manager, id, &digest_hex);
+    defer testing.allocator.free(item.data);
+    const own_ref = try arena.allocator().print("\"blob\":\"{s}\"", .{&digest_hex});
+    try testing.expect(std.mem.find(u8, item.data, own_ref) != null);
+    const other_ref = try arena.allocator().print("\"blob\":\"{s}\"", .{&other_hex});
+    try testing.expect(std.mem.find(u8, item.data, other_ref) == null);
+    try testing.expect(std.mem.find(u8, item.data, elsewhere) == null);
+    try testing.expectEqual(@as(u64, 0), (try t.store.manager.verify(id)).bad_blobs);
 }
 
 test "v2 image source refs reject malformed metadata" {
@@ -6934,7 +7300,7 @@ test "a converted v1 session keeps its title, permission rules and preferences (
     try testing.expectEqualStrings(saved.get("model").?.string, restored.preferences.?.model);
 }
 
-test "a converted v1 session's side files keep their old names, and its prompt images ride inside the prompt and name their blob (D44, D47, D79)" {
+test "a converted v1 session's side files keep their old names, and its prompt images become its blobs (D44, D47, D89)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
     try t.init();
@@ -6957,14 +7323,23 @@ test "a converted v1 session's side files keep their old names, and its prompt i
     var restored = try s.restore(alloc);
     defer restored.deinit(alloc);
     const image = restored.history[0].assistant.user.images[0];
-    try testing.expectEqualSlices(u8, image_bytes, image.inline_data.?);
-    // Its v1 file went with the folder; it names its blob (D79).
+    try testing.expectEqual(@as(?[]u8, null), image.inline_data);
+    {
+        var read = try image_attachments.loadVerifiedSnapshot(alloc, image, .{});
+        defer read.deinit(alloc);
+        try testing.expectEqualSlices(u8, image_bytes, read.bytes);
+    }
+    // Its v1 file went with the folder. The converted prompt names the
+    // image by its blob, listed on the user's item, as a new prompt does
+    // (D89).
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(image_bytes, &digest, .{});
     const image_hash = std.fmt.bytesToHex(digest, .lower);
     const blob_path = try t.store.manager.blobPath(alloc, id, &image_hash);
     defer alloc.free(blob_path);
-    try testing.expectEqualStrings(blob_path, image.snapshot_path.?);
+    try testing.expectEqualStrings(blob_path, image.blob_path.?);
+    try testing.expectEqual(@as(?[]u8, null), image.snapshot_path);
+    try testing.expect(try userItemLists(&t, id, &image_hash));
 }
 
 test "a converted v1 session keeps its ACP client's prompt and tool identities (D46)" {
@@ -7740,10 +8115,14 @@ test "an image the oldest format saved as only its path is captured from its fil
     try testing.expectEqualStrings("look [Image #1] [Image #2]", user.text);
     try testing.expectEqual(@as(usize, 1), user.images.len);
     try testing.expectEqual(@as(usize, 1), user.images[0].id);
-    try testing.expectEqualSlices(u8, bytes, user.images[0].inline_data.?);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     try testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), user.images[0].snapshot_sha256.?);
+    // The captured image converts to the session's blob, as any does (D89).
+    try testing.expect(user.images[0].blob_path != null);
+    var read = try image_attachments.loadVerifiedSnapshot(alloc, user.images[0], .{});
+    defer read.deinit(alloc);
+    try testing.expectEqualSlices(u8, bytes, read.bytes);
 }
 
 test "images the oldest format saved without an id get the numbers v1's resume gave them (D69)" {

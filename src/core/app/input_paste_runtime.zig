@@ -166,31 +166,33 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn settlePasteDeliveryEpoch(app: *App, max_input_len: usize) !bool {
-            switch (app.input_runtime.paste.settleDeliveryEpoch()) {
+            const finish = switch (app.input_runtime.paste.settleDeliveryEpoch()) {
                 .none => return false,
-                .finish => {
-                    debug_trace.logf(
-                        "input",
-                        "paste end owner={s} bytes={d}",
-                        .{ @tagName(app.input_runtime.paste.owner), app.input_runtime.paste.byteCount() },
-                    );
-                    try finishPaste(app, max_input_len);
-                },
-                .reject => {
-                    const owner = app.input_runtime.paste.owner;
-                    const render_reason: render_request.Reason = switch (owner) {
-                        .composer => .footer,
-                        .decision_prompt, .question_freeform, .approval_amendment => .modal,
-                        .none, .auth_code => .footer,
-                    };
-                    app.input_runtime.paste.resetWithTrace(.unsafe_suffix);
-                    app.shell.render_requests.request(render_reason);
-                    try app.writeDomainNotice(.{
-                        .topic = "input",
-                        .tone = .@"error",
-                        .body = "Paste was not applied because extra input followed its end marker.",
-                    }, true);
-                },
+                .finish => |finish| finish,
+            };
+            const owner = app.input_runtime.paste.owner;
+            debug_trace.logf(
+                "input",
+                "paste end owner={s} bytes={d}",
+                .{ @tagName(owner), app.input_runtime.paste.byteCount() },
+            );
+            // The paste is kept, but input that followed its end marker in the
+            // same delivery never runs: it may be clipboard content after an
+            // end marker embedded in the paste.
+            if (finish.dropped_suffix_bytes > 0) {
+                debug_trace.logf(
+                    "input",
+                    "paste suffix dropped owner={s} bytes={d} reason=same_delivery_as_end_marker",
+                    .{ @tagName(owner), finish.dropped_suffix_bytes },
+                );
+            }
+            try finishPaste(app, max_input_len);
+            if (finish.dropped_suffix_bytes > 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "input",
+                    .tone = .warning,
+                    .body = "Input that arrived right after the paste was ignored.",
+                }, true);
             }
             return true;
         }

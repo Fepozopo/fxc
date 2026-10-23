@@ -1,8 +1,8 @@
-// Model gate for the fx-layer MCP-v2 models: each model's smoke config
+// Model gate for the fx-layer MCP models: each model's smoke config
 // (safety and liveness), its stress config, every planted bug, the stated
 // properties the code is expected to break (findings), and repair witnesses.
 //
-// Verdicts, as MCP-v2's tools/run.py gives them:
+// Verdicts, as tests/tla/mcp/run.py gives them:
 //   PASS     exit 0, the completed marker, an empty queue
 //   CAUGHT   a planted bug: exit 12 naming its invariant, or exit 13 for its property
 //   FINDING  a findings config: exit 12 naming the stated invariant (13 for a property)

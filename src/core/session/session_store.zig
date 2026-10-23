@@ -42,9 +42,9 @@ pub const validateSessionId = paths.validateSessionId;
 pub const generateSessionId = paths.generateSessionId;
 
 /// The process's temporary folder for captured prompt images, made on first
-/// use. The turn keeps the bytes (D44); until the prompt is saved, a
-/// withheld image's notice names the copy here (D79). The caller frees the
-/// result; `temp_dir` keeps the folder's path.
+/// use. The turn keeps the bytes (D44), and a saved session saves them as
+/// its blob (D89), which requests name instead of a copy here. The caller
+/// frees the result; `temp_dir` keeps the folder's path.
 pub fn imageSnapshotTempDir(alloc: Allocator, temp_dir: *?[]u8) ![]u8 {
     if (temp_dir.* == null) temp_dir.* = try image_attachments.createTempSnapshotDir(alloc);
     return alloc.dupe(u8, temp_dir.*.?);

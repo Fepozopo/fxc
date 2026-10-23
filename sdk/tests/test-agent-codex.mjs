@@ -203,4 +203,15 @@ await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", credenti
 await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", onCredentials: () => {} }), /onCredentials needs provider "codex"/);
 await assert.rejects(createFxEngine({ ...backendOptions }), /apiKey is required/);
 
+// fx's default model is an AI Gateway id, which Codex doesn't serve, so a
+// Codex agent must name its model, and nothing is requested without one.
+{
+  const world = codexWorld({});
+  await assert.rejects(
+    createFxEngine({ ...backendOptions, provider: "codex", fetch: world.fetch, credentials: () => ({ accessToken: "at-first", refreshToken: "rt-1" }) }),
+    /provider "codex" needs a model; fx's default model is an AI Gateway id/,
+  );
+  assert.deepEqual(world.log, []);
+}
+
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Codex agent passed`);

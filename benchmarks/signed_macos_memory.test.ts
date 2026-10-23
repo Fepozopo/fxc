@@ -31,7 +31,7 @@ test("signed macOS variants preserve the image flow and native resource accounti
       writeFileSync(join(profile, ".fx/settings.json"), "{}");
       writeFileSync(join(profile, ".fx/mcp.json"), JSON.stringify({ mcp: { fixture: {
         type: "local", command: [process.execPath, fixture], enabled: true,
-        environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28", FX_MCP_MODE: "image_result" },
+        environment: { FX_MCP_MODE: "image_result" },
       } } }));
       let childPid = 0;
       let sample: Record<string, number> | null = null;

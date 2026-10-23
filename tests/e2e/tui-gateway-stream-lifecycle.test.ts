@@ -969,7 +969,7 @@ function handle(message) {
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        protocolVersion: "2024-11-05",
+        protocolVersion: "2025-03-26",
         capabilities: { tools: {} },
         serverInfo: { name: "fixture", version: "1.0.0" },
       },
@@ -6008,6 +6008,77 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
+  );
+
+  test(
+    "a shell subagent keeps an MCP tool it selected on its next request",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-subagent-mcp-selected-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const fixture = writeDelayedMcpFixture(root, home, 0);
+      const toolName = "mcp_fixture_echo";
+      const rootPrompt = "SUBAGENT_SELECTED_MCP_FIXTURE";
+      const childTask = "Select and call the fixture echo tool.";
+      let offeredAfterSelect: boolean | null = null;
+      const childGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as {
+          prompt: Array<{ role: string; content: unknown }>;
+          tools?: Array<{ name: string }>;
+        };
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        );
+        const has = (id: string) =>
+          parts.some((part) => part.type === "tool-result" && part.toolCallId === id);
+        if (has("parent_delegate")) return fakeGatewayFinalText("SUBAGENT_SELECTED_PARENT_DONE");
+        const userText = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
+        if (!userText.includes(childTask) || userText.includes(rootPrompt)) {
+          return fakeGatewayToolCall("parent_delegate", "subagent", {
+            request: { action: "run", task: childTask },
+          });
+        }
+        if (has("child_call")) return fakeGatewayFinalText("SUBAGENT_SELECTED_CHILD_DONE");
+        if (has("child_select")) {
+          // Selecting a tool puts its definition on the child's next request.
+          offeredAfterSelect = (request.tools ?? []).some((tool) => tool.name === toolName);
+          return fakeGatewayToolCall("child_call", toolName, { text: "selected" });
+        }
+        return fakeGatewayToolCall("child_select", "mcp_select_tool", { name: toolName });
+      }, { classifierDecision: "clear" });
+      gateway = childGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 110,
+        height: 35,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-subagent-selected-mcp-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: childGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: childGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: childGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(rootPrompt);
+      await session.waitForText("SUBAGENT_SELECTED_PARENT_DONE", TIMEOUT);
+      expect(offeredAfterSelect).toBe(true);
+      expect(readFileSync(fixture.callStartedPath, "utf8")).toContain("selected");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    },
+    TIMEOUT * 2,
   );
 
   test(

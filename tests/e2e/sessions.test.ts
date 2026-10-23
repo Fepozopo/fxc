@@ -35,7 +35,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, storeRoot } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, type LogLine, logLines, onlySessionId, rootSessionIds, savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
 
 // The session store: every `fx ask` entry and exit, the files it writes, and the faults a real disk and a real
 // crash produce: kills mid-stream and mid-tool, a torn tail, a flipped
@@ -1666,22 +1666,42 @@ function itemData(line: any): any {
   return typeof line.data === "string" ? JSON.parse(line.data) : line.data;
 }
 
-/// The images a session keeps inside its user items (D44), as the bytes
-/// each decodes to.
-function inlineImages(fixture: Fixture, id: string): Buffer[] {
-  const found: Buffer[] = [];
+/// The images a session's user items name as its own blobs (D89): each
+/// blob's path and bytes, and whether its item lists it. No user item may
+/// keep an image's bytes or a snapshot path.
+function savedImages(fixture: Fixture, id: string): { path: string; bytes: Buffer; listed: boolean }[] {
+  const found: { path: string; bytes: Buffer; listed: boolean }[] = [];
   for (const line of logLines(fixture.home, id) as any[]) {
     if (line.kind !== "item" || line.type !== "user") continue;
     for (const image of itemData(line).images ?? []) {
-      if (image.inline_data) found.push(Buffer.from(image.inline_data, "base64"));
+      expect(image.inline_data).toBeUndefined();
+      expect(image.snapshot_path).toBeUndefined();
+      expect(typeof image.blob).toBe("string");
+      const path = join(sessionDir(fixture.home, id), "blobs", image.blob);
+      found.push({ path, bytes: readFileSync(path), listed: (line.blobs ?? []).includes(image.blob) });
     }
   }
   return found;
 }
 
+/// The saved files a request's notes name, in order.
+function notedImagePaths(body: string): string[] {
+  const paths: string[] = [];
+  for (const message of JSON.parse(body).prompt as { content?: unknown }[]) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content as { type?: string; text?: string }[]) {
+      if (part.type !== "text") continue;
+      for (const match of String(part.text).matchAll(/^\[Image #\d+ \([^)]*\) is saved at ("(?:[^"\\]|\\.)*")\.\]$/gm)) {
+        paths.push(JSON.parse(match[1]!));
+      }
+    }
+  }
+  return paths;
+}
+
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-test("fx ask keeps an image inside its turn, and resume in a new process sends it again", async () => {
+test("fx ask saves an image as its session's blob, names it to the model, and resume sends it again (D89)", async () => {
   const fixture = createFixture("fx-v2-image-");
   const gateway = replyToLatest([
     ["Describe the image.", "IMAGE_SEEN"],
@@ -1694,16 +1714,49 @@ test("fx ask keeps an image inside its turn, and resume in a new process sends i
     expect(created.code).toBe(0);
     expect(JSON.parse(created.stdout).output).toBe("IMAGE_SEEN");
     const id = JSON.parse(created.stdout).session_id;
-    const images = inlineImages(fixture, id);
+    const images = savedImages(fixture, id);
     expect(images.length).toBe(1);
-    expect(images[0]!.subarray(0, 8).equals(PNG_SIGNATURE)).toBe(true);
+    expect(images[0]!.bytes.equals(Buffer.from(PNG_1X1, "base64"))).toBe(true);
+    expect(images[0]!.listed).toBe(true);
+    // The model is told where the blob is, and never the attached file.
+    expect(notedImagePaths(gateway.requests[0]!.body)).toEqual([images[0]!.path]);
+    expect(gateway.requests[0]!.body).not.toContain(image);
     const resumed = await ask(fixture, gateway, ["--resume-id", id, "And again."]);
     expect(resumed.code).toBe(0);
     // The prompt text says "image" too, so match the part's media type.
     expect(gateway.requests[0]!.body).toContain("image/png");
     expect(gateway.requests.at(-1)!.body).toContain("image/png");
+    // Read back from its blob, the image keeps its note in a new process.
+    expect(notedImagePaths(gateway.requests.at(-1)!.body)).toEqual([images[0]!.path]);
     expectWholeLog(fixture, id);
     expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("an image pasted into the app is saved as its session's blob and named to the model (D89)", async () => {
+  const fixture = createFixture("fx-v2-app-image-");
+  const gateway = replyToLatest([["Describe the pasted image.", "APP_IMAGE_SEEN"]], undefined, VISION_MODEL);
+  try {
+    const image = join(fixture.workspace, "dot.png");
+    writeFileSync(image, Buffer.from(PNG_1X1, "base64"));
+    const app = await startApp(fixture, gateway, []);
+    await app.session.pasteText(image);
+    await app.session.waitForText("[Image 1]", TIMEOUT);
+    await app.session.sendText(" Describe the pasted image.");
+    await app.session.waitForText("APP_IMAGE_SEEN", TIMEOUT);
+    await quitApp(app);
+    const id = onlySessionId(fixture.home);
+    const saved = savedImages(fixture, id);
+    expect(saved.length).toBe(1);
+    expect(saved[0]!.bytes.equals(Buffer.from(PNG_1X1, "base64"))).toBe(true);
+    expect(saved[0]!.listed).toBe(true);
+    const request = gateway.requests.find((r: { body: string }) => r.body.includes("Describe the pasted image."))!;
+    expect(notedImagePaths(request.body)).toEqual([saved[0]!.path]);
+    expect(request.body).not.toContain(image);
+    expectWholeLog(fixture, id);
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -1725,7 +1778,10 @@ test("ACP keeps an image prompt and replays it with the image on load", async ()
       ],
     });
     expect(prompted.stopReason).toBe("end_turn");
-    expect(inlineImages(fixture, id).length).toBe(1);
+    const saved = savedImages(fixture, id);
+    expect(saved.length).toBe(1);
+    expect(saved[0]!.bytes.equals(Buffer.from(PNG_1X1, "base64"))).toBe(true);
+    expect(notedImagePaths(gateway.requests.at(-1)!.body)).toEqual([saved[0]!.path]);
     expect(await client.close()).toBe(0);
 
     client = await AcpRpc.start(fixture, gateway);

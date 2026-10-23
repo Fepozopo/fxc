@@ -75,14 +75,10 @@ const native_host = @import("core/hosts/native.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
-const mcp_command_provider = @import("core/mcp/command_provider.zig");
-const mcp_runtime_mod = @import("core/mcp/mcp_runtime.zig");
 const mcp_host = @import("core/mcp_host/host.zig");
 const mcp_model_catalog = @import("core/mcp/model_catalog.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
-const mcp_menu_state = @import("core/mcp/menu_state.zig");
 const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
-const app_mcp_menu_runtime = @import("core/app/app_mcp_menu_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
@@ -448,10 +444,6 @@ const App = struct {
         return registry;
     }
 
-    pub fn mcpCommandProvider(_: *const Self) mcp_command_provider.Provider {
-        return builtin_mcp.command_provider;
-    }
-
     pub fn skillsCommandProvider(_: *const Self) skill_commands.Provider {
         return builtin_skills.command_provider;
     }
@@ -610,14 +602,6 @@ const App = struct {
 
     stream: StreamState = .{},
     metrics: Metrics = .{},
-    fn loadNoMcpRuntime(
-        _: Allocator,
-        _: []const u8,
-        _: @import("core/mcp/elicitation.zig").Capabilities,
-    ) !?*mcp_runtime_mod.McpRuntime {
-        return null;
-    }
-
     pub fn init(
         alloc: Allocator,
         launch: *cli_surface.InteractiveLaunch,
@@ -680,7 +664,6 @@ const App = struct {
             default_max_agent_steps,
             handle_sigwinch,
             .{
-                .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .load_mcp_host = if (comptime host_target.is_wasm) null else builtin_mcp.loadHost,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
                 .terminal_title = app.terminalTitle(),
@@ -915,7 +898,7 @@ const App = struct {
         // Waits for an in-flight API key or credential save to land.
         self.auth.deinit(self.alloc);
         shutdown_trace.mark("credentials_saved");
-        self.mcp.deinitForProcessExit(self.alloc);
+        self.mcp.deinitForProcessExit();
         shutdown_trace.mark("mcp_children_terminated");
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
@@ -1630,16 +1613,8 @@ const App = struct {
         return self.session.hasContextToCompact();
     }
 
-    pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
-        self.mcp.installInitial(runtime);
-    }
-
     pub fn loadMcpHost(self: *App, load: mcp_host.LoadFn) !void {
         try self.mcp.loadHost(load, self.alloc, self.workspace_root, self.toolRegistry(), .{ .form = true, .url = true });
-    }
-
-    pub fn mcpHostSelected(_: *const App) bool {
-        return mcp_host.selected();
     }
 
     pub fn runMcpVerbs(self: *App, rest: []const u8) !void {
@@ -1670,6 +1645,10 @@ const App = struct {
         return self.mcp.hostStatuses(alloc);
     }
 
+    pub fn mcpHostStatusesNow(self: *App, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
+        return self.mcp.hostStatusesNow(alloc);
+    }
+
     pub fn refreshMcpHostStatus(self: *App) void {
         if (self.mcp.refreshHostStatus(io_mod.milliTimestamp())) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
     }
@@ -1691,213 +1670,8 @@ const App = struct {
         try self.mcp.reloadHost(self.alloc, self.workspace_root, self.toolRegistry());
     }
 
-    pub fn acquireMcpRuntime(self: *App) ?app_mcp_runtime.Lease {
-        return self.mcp.acquire();
-    }
-
-    pub fn snapshotMcpModelCatalog(
-        self: *App,
-        alloc: Allocator,
-        permission_rules: types.PermissionRuleSet,
-        include_ask_deferred: bool,
-    ) !mcp_model_catalog.Report {
-        return self.mcp.snapshotModelCatalog(
-            alloc,
-            self.alloc,
-            permission_rules,
-            include_ask_deferred,
-        );
-    }
-
-    pub fn waitForRequiredMcp(
-        self: *App,
-        alloc: Allocator,
-        cancel_flag: ?*std.atomic.Value(bool),
-    ) !?[]u8 {
-        return self.mcp.waitForRequired(
-            alloc,
-            cancel_flag,
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
-    }
-
-    pub fn beginMcpReload(self: *App) !void {
-        return self.mcp.beginReload(
-            self.alloc,
-            self.workspace_root,
-            .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-            builtin_mcp.previewNativeWorkspaceAuthority,
-            self.toolRegistry(),
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
-    }
-
-    pub fn beginMcpSlackSetup(self: *App) !void {
-        return self.mcp.beginSlackSetup(
-            self.alloc,
-            self.workspace_root,
-            .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-            builtin_mcp.previewNativeWorkspaceAuthority,
-            self.toolRegistry(),
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
-    }
-
-    pub fn beginMcpMenuReload(self: *App, generation: u64) !void {
-        return self.mcp.beginMenuReload(
-            self.alloc,
-            self.workspace_root,
-            .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-            builtin_mcp.previewNativeWorkspaceAuthority,
-            self.toolRegistry(),
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-            generation,
-        );
-    }
-
-    pub fn beginMcpAuthorityReduction(self: *App, rebuild: bool) !void {
-        return self.mcp.beginAuthorityReduction(
-            self.alloc,
-            self.workspace_root,
-            .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-            self.toolRegistry(),
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-            rebuild,
-        ) catch |err| {
-            self.mcp.retireAuthoritySynchronously(self.alloc);
-            return err;
-        };
-    }
-
-    pub fn beginMcpMenuAuthorityReduction(
-        self: *App,
-        rebuild: bool,
-        generation: u64,
-    ) !void {
-        return self.mcp.beginMenuAuthorityReduction(
-            self.alloc,
-            self.workspace_root,
-            .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-            self.toolRegistry(),
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-            rebuild,
-            generation,
-        ) catch |err| {
-            self.mcp.retireAuthoritySynchronously(self.alloc);
-            return err;
-        };
-    }
-
-    pub fn startMcpAuthentication(
-        self: *App,
-        server_name: []const u8,
-    ) !mcp_command_provider.AuthenticationStart {
-        return self.mcp.startAuthentication(
-            self.alloc,
-            server_name,
-            self.urlOpener(),
-        );
-    }
-
-    pub fn beginMcpMenuAuthentication(self: *App, generation: u64) !void {
-        const server_name = self.mcp.selectedMenuServerName() orelse
-            return error.McpServerNotFound;
-        const started = try self.mcp.startMenuAuthentication(
-            self.alloc,
-            server_name,
-            self.urlOpener(),
-            generation,
-        );
-        if (started == .busy) return error.McpAuthenticationBusy;
-    }
-
-    pub fn takeMcpAuthenticationCompletion(
-        self: *App,
-    ) !?app_mcp_runtime.AuthenticationCompletion {
-        return self.mcp.takeAuthenticationCompletion();
-    }
-
-    pub fn mcpAuthenticationCompletionOrigin(self: *const App) app_mcp_runtime.PresentationOrigin {
-        return self.mcp.authenticationCompletionOrigin();
-    }
-
-    pub fn applyMcpMenuAuthenticationCompletion(
-        self: *App,
-        generation: u64,
-        completion: *const app_mcp_runtime.AuthenticationCompletion,
-    ) !void {
-        _ = try self.mcp.applyMenuAuthenticationCompletion(self.alloc, generation, completion);
-        self.shell.render_requests.request(.footer);
-    }
-
-    pub fn mcpAuthenticationPending(
-        self: *App,
-        server_name: []const u8,
-    ) bool {
-        return self.mcp.authenticationPending(server_name);
-    }
-
-    pub fn takeMcpReloadCompletion(self: *App) !?app_mcp_runtime.ReloadCompletion {
-        return self.mcp.takeReloadCompletion();
-    }
-
-    pub fn takeMcpStartupHealthNotice(self: *App) !?[]u8 {
-        return self.mcp.takeStartupHealthNotice(self.alloc);
-    }
-
-    pub fn mcpReloadCompletionOrigin(self: *const App) app_mcp_runtime.PresentationOrigin {
-        return self.mcp.reloadCompletionOrigin();
-    }
-
-    pub fn applyMcpMenuReloadCompletion(
-        self: *App,
-        generation: u64,
-        completion: *const app_mcp_runtime.ReloadCompletion,
-    ) !void {
-        try self.mcp.applyMenuReloadCompletion(
-            self.alloc,
-            generation,
-            completion,
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
-        self.shell.render_requests.request(.footer);
-    }
-
-    pub fn startMcpDiscovery(self: *App) void {
-        self.mcp.startDiscovery(self.toolRegistry());
-    }
-
-    pub fn presentProjectMcpPrompt(self: *App) !void {
-        const name = (try self.mcp.projectPromptDisplayName(self.alloc)) orelse return;
-        defer self.alloc.free(name);
-        var notice: std.Io.Writer.Allocating = .init(self.alloc);
-        defer notice.deinit();
-        try notice.writer.print(
-            "Project MCP server '{s}' is defined in .mcp.json.\n  [1] approve  [2] approve all  [3] reject  [esc] dismiss remaining prompts\n",
-            .{name},
-        );
-        try self.writeTranscriptClassified(
-            notice.writer.buffered(),
-            true,
-            .unknown_raw,
-        );
-    }
-
-    pub fn projectMcpPromptActive(self: *App) bool {
-        return self.mcp.projectPromptActive();
-    }
-
-    pub fn projectMcpPromptName(self: *App, alloc: Allocator) !?[]u8 {
-        return self.mcp.projectPromptName(alloc);
-    }
-
-    pub fn suppressProjectMcpPrompts(self: *App) void {
-        self.mcp.suppressProjectPrompts();
+    pub fn snapshotMcpModelCatalog(self: *App, alloc: Allocator) !mcp_model_catalog.Report {
+        return self.mcp.snapshotModelCatalog(alloc, self.alloc);
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
@@ -1951,64 +1725,8 @@ const App = struct {
         return self.mcp.toolSchema(arena, name, permission_rules, self.context_limits, access, cancel_flag);
     }
 
-    pub fn listMcpServersAndTools(self: *App, alloc: Allocator) ![]u8 {
-        return self.mcp.renderHealth(alloc);
-    }
-
-    pub fn openMcpMenu(self: *App) !void {
-        try self.mcp.openMenu(
-            self.alloc,
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
-    }
-
-    pub fn closeMcpMenu(self: *App) void {
-        self.mcp.closeMenu(self.alloc);
-    }
-
-    pub fn beginMcpMenuEffect(self: *App, effect: mcp_menu_state.Effect) !void {
-        return self.mcp.beginMenuEffect(
-            self.alloc,
-            effect,
-            self.permission_engine.rules,
-            self.context_limits,
-        );
-    }
-
-    pub fn recordMcpMenuEffectFailure(
-        self: *App,
-        generation: u64,
-        err: anyerror,
-    ) !void {
-        return self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
-    }
-
     pub fn addMcpSlack(self: *App) !void {
         return app_commands.Handlers(App).addSlack(self);
-    }
-
-    pub fn saveMcpMenuAdd(
-        self: *App,
-        generation: u64,
-        transport: mcp_menu_state.AddTransport,
-    ) !void {
-        return app_mcp_menu_runtime.Runtime(App).saveAdd(self, generation, transport);
-    }
-
-    pub fn removeMcpMenuServer(self: *App, generation: u64) !void {
-        return app_mcp_menu_runtime.Runtime(App).removeServer(self, generation);
-    }
-
-    pub fn applyMcpMenuTrustAction(
-        self: *App,
-        generation: u64,
-        action: mcp_menu_state.Action,
-    ) !void {
-        return app_mcp_menu_runtime.Runtime(App).applyTrustAction(self, generation, action);
-    }
-
-    pub fn summarizeMcpServers(self: *App, alloc: Allocator) ![]u8 {
-        return self.mcp.renderHealthSummary(alloc);
     }
 
     pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
@@ -2025,15 +1743,8 @@ const App = struct {
         owner_id: []const u8,
         parent_id: []const u8,
         permission_rules: types.PermissionRuleSet,
-        features_visible: bool,
     ) !?mcp_access_policy.View {
-        return self.mcp.snapshotAccessView(
-            alloc,
-            owner_id,
-            parent_id,
-            permission_rules,
-            features_visible,
-        );
+        return self.mcp.snapshotAccessView(alloc, owner_id, parent_id, permission_rules);
     }
 
     pub fn snapshotModelToolProjection(
@@ -2887,7 +2598,6 @@ const App = struct {
             self.terminal_input_runtime.hasPendingTerminalAction() or
             self.question_prompt.isActive() or
             self.approval_prompt.isActive() or
-            @constCast(&self.mcp).projectPromptActive() or
             self.auth.apiKeyEntryActive() or
             !self.shell.has_committed_frame or
             !self.shell.footer_viewport.has_frame or
@@ -3154,18 +2864,8 @@ const App = struct {
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
-        switch (try self.mcp.collectMenuCompletion(self.alloc)) {
-            .none => {},
-            .repaint => RenderAppRuntime.requestActiveSurfaceFrame(self, .footer),
-        }
-        try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
-        try app_commands.Handlers(App).collectMcpReloadFacts(self);
-        try app_commands.Handlers(App).collectMcpStartupHealthFacts(self);
         try app_commands.Handlers(App).collectMcpHostFacts(self);
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
-        if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
-            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
-        }
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectProviderPreparationFacts(self);
             try AuthAppRuntime.collectSourceInventoryFacts(self);
@@ -3794,7 +3494,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
             std.mem.eql(u8, effective_args[1], "logout") or
-            // MCP-v2's verbs start a host or delete a stored login.
+            // The MCP verbs start a host or delete a stored login.
             std.mem.eql(u8, effective_args[1], "show") or
             std.mem.eql(u8, effective_args[1], "login") or
             std.mem.eql(u8, effective_args[1], "remove") or
@@ -4096,10 +3796,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
-        .load_mcp_runtime = builtin_mcp.loadRuntime,
         .load_mcp_host = builtin_mcp.loadHost,
-        .add_mcp_profile_server = builtin_mcp.addProfileServer,
-        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -4136,10 +3833,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
-        .load_mcp_runtime = builtin_mcp.loadRuntime,
         .load_mcp_host = builtin_mcp.loadHost,
-        .add_mcp_profile_server = builtin_mcp.addProfileServer,
-        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -4176,10 +3870,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
-        .load_mcp_runtime = builtin_mcp.loadRuntime,
         .load_mcp_host = builtin_mcp.loadHost,
-        .add_mcp_profile_server = builtin_mcp.addProfileServer,
-        .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
         .acp_runner = .{ .run_fn = runAcpServer },
     };
 }
@@ -4937,6 +4628,7 @@ test {
     _ = @import("acp/libfx_journal.zig");
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
+    _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
@@ -5050,18 +4742,10 @@ test {
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
-    _ = @import("core/mcp/mcp_runtime.zig");
-    _ = @import("core/mcp/connection_control.zig");
-    _ = @import("core/mcp/server_transport.zig");
-    _ = @import("core/mcp/stdio_dispatcher.zig");
-    _ = @import("core/mcp/tool_operations.zig");
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");
+    _ = @import("core/mcp/http_config.zig");
     _ = @import("core/mcp/elicitation_interaction.zig");
-    _ = @import("core/mcp/features/common.zig");
-    _ = @import("core/mcp/features/resources.zig");
-    _ = @import("core/mcp/features/prompts.zig");
-    _ = @import("core/mcp/features/completion.zig");
     _ = @import("core/config/model_capabilities.zig");
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/workspace/pathing.zig");
@@ -5113,6 +4797,9 @@ test {
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
     _ = @import("core/hosts/js_host_workspace.zig");
+    _ = @import("core/hosts/js_host_clipboard.zig");
+    _ = @import("core/hosts/js_host_url_opener.zig");
+    _ = @import("core/hosts/browser_capabilities.zig");
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
     _ = @import("core/tooling/tool_runtime.zig");

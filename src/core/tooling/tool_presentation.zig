@@ -1251,6 +1251,16 @@ test "tool presentation formats permission labels" {
     defer alloc.free(risk);
     try expectContains(risk, "risk: command may discard version-control state");
     try expectContains(risk, "safer: inspect git status first");
+
+    // A quoted assignment value does not hide the command behind it.
+    const assigned = try formatPermissionLabel(alloc, test_tool_registry, .{
+        .id = "assigned",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"CI='x ls' rm -rf /tmp/x\"}",
+    });
+    defer alloc.free(assigned);
+    try expectContains(assigned, "risk: command may remove files forcefully");
+    try expectContains(assigned, "safer: inspect targets first");
 }
 
 test "tool presentation preserves plain action fallbacks" {

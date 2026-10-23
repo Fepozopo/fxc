@@ -1,4 +1,4 @@
-//! Draws the `/mcp` menu on MCP-v2 as fx's picker: a
+//! Draws the `/mcp` menu as fx's picker: a
 //! titled list, a server's facts, choices, and tools, and fx's hint line.
 //! The logic is `core/mcp_host/menu.zig`; this only turns it into rows.
 
@@ -95,6 +95,14 @@ fn addressWidth(width: u16) usize {
     return @max(@as(usize, width) -| 4, 16);
 }
 
+/// An address that can go in an OSC 8 link as it is: printable ASCII only,
+/// so nothing in it can end the sequence. Any other is shown unlinked.
+fn linkable(url: []const u8) bool {
+    if (url.len == 0) return false;
+    for (url) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return true;
+}
+
 fn matching(p: Projection) usize {
     var n: usize = 0;
     for (p.rows) |r| n += @intFromBool(menu.matches(r.status.name, p.filter));
@@ -174,7 +182,7 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, status_col);
     const needs_you = r.status.needs_login or switch (r.status.state) {
-        .failed, .retrying, .waiting_for_approval, .missing_env => true,
+        .failed, .retrying, .waiting_for_approval, .missing_env, .invalid_env => true,
         else => false,
     };
     const idle = !needs_you and switch (r.status.state) {
@@ -252,9 +260,20 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         var row: Row = .empty;
         errdefer row.deinit(alloc);
         try row.appendSlice(alloc, "    ");
+        // One link on every row of it, so a click on any opens the whole address.
+        const linked = linkable(url);
+        if (linked) {
+            try row.appendSlice(alloc, "\x1b]8;id=fx-mcp-sign-in;");
+            try row.appendSlice(alloc, url);
+            try row.appendSlice(alloc, "\x1b\\\x1b[4m");
+        }
         try row_text.appendTerminalSafeSingleLine(alloc, &row, url[from..@min(from + w, url.len)], w);
+        if (linked) try row.appendSlice(alloc, "\x1b[24m\x1b]8;;\x1b\\");
         return row;
     }
+    // From Log in until the address comes, the requests before it can take seconds.
+    if (after == 1 and r.status.signing_in and menu.toolsFor(r, p.tools) != .ready)
+        return row_text.composeTextRow(alloc, "Signing in…", width, ui_render.dim_style, 2);
     if (after == 1) {
         const heading: []const u8 = switch (menu.toolsFor(r, p.tools)) {
             .loading => "Loading tools…",
@@ -481,6 +500,11 @@ fn stripped(styled: []const u8) ![]const u8 {
     var n: usize = 0;
     var i: usize = 0;
     while (i < styled.len) {
+        // A link: OSC up to its ST.
+        if (std.mem.startsWith(u8, styled[i..], "\x1b]")) {
+            i = if (std.mem.find(u8, styled[i..], "\x1b\\")) |end| i + end + 2 else styled.len;
+            continue;
+        }
         if (styled[i] == 0x1b) {
             while (i < styled.len and styled[i] != 'm') i += 1;
             i += 1;
@@ -673,6 +697,128 @@ test "a sign-in that waits shows its whole address on the server's screen" {
     // No address, no extra lines.
     p.sign_in_url = null;
     try testing.expectEqual(@as(u16, 8), menuRowCount(p, 48, 40));
+}
+
+test "the waiting address is one link, on every row it wraps to" {
+    var linear = testStatus("linear", .idle);
+    linear.needs_login = true;
+    const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
+    const url = "https://linear.app/oauth/authorize?client_id=abc&state=0123456789abcdef0123456789&x=1";
+    var p: Projection = .{ .rows = &rows, .tools = .needs_login, .sign_in_url = url };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    // The two address rows come last.
+    const count = menuRowCount(p, 48, 40);
+    inline for (.{ 2, 1 }, .{ url[0..44], url[44..] }) |back, piece| {
+        var row = try composeRow(testing.allocator, p, count - back, 48, count);
+        defer row.deinit(testing.allocator);
+        try testing.expect(std.mem.startsWith(u8, row.items, "    \x1b]8;id=fx-mcp-sign-in;" ++ url ++ "\x1b\\\x1b[4m"));
+        try testing.expect(std.mem.endsWith(u8, row.items, piece ++ "\x1b[24m\x1b]8;;\x1b\\"));
+        try testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 48);
+    }
+
+    // An address that could end the sequence is shown, inert, without one.
+    for ([_][]const u8{ "https://h/a\x1b\\\x1b]8;;evil", "https://h/a b", "https://h/\xc3\xa9" }) |odd| {
+        p.sign_in_url = odd;
+        const n = menuRowCount(p, 48, 40);
+        var row = try composeRow(testing.allocator, p, n - 1, 48, n);
+        defer row.deinit(testing.allocator);
+        try testing.expect(std.mem.find(u8, row.items, "\x1b]") == null);
+    }
+}
+
+// The address is the server's: no byte of it may end the link, start another
+// sequence, or push a row past the width.
+fn fuzzWaitingAddress(_: void, smith: *testing.Smith) !void {
+    var buffer: [512]u8 = undefined;
+    const len = smith.sliceWeightedBytes(&buffer, &.{
+        .rangeAtMost(u8, 0x21, 0x7e, 8),
+        .rangeAtMost(u8, 0x00, 0xff, 1),
+        .value(u8, 0x1b, 2),
+        .value(u8, 0x07, 1),
+        .value(u8, '\\', 2),
+        .value(u8, ']', 2),
+    });
+    const url = buffer[0..len];
+    var linear = testStatus("linear", .idle);
+    linear.needs_login = true;
+    const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
+    var p: Projection = .{ .rows = &rows, .tools = .needs_login, .sign_in_url = url };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    const width = smith.valueRangeAtMost(u16, 20, 140);
+    const count = menuRowCount(p, width, max_inline_rows);
+    const open = "\x1b]8;id=fx-mcp-sign-in;";
+    const close = "\x1b]8;;\x1b\\";
+    for (0..count) |i| {
+        var row = try composeRow(testing.allocator, p, @intCast(i), width, count);
+        defer row.deinit(testing.allocator);
+        try testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+        try testing.expect(std.mem.findScalar(u8, row.items, 0x07) == null);
+        // Every OSC in a row is the link's, around an address that can't end it.
+        var rest = row.items;
+        while (std.mem.find(u8, rest, "\x1b]")) |at| {
+            rest = rest[at..];
+            if (std.mem.startsWith(u8, rest, close)) {
+                rest = rest[close.len..];
+                continue;
+            }
+            try testing.expect(linkable(url));
+            try testing.expect(std.mem.startsWith(u8, rest, open));
+            try testing.expect(std.mem.startsWith(u8, rest[open.len..], url));
+            try testing.expect(std.mem.startsWith(u8, rest[open.len + url.len ..], "\x1b\\"));
+            rest = rest[open.len + url.len + 2 ..];
+        }
+    }
+}
+
+test "a waiting address of any bytes stays in its rows and inside its link" {
+    try testing.fuzz({}, fuzzWaitingAddress, .{ .corpus = &.{
+        "https://linear.app/oauth/authorize?client_id=abc&state=0123456789abcdef0123456789&x=1",
+        "https://h/a\x1b\\\x1b]8;;evil\x07",
+        "https://h/\xc3\xa9\xe2\x80\x8b",
+    } });
+}
+
+test "a login under way says so until its address comes" {
+    var linear = testStatus("linear", .idle);
+    linear.needs_login = true;
+    linear.signing_in = true;
+    const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
+    var p: Projection = .{ .rows = &rows, .tools = .needs_login };
+    menu.open(&p.state);
+    _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
+    const text = try render(p, 80);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(
+        \\  linear  needs login
+        \\  http   https://mcp.linear.app/mcp
+        \\  file   ~/.fx/mcp.json
+        \\
+        \\› Log in        /mcp login linear
+        \\  Remove        /mcp remove linear
+        \\
+        \\  Signing in…
+        \\
+    , text);
+    // Its address takes that line's place.
+    p.sign_in_url = "https://linear.app/oauth/authorize?state=1";
+    const waiting = try render(p, 80);
+    defer testing.allocator.free(waiting);
+    try testing.expect(std.mem.find(u8, waiting, "Signing in…") == null);
+    try testing.expect(std.mem.find(u8, waiting, "Waiting for the browser. Didn't open? Go to:") != null);
+    // A server already signed in keeps its tools while it signs in again.
+    var github = testStatus("github", .ready);
+    github.signed_in = true;
+    github.signing_in = true;
+    const gh_rows = [_]menu.Row{.{ .status = github, .target = "https://h/mcp" }};
+    var gh: Projection = .{ .rows = &gh_rows, .tools = .{ .ready = &.{} } };
+    menu.open(&gh.state);
+    _ = menu.press(&gh.state, .{ .rows = &gh_rows }, .enter);
+    const ready = try render(gh, 80);
+    defer testing.allocator.free(ready);
+    try testing.expect(std.mem.find(u8, ready, "It has no tools.") != null);
+    try testing.expect(std.mem.find(u8, ready, "Signing in…") == null);
 }
 
 test "names and errors from config and servers stay inert" {

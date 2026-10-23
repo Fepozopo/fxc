@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -751,19 +752,19 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
   test(
-    "unresponsive MCP discovery does not block startup or shutdown",
+    "an unresponsive MCP server blocks neither startup nor quitting",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-startup-")));
       const home = join(root, "home");
       mkdirSync(join(home, ".fx"), { recursive: true });
 
-      let discoveryRequests = 0;
+      let requests = 0;
       const server = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
         async fetch(request) {
-          const body = await request.text();
-          if (body.includes('"method":"initialize"')) discoveryRequests += 1;
+          await request.text();
+          requests += 1;
           return await new Promise<Response>(() => {});
         },
       });
@@ -790,27 +791,13 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         });
         const pane = await session.waitForComposer(5_000);
         expect(hasEmptyComposer(pane)).toBe(true);
-        const startupDeadline = Date.now() + 5_000;
-        while (discoveryRequests < 1 && Date.now() < startupDeadline) {
+        // After the first frame the shell starts every server in the
+        // background; this one never answers. Quitting waits for no server.
+        const connectDeadline = Date.now() + 5_000;
+        while (requests < 1 && Date.now() < connectDeadline) {
           await Bun.sleep(25);
         }
-        expect(discoveryRequests).toBe(1);
-
-        await session.sendText("/mcp");
-        const summary = await session.waitForText("MCP 1", 5_000);
-        expect(summary).toContain("pending");
-        expect(summary).toContain("Connecting");
-        await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-        const beforeListMenu = await session.captureFullScrollback();
-        await session.sendText("/mcp list");
-        const listMenu = await session.waitForText("[Servers]", 5_000);
-        expect(listMenu).toContain("pending");
-        expect(listMenu).toContain("Connecting");
-        await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-        expect(await session.captureFullScrollback()).toBe(beforeListMenu);
-
+        expect(requests).toBeGreaterThanOrEqual(1);
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(5_000)).toBe(true);
       } finally {
@@ -819,6 +806,112 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
           session = null;
         }
         server.stop(true);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a busy MCP sign-in store doesn't hold up the first frame",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-store-busy-")));
+      const home = join(root, "home");
+      const store = join(home, ".fx", "mcp-credentials");
+      mkdirSync(store, { recursive: true, mode: 0o700 });
+      const lock = join(store, "credentials-v3.lock");
+      writeFileSync(lock, "", { mode: 0o600 });
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        JSON.stringify({ mcp: { remote: { type: "http", url: "http://127.0.0.1:9/mcp", enabled: true } } }),
+      );
+      const tracePath = join(root, "trace.log");
+      // Another fx holds the store's lock, so reading the saved logins waits
+      // for it, then gives up after 2 s.
+      const holder = Bun.spawn(
+        ["perl", "-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "held\n"; sleep $ARGV[1];', lock, "20"],
+        { stdout: "pipe" },
+      );
+      try {
+        const { value } = await holder.stdout.getReader().read();
+        expect(new TextDecoder().decode(value)).toBe("held\n");
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TRACE_LOG: tracePath },
+        });
+        await session.waitForComposer(10_000);
+        let trace = "";
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+          if (trace.includes("MCP credentials not loaded")) break;
+          await Bun.sleep(50);
+        }
+        const gaveUp = trace.indexOf("MCP credentials not loaded err=LockBusy");
+        const firstFrame = trace.indexOf("attempt_end outcome=committed");
+        expect(gaveUp).toBeGreaterThan(-1);
+        expect(firstFrame).toBeGreaterThan(-1);
+        // The first frame is drawn while the saved logins are still being read.
+        expect(firstFrame).toBeLessThan(gaveUp);
+      } finally {
+        holder.kill();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // Before, the menu waited for the saved logins on the UI thread, so /mcp
+  // right after launch froze the shell until they were read.
+  test(
+    "with the MCP sign-in store busy, /mcp opens before the saved logins are read",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-menu-busy-")));
+      const home = join(root, "home");
+      const store = join(home, ".fx", "mcp-credentials");
+      mkdirSync(store, { recursive: true, mode: 0o700 });
+      const lock = join(store, "credentials-v3.lock");
+      writeFileSync(lock, "", { mode: 0o600 });
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        JSON.stringify({ mcp: { remote: { type: "http", url: "http://127.0.0.1:9/mcp", enabled: true } } }),
+      );
+      const tracePath = join(root, "trace.log");
+      const loaded = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").includes("MCP credentials not loaded");
+      // Another fx holds the store's lock: reading the saved logins waits 2 s for it.
+      const holder = Bun.spawn(
+        ["perl", "-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "held\n"; sleep $ARGV[1];', lock, "20"],
+        { stdout: "pipe" },
+      );
+      try {
+        const { value } = await holder.stdout.getReader().read();
+        expect(new TextDecoder().decode(value)).toBe("held\n");
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TRACE_LOG: tracePath },
+        });
+        await session.waitForComposer(10_000);
+        expect(loaded()).toBe(false);
+        await session.sendText("/mcp");
+        await session.waitForText("MCP servers  1", 5_000);
+        // Still being read when the menu shows.
+        expect(loaded()).toBe(false);
+        // Once they're read, the menu goes on working.
+        const deadline = Date.now() + 10_000;
+        while (!loaded() && Date.now() < deadline) await Bun.sleep(50);
+        expect(loaded()).toBe(true);
+        await session.sendKeys("Enter");
+        await session.waitForText("› Remove        /mcp remove remote", 5_000);
+      } finally {
+        holder.kill();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
         rmSync(root, { recursive: true, force: true });
       }
     },

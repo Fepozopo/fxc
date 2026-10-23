@@ -1,7 +1,10 @@
 const std = @import("std");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
+const session_summary_codec = @import("session_summary_codec.zig");
 const text_utils = @import("../shared/text_utils.zig");
+
+const Allocator = std.mem.Allocator;
 
 pub const Scope = enum {
     current_workspace,
@@ -40,6 +43,53 @@ pub fn summaryAt(
         current += 1;
     }
     return null;
+}
+
+/// Whether the resume picker lists `summary` for `query` in `workspace_root`,
+/// or in every workspace when it is null.
+pub fn pickerLists(
+    summary: session_store.SessionSummary,
+    workspace_root: ?[]const u8,
+    query: []const u8,
+) bool {
+    if (workspace_root) |root| {
+        const summary_workspace = summary.workspace_root orelse return false;
+        if (!std.mem.eql(u8, summary_workspace, root)) return false;
+    }
+    return summary.hasResumableContent() and matchesQuery(summary, query);
+}
+
+/// One resume picker page from newest-first `summaries`: up to `limit` that
+/// the picker lists for `query` in `workspace_root`, after `continuation`.
+/// `has_more` is set only when another listed summary follows, so loading
+/// more always has a match to show. Caller owns the returned page.
+pub fn resumablePage(
+    alloc: Allocator,
+    summaries: []const session_store.SessionSummary,
+    workspace_root: ?[]const u8,
+    query: []const u8,
+    continuation: ?session_store.ResumableSessionContinuation,
+    limit: usize,
+) !session_store.ResumableSessionPage {
+    const page_limit = @max(limit, 1);
+    var page: session_store.ResumableSessionPage = .{};
+    errdefer page.deinit(alloc);
+    for (summaries) |summary| {
+        if (!pickerLists(summary, workspace_root, query)) continue;
+        if (continuation) |position| {
+            if (!session_summary_codec.summaryFollowsContinuation(summary, position)) continue;
+        }
+        if (page.summaries.items.len >= page_limit) {
+            page.has_more = true;
+            break;
+        }
+        var copied = try session_summary_codec.cloneSessionSummary(alloc, summary);
+        page.summaries.append(alloc, copied) catch |err| {
+            copied.deinit(alloc);
+            return err;
+        };
+    }
+    return page;
 }
 
 pub fn displayTitle(summary: session_store.SessionSummary) []const u8 {
@@ -115,6 +165,50 @@ test "session catalog filters titles previews and workspace paths" {
     try std.testing.expectEqualStrings("two", summaryAt(&summaries, "beta", 0).?.id);
     try std.testing.expectEqualStrings("one", summaryAt(&summaries, "footer", 0).?.id);
     try std.testing.expect(summaryAt(&summaries, "missing", 0) == null);
+}
+
+test "session catalog pages checkpoint-only sessions without changing turn counts" {
+    const alloc = std.testing.allocator;
+    const checkpoint = session_store.SessionSummary{
+        .id = @constCast("checkpoint"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = .literal("en"),
+        .history_len = 0,
+        .has_checkpoint = true,
+    };
+    var empty = checkpoint;
+    empty.id = @constCast("empty");
+    empty.has_checkpoint = false;
+    var page = try resumablePage(alloc, &.{ checkpoint, empty }, null, "", null, 10);
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
+    try std.testing.expectEqualStrings("checkpoint", page.summaries.items[0].id);
+    try std.testing.expect(page.summaries.items[0].has_checkpoint);
+    try std.testing.expectEqual(@as(usize, 0), page.summaries.items[0].history_len);
+}
+
+test "session catalog pages filter the workspace and preserve append cursor order" {
+    var summaries = [_]session_store.SessionSummary{
+        .{ .id = @constCast("new"), .workspace_root = @constCast("/workspace"), .created_at_ms = 1, .updated_at_ms = 4, .conversation_language = .literal("en"), .history_len = 1 },
+        .{ .id = @constCast("foreign"), .workspace_root = @constCast("/foreign"), .created_at_ms = 1, .updated_at_ms = 3, .conversation_language = .literal("en"), .history_len = 1 },
+        .{ .id = @constCast("old"), .workspace_root = @constCast("/workspace"), .created_at_ms = 1, .updated_at_ms = 1, .conversation_language = .literal("en"), .history_len = 1 },
+    };
+    session_summary_codec.sortSummariesNewestFirst(&summaries);
+    var page = try resumablePage(std.testing.allocator, &summaries, "/workspace", "", null, 1);
+    defer page.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
+    try std.testing.expectEqualStrings("new", page.summaries.items[0].id);
+    try std.testing.expect(page.has_more);
+
+    var next = try resumablePage(std.testing.allocator, &summaries, "/workspace", "", .{
+        .updated_at_ms = page.summaries.items[0].updated_at_ms,
+        .id = page.summaries.items[0].id,
+    }, 1);
+    defer next.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), next.summaries.items.len);
+    try std.testing.expectEqualStrings("old", next.summaries.items[0].id);
+    try std.testing.expect(!next.has_more);
 }
 
 test "session catalog activity age uses the last update" {

@@ -15,8 +15,10 @@ const tools = @import("protocol/tools.zig");
 const mrtr = @import("protocol/mrtr.zig");
 const wire = @import("protocol/wire.zig");
 const elicitation = @import("protocol/elicitation.zig");
+const elicit_core = @import("core/elicitation.zig");
 const auth_client = @import("auth/client.zig");
 const trace = @import("io/trace.zig");
+const process = @import("io/process.zig");
 const Bell = @import("io/bell.zig").Bell;
 const Host = @import("host.zig").Host;
 
@@ -35,6 +37,8 @@ pub const Config = struct {
     name: []const u8,
     transport: Transport,
     auth: auth_client.Options = .{},
+    /// This server's own limits; null for the engine's.
+    timeouts: ?request.Timeouts = null,
 };
 
 pub const Options = struct {
@@ -48,7 +52,7 @@ pub const Options = struct {
 };
 
 /// How a call ended: the server's outcomes, and the engine's own.
-pub const Outcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, denied, transport_failed };
+pub const Outcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, auth_unavailable, denied, transport_failed };
 
 pub const Event = struct {
     /// The server's name, valid until the next `reload`.
@@ -58,6 +62,9 @@ pub const Event = struct {
         /// A call ended. `answer` is set when the server answered, valid
         /// until the next `next`.
         called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
+        /// A call's server reported progress; `message` is terminal-safe and
+        /// valid until the next `next`.
+        progress: struct { call: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
         /// A call needs the host's answers to its input requests:
         /// `respond`, or `cancel`. Valid until then.
         input: struct { call: Handle, requests: []const mrtr.Request },
@@ -74,6 +81,10 @@ pub const Status = struct {
     version: ?[]const u8,
     tools: usize,
     last_error: ?[]const u8,
+    /// How the last process ended, and the last stdout line that answered
+    /// nothing since the server was last ready, until it starts again.
+    exit: ?process.Exit,
+    stray_line: ?[]const u8,
 };
 
 pub const Error = server_mod.Error || error{ UnknownServer, UnknownCall, TooManyCalls };
@@ -97,6 +108,8 @@ const Slot = struct {
     tracer: trace.Writer = undefined,
     calls: std.ArrayList(Call) = .empty,
     backoff_due: ?i64 = null,
+    /// When a ready server's tries start over.
+    stable_due: ?i64 = null,
     last_error: ?[]const u8 = null,
     /// Dropped by `reload`: freed once it is down and the host read its events.
     retired_at: i64 = 0,
@@ -145,7 +158,6 @@ pub const Engine = struct {
         for (e.retired.items) |slot| e.destroySlot(slot);
         e.retired.deinit(e.gpa);
         e.slots.deinit(e.gpa);
-        e.bell.deinit();
     }
 
     /// Takes a new list of servers. One whose config is unchanged keeps
@@ -185,7 +197,16 @@ pub const Engine = struct {
             .version = if (slot.server) |s| s.protocolVersion() else null,
             .tools = if (slot.server) |s| s.toolList().len() else 0,
             .last_error = slot.last_error,
+            .exit = if (slot.server) |s| s.exitStatus() else null,
+            .stray_line = if (slot.server) |s| s.strayLine() else null,
         };
+    }
+
+    /// The last stderr lines of server `index`'s current or last process,
+    /// in `out`, until it starts again.
+    pub fn stderrTail(e: *const Engine, index: usize, out: *[process.tail_max]u8) ?[]const u8 {
+        const s = e.slots.items[index].server orelse return null;
+        return s.stderrTail(out);
     }
 
     /// The server's tools as it advertised them, valid until the next `next`.
@@ -249,9 +270,9 @@ pub const Engine = struct {
     }
 
     /// Answers a 2025 server's elicitation, as `server.zig` does.
-    pub fn answerElicitation(e: *Engine, name: []const u8, elicit: u8, answer: elicitation.Answer) Error!void {
+    pub fn answerElicitation(e: *Engine, name: []const u8, id: elicit_core.Id, answer: elicitation.Answer) Error!void {
         const s = (try e.find(name)).server orelse return error.UnknownElicitation;
-        try s.answerElicitation(elicit, answer);
+        try s.answerElicitation(id, answer);
     }
 
     /// Sign-in, as `server.zig` does; a server that never started
@@ -268,6 +289,22 @@ pub const Engine = struct {
 
     pub fn cancelSignIn(e: *Engine, name: []const u8) Error!void {
         try (try e.ensureServer(try e.find(name))).cancelSignIn();
+    }
+
+    /// Hands server `name` a credential its host found saved since, as after
+    /// a sign-in, and starts the server; false when the server can't
+    /// use it, so it is still signed out and nothing starts.
+    pub fn useCredential(e: *Engine, name: []const u8, saved: []const u8) Error!bool {
+        const slot = try e.find(name);
+        if (!try (try e.ensureServer(slot)).useCredential(saved)) return false;
+        try e.step(slot, .need);
+        return true;
+    }
+
+    /// Sends the refresh server `name` said was due.
+    pub fn refresh(e: *Engine, name: []const u8) Error!void {
+        const server = (try e.find(name)).server orelse return;
+        try server.refresh();
     }
 
     pub fn signOut(e: *Engine, name: []const u8) Error!void {
@@ -330,6 +367,10 @@ pub const Engine = struct {
                     // A subscription waiting to listen again is demand.
                     if (slot.server) |s| if (s.waiting()) try e.step(slot, .need);
                 };
+                if (slot.stable_due) |due| if (due <= e.now()) {
+                    slot.stable_due = null;
+                    try e.step(slot, .stable);
+                };
                 // What the host should see goes out before that server is
                 // read again, so the slices in it stay valid. What the same
                 // read queued is taken with it, so the gate is current when
@@ -350,6 +391,7 @@ pub const Engine = struct {
             var wait = deadline;
             for (e.slots.items) |slot| {
                 if (slot.backoff_due) |due| wait = @min(wait, due);
+                if (slot.stable_due) |due| wait = @min(wait, due);
                 if (slot.server) |s| {
                     if (s.dueMs()) |due| wait = @min(wait, due);
                 }
@@ -366,7 +408,9 @@ pub const Engine = struct {
                 slot.last_error = switch (f) {
                     .era => |why| @tagName(why),
                     .session => "session",
+                    .initialized_timed_out => "initialized_timed_out",
                     .needs_auth => "needs_auth",
+                    .auth_unavailable => "auth_unavailable",
                 };
                 // One that needs a sign-in is dropped, as the host would,
                 // and what waits ends needs_auth; once signed in, the next
@@ -406,6 +450,9 @@ pub const Engine = struct {
             },
             .input => |q| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == q.handle) {
                 return e.emit(slot, .{ .input = .{ .call = x.handle, .requests = q.requests } });
+            },
+            .progress => |p| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == p.handle) {
+                return e.emit(slot, .{ .progress = .{ .call = x.handle, .progress = p.progress, .total = p.total, .message = p.message } });
             },
             .timeout => unreachable, // `poll` never says it
             else => e.emit(slot, .{ .server = event }),
@@ -449,6 +496,7 @@ pub const Engine = struct {
             .list => try slot.server.?.needTools(),
             .refuse_need => e.emit(slot, .{ .server = .{ .tools = .{ .ok = false, .fresh = false, .needs_auth = why == .needs_auth } } }),
             .arm_backoff => |ms| slot.backoff_due = e.now() + ms,
+            .arm_stable => |ms| slot.stable_due = e.now() + ms,
             .teardown => {
                 slot.backoff_due = null;
                 if (slot.server) |s| try s.reset();
@@ -481,7 +529,7 @@ pub const Engine = struct {
             .era = e.options.era,
             .auth = slot.config.auth,
             .listen_tools = e.options.listen_tools,
-            .timeouts = e.options.timeouts,
+            .timeouts = slot.config.timeouts orelse e.options.timeouts,
             .trace = tracer,
         });
         slot.server = s;
@@ -527,10 +575,11 @@ pub const Engine = struct {
                 },
             },
             .auth = c.auth,
+            .timeouts = c.timeouts,
         };
         const auth = &slot.config.auth;
         auth.client_name = try a.dupe(u8, c.auth.client_name);
-        inline for (.{ "client_id", "client_secret", "client_metadata_url", "saved" }) |field| {
+        inline for (.{ "client_id", "client_secret", "client_metadata_url", "saved", "resource", "scopes" }) |field| {
             if (@field(c.auth, field)) |v| @field(auth, field) = try a.dupe(u8, v);
         }
         return slot;
@@ -602,13 +651,14 @@ fn same(a: Config, b: Config) bool {
             for (h.headers, g.headers) |x, y| if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.value, y.value)) return false;
         },
     }
-    inline for (.{ "client_id", "client_secret", "client_metadata_url" }) |field| {
+    inline for (.{ "client_id", "client_secret", "client_metadata_url", "resource", "scopes" }) |field| {
         const x = @field(a.auth, field);
         const y = @field(b.auth, field);
         if ((x == null) != (y == null)) return false;
         if (x != null and !std.mem.eql(u8, x.?, y.?)) return false;
     }
-    return std.mem.eql(u8, a.auth.client_name, b.auth.client_name) and std.meta.eql(a.auth.flow, b.auth.flow);
+    return std.mem.eql(u8, a.auth.client_name, b.auth.client_name) and std.meta.eql(a.auth.flow, b.auth.flow) and
+        std.meta.eql(a.timeouts, b.timeouts);
 }
 
 test {
@@ -617,22 +667,29 @@ test {
     std.testing.refAllDecls(Engine);
 }
 
+/// A host that allows everything and logs nothing, for the tests below.
+const TestHost = struct {
+    var context: u8 = 0;
+    fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
+        return true;
+    }
+    fn log(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    fn start(e: *Engine) !void {
+        try e.init(std.testing.io, std.testing.allocator, .{ .context = &context, .allow = allow, .log = log }, .{
+            .client = .{ .info = .{ .name = "test", .version = "0" } },
+        }, &.{});
+    }
+};
+
 test "wake from another thread ends a waiting next early" {
     const Fake = struct {
-        fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
-            return true;
-        }
-        fn log(_: *anyopaque, _: []const u8, _: []const u8) void {}
         fn wakeLater(e: *Engine) void {
             std.Io.sleep(e.io, .fromMilliseconds(30), .awake) catch {};
             e.wake();
         }
     };
-    var context: u8 = 0;
     var e: Engine = undefined;
-    try e.init(std.testing.io, std.testing.allocator, .{ .context = &context, .allow = Fake.allow, .log = Fake.log }, .{
-        .client = .{ .info = .{ .name = "test", .version = "0" } },
-    }, &.{});
+    try TestHost.start(&e);
     defer e.deinit();
 
     const started = e.now();
@@ -670,6 +727,26 @@ test "a credential restored after init is the one the server starts with" {
     try std.testing.expectError(error.UnknownServer, e.restoreCredential("nope", "{}"));
 }
 
+test "a saved credential the server can't use starts nothing, and the host hears so" {
+    const Fake = struct {
+        fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
+            return true;
+        }
+        fn log(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    };
+    var context: u8 = 0;
+    var e: Engine = undefined;
+    const servers = [_]Config{.{ .name = "web", .transport = .{ .http = .{ .url = "https://web.example.invalid/mcp" } } }};
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &context, .allow = Fake.allow, .log = Fake.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    }, &servers);
+    defer e.deinit();
+    const before = e.status(0).phase;
+    try std.testing.expect(!try e.useCredential("web", "not json"));
+    try std.testing.expect(!try e.useCredential("web", "{\"access\":\"w1\"}"));
+    try std.testing.expectEqual(before, e.status(0).phase);
+}
+
 test "a stdio server's directory is part of its config, so a new one restarts it" {
     const argv = [_][]const u8{ "node", "s.js" };
     const a: Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv, .cwd = "/a" } } };
@@ -679,4 +756,73 @@ test "a stdio server's directory is part of its config, so a new one restarts it
     try std.testing.expect(!same(a, b));
     b.transport.stdio.cwd = null;
     try std.testing.expect(!same(a, b));
+}
+
+test "a slot copies every auth string, so the host may free its configs" {
+    var e: Engine = undefined;
+    try TestHost.start(&e);
+    defer e.deinit();
+    const info = @typeInfo(auth_client.Options).@"struct";
+    var text = "borrowed".*;
+    var auth: auth_client.Options = .{};
+    inline for (info.field_names, info.field_types) |name, T| switch (T) {
+        []const u8, ?[]const u8 => @field(auth, name) = &text,
+        else => {},
+    };
+    const argv = [_][]const u8{"x"};
+    const slot = try e.newSlot(.{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv } }, .auth = auth });
+    defer e.destroySlot(slot);
+    @memset(&text, 'U');
+    inline for (info.field_names, info.field_types) |name, T| switch (T) {
+        []const u8 => try std.testing.expectEqualStrings("borrowed", @field(slot.config.auth, name)),
+        ?[]const u8 => try std.testing.expectEqualStrings("borrowed", @field(slot.config.auth, name).?),
+        else => {},
+    };
+}
+
+test "the resource is part of a server's config, so a new one restarts it" {
+    const argv = [_][]const u8{"x"};
+    const a: Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv } }, .auth = .{ .resource = "https://a.example/" } };
+    var b = a;
+    try std.testing.expect(same(a, b));
+    b.auth.resource = "https://b.example/";
+    try std.testing.expect(!same(a, b));
+    b.auth.resource = null;
+    try std.testing.expect(!same(a, b));
+}
+
+test "the scopes are part of a server's config, so new ones restart it" {
+    const argv = [_][]const u8{"x"};
+    const a: Config = .{ .name = "x", .transport = .{ .stdio = .{ .argv = &argv } }, .auth = .{ .scopes = "a.read" } };
+    var b = a;
+    try std.testing.expect(same(a, b));
+    b.auth.scopes = "a.write";
+    try std.testing.expect(!same(a, b));
+    b.auth.scopes = null;
+    try std.testing.expect(!same(a, b));
+}
+
+test "a server's own timeouts replace the engine's, and the others keep the engine's" {
+    var e: Engine = undefined;
+    const servers = [_]Config{
+        .{ .name = "plain", .transport = .{ .http = .{ .url = "https://plain.example.invalid/mcp" } } },
+        .{ .name = "tuned", .transport = .{ .http = .{ .url = "https://tuned.example.invalid/mcp" } }, .timeouts = .{ .start_ms = 5_000, .idle_ms = 90_000 } },
+    };
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &TestHost.context, .allow = TestHost.allow, .log = TestHost.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+        .timeouts = .{ .start_ms = 20_000 },
+    }, &servers);
+    defer e.deinit();
+
+    const plain = try e.ensureServer(e.slots.items[0]);
+    const tuned = try e.ensureServer(e.slots.items[1]);
+    try std.testing.expectEqual(@as(u32, 20_000), plain.options.timeouts.start_ms);
+    try std.testing.expectEqual(@as(u32, 5_000), tuned.options.timeouts.start_ms);
+    try std.testing.expectEqual(@as(u32, 90_000), tuned.options.timeouts.idle_ms);
+    // A reload that changes only the timeouts replaces the server.
+    var retimed = servers[1];
+    retimed.timeouts = .{ .start_ms = 6_000 };
+    try std.testing.expect(same(servers[1], servers[1]));
+    try std.testing.expect(!same(servers[1], retimed));
+    try std.testing.expect(!same(servers[0], .{ .name = "plain", .transport = servers[0].transport, .timeouts = .{} }));
 }

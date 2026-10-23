@@ -1097,73 +1097,6 @@ test "responsive compact menus stay inline across the VT width matrix" {
     }
 }
 
-test "MCP menu stays inline across the VT width matrix and restores the composer" {
-    const alloc = std.testing.allocator;
-    const tools = [_][]const u8{
-        "mcp_fixture_echo",
-        "mcp_fixture_read_resource",
-    };
-
-    for ([_]u16{ 50, 80, 120 }) |width| {
-        var h = try Harness.init(alloc, width, 28, 4);
-        defer h.deinit();
-        var input = InputRuntime{};
-        defer input.deinit(alloc);
-        var approval = approval_prompt.ApprovalPrompt{};
-        defer approval.deinit(alloc);
-        try h.shell.initViewport(&h.metrics, 1);
-        try h.shell.writeTranscript(
-            alloc,
-            &h.metrics,
-            "MCP menu transcript remains visible\n",
-            true,
-        );
-
-        var ctx = defaultFooterContext(&input);
-        ctx.mcp_menu = .{
-            .state = .{
-                .active = true,
-                .section = .tools,
-                .selected_index = 1,
-                .load_state = .ready,
-            },
-            .tools = &tools,
-        };
-        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
-        try h.flush();
-        try expectGridContains(&h, "MCP menu transcript remains visible");
-        try expectGridContains(&h, "MCP 0");
-        try expectGridContains(&h, "[Tools]");
-        try expectGridContains(&h, "mcp_fixture_read_resource");
-        try expectGridContains(&h, "tab");
-        try expectGridContains(&h, "esc");
-
-        ctx.mcp_menu = .{
-            .state = .{
-                .active = true,
-                .section = .resources,
-                .screen = .preview,
-                .load_state = .ready,
-            },
-            .preview = "MCP resource · untrusted content\n\nRESOURCE_TEXT: preview remains wrapped and scrollable",
-        };
-        h.frame_redraw = true;
-        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
-        try h.flush();
-        try expectGridContains(&h, "untrusted content");
-        try expectGridContains(&h, "RESOURCE_TEXT:");
-        try expectGridContains(&h, "i insert");
-
-        ctx.mcp_menu = .{};
-        h.frame_redraw = true;
-        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
-        try h.flush();
-        try expectGridContains(&h, "MCP menu transcript remains visible");
-        try expectGridNotContains(&h, "[Resources]");
-        try expectGridNotContains(&h, "i insert");
-    }
-}
-
 fn expectGridNotContains(h: *Harness, needle: []const u8) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(h.alloc);
@@ -9152,4 +9085,89 @@ test "full transcript shows terminal session launch commands in full across widt
     try h.driveResize(100, 30, 4, true);
     try expectGridContains(&h, "Observed cd . && python3");
     try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
+}
+
+test "transcript painting keeps the shadow terminal in step with the screen" {
+    try std.testing.fuzz({}, fuzzTranscriptPaint, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").transcript_paint.*),
+    });
+}
+
+const fuzz_transcript_pieces = [_][]const u8{
+    "word",   " ",       "\n",         "\n\n",  "\u{754c}", "e\u{301}", "\u{2600}\u{fe0f}",                           "**bold**",
+    "`code`", "- item ", "# heading ", "```\n", "\t",       "|a|b|\n",  "an-unbroken-token-longer-than-a-narrow-row",
+};
+
+fn appendFuzzTranscriptText(alloc: Allocator, smith: *std.testing.Smith, out: *std.ArrayList(u8)) !void {
+    for (0..smith.valueRangeAtMost(u8, 0, 24)) |_| {
+        try out.appendSlice(alloc, fuzz_transcript_pieces[smith.index(fuzz_transcript_pieces.len)]);
+    }
+}
+
+fn fuzzTranscriptPaint(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var cols = smith.valueRangeAtMost(u16, 10, 80);
+    var rows = smith.valueRangeAtMost(u16, 6, 24);
+    // The test layout always draws a four-row footer.
+    const footer_rows = 4;
+    var h = try Harness.init(alloc, cols, rows, footer_rows);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.flush();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (0..smith.valueRangeAtMost(u8, 0, 24)) |_| {
+        text.clearRetainingCapacity();
+        switch (smith.valueRangeAtMost(u8, 0, 4)) {
+            0, 1 => {
+                try appendFuzzTranscriptText(alloc, smith, &text);
+                _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text.items);
+            },
+            2 => {
+                try appendFuzzTranscriptText(alloc, smith, &text);
+                try h.shell.writeTranscript(alloc, &h.metrics, text.items, true);
+            },
+            else => {
+                cols = smith.valueRangeAtMost(u16, 10, 80);
+                rows = smith.valueRangeAtMost(u16, 6, 24);
+                // fx applies a resize it is still debouncing as unsettled,
+                // then applies it again settled before more output lands.
+                const debounced = smith.value(bool);
+                if (debounced) try h.driveResize(cols, rows, footer_rows, false);
+                try h.driveResize(cols, rows, footer_rows, true);
+            },
+        }
+        try h.renderTranscriptFrameIfDirty();
+        try h.flush();
+        try expectFuzzShadowMatchesScreen(&h);
+    }
+}
+
+/// The transcript runtime's model of the terminal must show what the bytes
+/// it wrote actually drew: the same rows and the same cursor.
+fn expectFuzzShadowMatchesScreen(h: *Harness) !void {
+    const shadow = h.shell.shadow_vt orelse return error.TestMissingShadowTerminal;
+    var screen_row: std.ArrayList(u8) = .empty;
+    defer screen_row.deinit(h.alloc);
+    var shadow_row: std.ArrayList(u8) = .empty;
+    defer shadow_row.deinit(h.alloc);
+    var mismatch = false;
+    if (shadow.cols != h.vt.cols or shadow.rows != h.vt.rows) mismatch = true;
+    var row: u16 = 1;
+    while (row <= @min(h.vt.rows, shadow.rows)) : (row += 1) {
+        screen_row.clearRetainingCapacity();
+        shadow_row.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(row, &screen_row);
+        try shadow.rowTextTrimmed(row, &shadow_row);
+        if (!std.mem.eql(u8, screen_row.items, shadow_row.items)) {
+            mismatch = true;
+            std.debug.print("transcript_paint row {d}: screen=[{s}] shadow=[{s}]\n", .{ row, screen_row.items, shadow_row.items });
+        }
+    }
+    if (shadow.cursor_row != h.vt.cursor_row or shadow.cursor_col != h.vt.cursor_col) mismatch = true;
+    if (mismatch) {
+        std.debug.print("transcript_paint: screen {d}x{d} at {d},{d}; shadow {d}x{d} at {d},{d}\n", .{ h.vt.cols, h.vt.rows, h.vt.cursor_row, h.vt.cursor_col, shadow.cols, shadow.rows, shadow.cursor_row, shadow.cursor_col });
+        return error.TestShadowTerminalDiverged;
+    }
 }

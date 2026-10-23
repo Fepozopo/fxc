@@ -701,26 +701,36 @@ fn snapshotModelCatalogForView(
         for (view.tools) |tool| {
             if (std.mem.eql(u8, tool.server_name, server.name)) tool_count += 1;
         }
+        // Generation 0: the server's list hadn't loaded when the view was
+        // taken, so it starts when the subagent first needs it.
+        const on_demand = tool_count == 0 and server.catalog_generation == 0;
         servers[index] = .{
             .name = try alloc.dupe(u8, server.name),
-            .availability = .ready,
-            .tool_count = tool_count,
+            .availability = if (on_demand) .available_on_demand else .ready,
+            .tool_count = if (on_demand) null else tool_count,
         };
         initialized += 1;
     }
     return .{ .servers = servers };
 }
 
-test "subagent model catalog counts only tools in the captured MCP view" {
+test "subagent model catalog counts the captured view's tools and offers servers not yet listed" {
     const alloc = std.testing.allocator;
-    var servers = [_]mcp_access.ServerIdentity{.{
+    var servers = [_]mcp_access.ServerIdentity{ .{
         .name = @constCast("chrome-devtools"),
         .source = .profile,
         .scope = .profile,
         .connection_generation = 1,
         .catalog_generation = 2,
         .auth_generation = 3,
-    }};
+    }, .{
+        .name = @constCast("later"),
+        .source = .profile,
+        .scope = .profile,
+        .connection_generation = 0,
+        .catalog_generation = 0,
+        .auth_generation = 0,
+    } };
     var tools = [_]mcp_access.ToolIdentity{
         .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
         .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
@@ -729,7 +739,6 @@ test "subagent model catalog counts only tools in the captured MCP view" {
         .runtime_generation = 1,
         .owner_id = @constCast("child"),
         .parent_id = @constCast("parent"),
-        .features_visible = false,
         .servers = &servers,
         .tools = &tools,
     };
@@ -737,10 +746,13 @@ test "subagent model catalog counts only tools in the captured MCP view" {
     var snapshot = try snapshotModelCatalogForView(alloc, &view);
     defer snapshot.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.servers.len);
     try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
     try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
     try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
+    // A server whose list hadn't loaded is offered, not shown as empty.
+    try std.testing.expectEqual(model_catalog.Availability.available_on_demand, snapshot.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, null), snapshot.servers[1].tool_count);
 }
 
 test "subagent inherits model capabilities" {

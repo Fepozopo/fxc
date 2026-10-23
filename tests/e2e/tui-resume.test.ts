@@ -6732,6 +6732,28 @@ test.skipIf(!tmuxAvailable())(
         const plain = stripAnsi(pane);
         return plain.includes("Sessions 10") && plain.includes("Load more");
       }, TIMEOUT);
+      // A search that matches no saved session has nothing more to load.
+      await active.sendLiteralText("NO_SAVED_SESSION_MATCHES");
+      await active.waitForPane((pane) => {
+        const plain = stripAnsi(pane);
+        return /Sessions 0\b/.test(plain) &&
+          plain.includes("No sessions found.") &&
+          !plain.includes("Load more");
+      }, TIMEOUT);
+      // A search finds the oldest session before its page is loaded.
+      await active.sendKeys("C-u");
+      await active.sendLiteralText(savedMarkers[0]!);
+      await active.waitForPane((pane) => {
+        const plain = stripAnsi(pane);
+        return /Sessions 1\b/.test(plain) &&
+          plain.includes(`Save ${savedMarkers[0]!}.`) &&
+          !plain.includes("Load more");
+      }, TIMEOUT);
+      await active.sendKeys("C-u");
+      await active.waitForPane((pane) => {
+        const plain = stripAnsi(pane);
+        return plain.includes("Sessions 10") && plain.includes("Load more");
+      }, TIMEOUT);
       for (let index = 0; index < 10; index += 1) {
         await active.sendKeys("Down");
       }

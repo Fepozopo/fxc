@@ -349,11 +349,28 @@ async function runTerminalToolScenario(args: {
 }
 
 describe("filesystem path handling", () => {
-  for (const supportsImages of [true, false]) {
+  const readImageCases = [
+    {
+      name: "read_file attaches a workspace image inline for a vision model",
+      modelTags: ["tool-use", "vision", "file-input"],
+      inline: true,
+    },
+    {
+      // The catalog lists the default model, spacexai/grok-4.7, with vision
+      // and without file-input, which covers documents rather than images.
+      name: "read_file attaches a workspace image inline for a vision model without file input",
+      modelTags: ["reasoning", "tool-use", "implicit-caching", "vision", "structured-output"],
+      inline: true,
+    },
+    {
+      name: "read_file image is withheld with guidance for a text-only model",
+      modelTags: ["tool-use"],
+      inline: false,
+    },
+  ];
+  for (const imageCase of readImageCases) {
     test(
-      supportsImages
-        ? "read_file attaches a workspace image inline for a vision model"
-        : "read_file image is withheld with guidance for a text-only model",
+      imageCase.name,
       async () => {
         const root = createIsolatedRoot();
         const pngBase64 =
@@ -363,11 +380,7 @@ describe("filesystem path handling", () => {
             toolCall("read_image_1", "read_file", { path: "pixel.png" }),
             finalText("image inspected"),
           ],
-          {
-            modelTags: supportsImages
-              ? ["tool-use", "vision", "file-input"]
-              : ["tool-use"],
-          },
+          { modelTags: imageCase.modelTags },
         );
         try {
           writeFileSync(
@@ -398,7 +411,7 @@ describe("filesystem path handling", () => {
             ) as Record<string, unknown> | undefined;
           expect(part).toBeDefined();
           const output = part!.output as Record<string, unknown>;
-          if (supportsImages) {
+          if (imageCase.inline) {
             expect(output.type).toBe("content");
             expect(contentText(output)).toContain("image attached");
             expect(contentText(output)).not.toContain("binary or non-utf8");

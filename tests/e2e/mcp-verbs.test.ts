@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { fakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
-// `fx mcp` on MCP-v2. Sign-in is covered in mcp-auth.test.ts.
+// `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
@@ -48,12 +48,10 @@ function createRoot(profile?: unknown, project?: unknown) {
     projectPath: join(workspace, ".mcp.json"),
     env: {
       HOME: home,
-      FX_MCP_ENGINE: "v2",
       FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0",
       AI_GATEWAY_API_KEY: "fake-mcp-verbs-key",
       VERCEL_OIDC_TOKEN: undefined,
-      FX_MCP_PROTOCOL_VERSION: undefined,
     },
   };
 }
@@ -67,11 +65,10 @@ function mcp(root: Root, ...args: string[]) {
 const fixtureServer = (extra: Record<string, unknown> = {}) => ({
   command: process.execPath,
   args: [MODERN_FIXTURE],
-  env: { FX_MCP_SPEC_CLIENT: "1" },
   ...extra,
 });
 
-describe("fx mcp on MCP-v2", () => {
+describe("fx mcp", () => {
   test("add writes each file and keeps every key it doesn't know", async () => {
     // Raw text, so the number's spelling reaches fx as written.
     const root = createRoot('{"theme":"dark","mcp":{"old":{"command":"true","environment":{"A":"1"},"startup_timeout_ms":1.50}}}');
@@ -125,6 +122,45 @@ describe("fx mcp on MCP-v2", () => {
     expect(notUrl.stderr).toStartWith("'mcp.example' isn't a URL. A stdio server's command goes after --.\n");
   });
 
+  // Fx never edits a linked file. Replacing a link forks the file it
+  // points to, and following one could write outside the project.
+  test("add and remove refuse a linked config file and name what it points to", async () => {
+    const root = createRoot();
+    const shared = join(root.workspace, "shared");
+    mkdirSync(shared);
+    const target = join(shared, "mcp.json");
+    const text = JSON.stringify({ mcpServers: { one: { command: "true" } } });
+    writeFileSync(target, text);
+    symlinkSync(target, root.projectPath);
+    const why = `it's a link to ${target}, and fx edits only a plain file; edit ${target} by hand.\n`;
+    const added = await mcp(root, "add", "--project", "two", "--", "true");
+    expect(added.code).toBe(1);
+    expect(added.stderr).toBe(`Couldn't add two to .mcp.json: ${why}`);
+    const removed = await mcp(root, "remove", "--project", "one");
+    expect(removed.code).toBe(1);
+    expect(removed.stderr).toBe(`Couldn't remove one from .mcp.json: ${why}`);
+    expect(lstatSync(root.projectPath).isSymbolicLink()).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe(text);
+
+    // A hard link would fork the same way.
+    rmSync(root.projectPath);
+    linkSync(target, root.projectPath);
+    const hard = await mcp(root, "add", "--project", "two", "--", "true");
+    expect(hard.code).toBe(1);
+    expect(hard.stderr).toBe("Couldn't add two to .mcp.json: it has another hard link, and fx edits only a plain file; edit it by hand.\n");
+    expect(readFileSync(target, "utf8")).toBe(text);
+
+    // The profile's own replace refuses a link too, and says so the same way.
+    const profileTarget = join(shared, "profile.json");
+    writeFileSync(profileTarget, "{}");
+    symlinkSync(profileTarget, root.profilePath);
+    const profile = await mcp(root, "add", "three", "--", "true");
+    expect(profile.code).toBe(1);
+    expect(profile.stderr).toBe(`Couldn't add three to ~/.fx/mcp.json: it's a link to ${profileTarget}, and fx edits only a plain file; edit ${profileTarget} by hand.\n`);
+    expect(lstatSync(root.profilePath).isSymbolicLink()).toBe(true);
+    expect(readFileSync(profileTarget, "utf8")).toBe("{}");
+  });
+
   test("list shows each server's file, transport, and status without connecting", async () => {
     const root = createRoot(
       {
@@ -171,11 +207,15 @@ describe("fx mcp on MCP-v2", () => {
     expect(noted.stderr).toBe("note: .mcp.json server 'docs' field argument requires environment variable 'FX_VERBS_UNSET'; set it or use ${FX_VERBS_UNSET:-default}.\n");
     expect(noted.stdout).not.toContain("docs");
 
-    // fx won't send a token written into an Authorization header.
+    // fx won't send a token written into an Authorization header: that
+    // server is skipped, and the note says where the token goes.
     writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { bad: { type: "http", url: "https://b/mcp", headers: { Authorization: "Bearer x" } } } }));
     const refused = await mcp(root, "list");
-    expect(refused.code).toBe(1);
-    expect(refused.stderr).toBe("fx mcp: a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login\n");
+    expect(refused.code).toBe(0);
+    expect(refused.stderr).toContain(
+      "note: ~/.fx/mcp.json server 'bad' was skipped: fx won't send its Authorization header; put the token in \"bearer_token_env\", or sign in with login.\n",
+    );
+    expect(refused.stdout).not.toContain("bad");
 
     const empty = await mcp(createRoot(), "list");
     expect(empty.code).toBe(0);
@@ -204,6 +244,27 @@ describe("fx mcp on MCP-v2", () => {
     const unknown = await mcp(root, "show", "nope");
     expect(unknown.code).toBe(1);
     expect(unknown.stderr).toBe("No MCP server named nope. fx mcp list shows them.\n");
+  });
+
+  test("a variable a header can't carry holds its server back instead of aborting fx", async () => {
+    // Nothing listens on port 1, and nothing should be sent there.
+    const root = createRoot({
+      mcp: {
+        token: { type: "http", url: "http://127.0.0.1:1/mcp", bearer_token_env: "FX_VERBS_TOKEN" },
+        team: { type: "http", url: "http://127.0.0.1:1/mcp", header_env: { "X-Team": "FX_VERBS_TEAM" } },
+      },
+    });
+    root.env = { ...root.env, FX_VERBS_TOKEN: "a\r\nb", FX_VERBS_TEAM: "x\nInjected: yes" } as typeof root.env;
+    const shown = await mcp(root, "show", "token");
+    expect(shown.stderr).toBe("");
+    expect(shown.code).toBe(1);
+    expect(shown.stdout).toContain("  status     can't use $FX_VERBS_TOKEN\n");
+    const json = await mcp(root, "list", "--json");
+    expect(json.code).toBe(0);
+    expect(JSON.parse(json.stdout).servers.map((s: { name: string; status: string }) => [s.name, s.status])).toEqual([
+      ["token", "invalid_env"],
+      ["team", "invalid_env"],
+    ]);
   });
 
   test("${VAR} works in the profile too", async () => {
@@ -255,6 +316,9 @@ describe("fx mcp on MCP-v2", () => {
     const all = await mcp(root, "approve", "--all");
     expect(all.code).toBe(0);
     expect(all.stdout).toBe("Approved docs, which runs: node 'docs server.js'\n");
+    // `--all` approves the servers it shows, not a server added later.
+    const settings = JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"));
+    expect(settings.workspaces[root.workspace]).toEqual({ enabledMcpjsonServers: ["docs"], disabledMcpjsonServers: ["web"] });
 
     const list = JSON.parse((await mcp(root, "list", "--json")).stdout).servers;
     expect(list.map((s: { name: string; status: string }) => [s.name, s.status])).toEqual([
@@ -266,6 +330,27 @@ describe("fx mcp on MCP-v2", () => {
     const profileServer = await mcp(root, "approve", "mine");
     expect(profileServer.code).toBe(1);
     expect(profileServer.stderr).toBe("No project server named mine in .mcp.json.\n");
+    const project = JSON.parse(readFileSync(root.projectPath, "utf8"));
+    project.mcpServers.later = { command: "node", args: ["later.js"] };
+    writeFileSync(root.projectPath, JSON.stringify(project));
+    const after = JSON.parse((await mcp(root, "list", "--json")).stdout).servers;
+    expect(after.find((s: { name: string }) => s.name === "later")?.status).toBe("waiting_for_approval");
+  });
+
+  test("approve --all approves each server it shows, and one added later still waits", async () => {
+    const root = createRoot(undefined, { mcpServers: { a: { command: "node", args: ["a.js"] }, b: { type: "http", url: "https://b.example/mcp" } } });
+    const all = await mcp(root, "approve", "--all");
+    expect(all.code).toBe(0);
+    expect(all.stdout).toBe("Approved a, which runs: node a.js\nApproved b, which connects to: https://b.example/mcp\n");
+    const settings = JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"));
+    expect(settings.workspaces[root.workspace]).toEqual({ enabledMcpjsonServers: ["a", "b"] });
+    writeFileSync(root.projectPath, JSON.stringify({ mcpServers: { a: { command: "node", args: ["a.js"] }, b: { type: "http", url: "https://b.example/mcp" }, c: { command: "node", args: ["c.js"] } } }));
+    const list = JSON.parse((await mcp(root, "list", "--json")).stdout).servers;
+    expect(list.map((s: { name: string; status: string }) => [s.name, s.status])).toEqual([
+      ["a", "not_started"],
+      ["b", "not_started"],
+      ["c", "waiting_for_approval"],
+    ]);
   });
 
   test("help, usage mistakes, and old verbs", async () => {
@@ -297,12 +382,21 @@ describe("fx mcp on MCP-v2", () => {
     }
     expect(existsSync(root.profilePath)).toBe(false);
   });
+
+  test("fx mcp commands keep a trace when FX_TRACE_LOG asks for one", async () => {
+    const root = createRoot({ mcp: { noisy: { command: "sh", args: ["-c", "echo trace-me >&2; exit 3"], startup_timeout_ms: 2_000 } } });
+    const trace = join(root.home, "trace.log");
+    const show = await runFx(["mcp", "show", "noisy"], { cwd: root.workspace, env: { ...root.env, FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mcp" }, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(existsSync(trace)).toBe(true);
+    expect(readFileSync(trace, "utf8")).toContain("line=trace-me");
+  }, 30_000);
 });
 
-describe("/mcp in the shell on MCP-v2", () => {
+describe("/mcp in the shell", () => {
   test.skipIf(!tmuxAvailable())("/mcp runs the same verbs and prints the same text", async () => {
     // The shell can ask questions, so it says so to servers.
-    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_SPEC_CLIENT: "1", FX_MCP_EXPECT_ELICITATION: "both" } }) } });
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both" } }) } });
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true,
@@ -313,10 +407,16 @@ describe("/mcp in the shell on MCP-v2", () => {
     });
     await tui.waitForComposer(15_000);
 
-    // Servers start on their own once the first frame is up, and the status line counts them.
-    await tui.waitForText("mcp 1/1", 10_000);
-    await tui.sendText("/mcp list");
-    await tui.waitForText("fixture  ~/.fx/mcp.json  stdio      ready, 1 tool", 10_000);
+    // Servers start on their own once the first frame is up. `/mcp list`
+    // says what each is doing now, so ask until it's ready. Nothing is wrong,
+    // so the status line says nothing about MCP.
+    const listed = "fixture  ~/.fx/mcp.json  stdio      ready, 1 tool";
+    for (let i = 0; i < 20 && !(await tui.capturePane()).includes(listed); i++) {
+      await tui.sendText("/mcp list");
+      await tui.waitForText(listed, 500).catch(() => {});
+    }
+    await tui.waitForText(listed, 1_000);
+    expect(await tui.capturePane()).not.toMatch(/mcp \d+\/\d+/);
     await tui.sendText("/mcp show fixture");
     await tui.waitForText("Echo text through the modern MCP fixture", 15_000);
     await tui.waitForText("version    2026-07-28", 5_000);
@@ -346,6 +446,107 @@ describe("/mcp in the shell on MCP-v2", () => {
     await tui.sendText("/mcp auth web");
     await tui.waitForText("/mcp auth is now /mcp login NAME.", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toEqual({ type: "http", url: "https://w.example/mcp" });
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a config change never freezes the shell, and a server runs one copy at a time", async () => {
+    // `s` keeps running after its input closes and ignores SIGTERM, so fx
+    // takes about 3 s to stop it: 1.5 s for it to exit, 1.5 s after SIGTERM.
+    const root = createRoot();
+    const pidPath = join(root.home, "s.pid");
+    const eofPath = join(root.home, "s.eof");
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_IGNORE_EOF: "1", FX_MCP_IGNORE_TERM: "1", FX_MCP_PID_PATH: pidPath, FX_MCP_EOF_PATH: eofPath } }) } }));
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    // `s` outlives fx's SIGTERM at quit, so every copy is killed here.
+    const pids = new Set<number>();
+    const killServers = () => {
+      if (existsSync(pidPath)) pids.add(Number(readFileSync(pidPath, "utf8")));
+      for (const pid of pids) if (isRunning(pid)) process.kill(pid, "SIGKILL");
+    };
+    try {
+      await tui.waitForComposer(15_000);
+      // `s` starts on its own once the first frame is up and writes its pid.
+      // Nothing is wrong, so the status line says nothing about MCP.
+      const upBy = Date.now() + 10_000;
+      while (!(existsSync(pidPath) && readFileSync(pidPath, "utf8").trim() !== "") && Date.now() < upBy) await Bun.sleep(5);
+      const oldPid = Number(readFileSync(pidPath, "utf8"));
+      pids.add(oldPid);
+
+      await tui.sendText("/mcp add web https://w.example/mcp");
+      const eofBy = Date.now() + 10_000;
+      // The fixture creates the file, then writes its pid.
+      while (!(existsSync(eofPath) && readFileSync(eofPath, "utf8").trim() !== "") && Date.now() < eofBy) await Bun.sleep(5);
+      expect(readFileSync(eofPath, "utf8").trim()).toBe(String(oldPid));
+      // The old host is stopping `s` now. Typing still shows at once.
+      const typedAt = Date.now();
+      await tui.sendLiteral("zq");
+      await tui.waitForText("zq", 5_000);
+      expect(Date.now() - typedAt).toBeLessThan(1_000);
+      expect(isRunning(oldPid)).toBe(true);
+
+      // The new host starts `s` only once the old copy is gone.
+      const startBy = Date.now() + 15_000;
+      while (Number(readFileSync(pidPath, "utf8")) === oldPid && Date.now() < startBy) await Bun.sleep(5);
+      expect(Number(readFileSync(pidPath, "utf8"))).not.toBe(oldPid);
+      expect(isRunning(oldPid)).toBe(false);
+      await tui.sendKeys("C-u");
+      await tui.sendText("/mcp list");
+      await tui.waitForText(/s +~\/\.fx\/mcp\.json +stdio +ready, 1 tool/, 15_000);
+    } finally {
+      // fx first, so no new copy starts after this.
+      await tui?.kill();
+      tui = null;
+      killServers();
+    }
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a config change while a server is in use lets it finish, and the server never runs twice", async () => {
+    // `s` takes 3 s to start, so `/mcp show s` holds the old host while the config changes.
+    const root = createRoot();
+    const pidPath = join(root.home, "s.pid");
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_DISCOVER_DELAY_MS: "3000", FX_MCP_PID_PATH: pidPath } }) } }));
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    const pids = new Set<number>();
+    try {
+      await tui.waitForComposer(15_000);
+      const startBy = Date.now() + 10_000;
+      while (!existsSync(pidPath) && Date.now() < startBy) await Bun.sleep(5);
+      const oldPid = Number(readFileSync(pidPath, "utf8"));
+      pids.add(oldPid);
+
+      await tui.sendText("/mcp show s");
+      await Bun.sleep(300);
+      await tui.sendText("/mcp add web https://w.example/mcp");
+      await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+      expect(await tui.capturePane()).not.toContain("Echo text through the modern MCP fixture");
+
+      // The moment a new copy starts, the old one must be gone.
+      const nextBy = Date.now() + 15_000;
+      while (Number(readFileSync(pidPath, "utf8")) === oldPid && Date.now() < nextBy) await Bun.sleep(5);
+      const oldAliveAtSwitch = isRunning(oldPid);
+      pids.add(Number(readFileSync(pidPath, "utf8")));
+      expect(pids.size).toBe(2);
+      expect(oldAliveAtSwitch).toBe(false);
+      // And the show finished on the old host.
+      await tui.waitForText("Echo text through the modern MCP fixture", 10_000);
+    } finally {
+      await tui?.kill();
+      tui = null;
+      for (const pid of pids) if (isRunning(pid)) process.kill(pid, "SIGKILL");
+    }
   }, 90_000);
 
   test.skipIf(!tmuxAvailable())("the status line, not the transcript, names waiting project servers and config problems", async () => {
@@ -414,7 +615,7 @@ describe("/mcp in the shell on MCP-v2", () => {
 
   test.skipIf(!tmuxAvailable())("/mcp alone opens the menu, whose choices run the verbs", async () => {
     const root = createRoot(
-      { mcpServers: { fixture: fixtureServer({ env: { FX_MCP_SPEC_CLIENT: "1", FX_MCP_EXPECT_ELICITATION: "both" } }), web: { type: "http", url: "https://w.example/mcp" } } },
+      { mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both" } }), web: { type: "http", url: "https://w.example/mcp" } } },
       { mcpServers: { proj: { command: "node", args: ["proj.js", "--port", "4100"] } } },
     );
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
@@ -507,7 +708,7 @@ describe("/mcp in the shell on MCP-v2", () => {
   }, 90_000);
 });
 
-describe("fx ask on MCP-v2", () => {
+describe("fx ask", () => {
   test("fx ask names unapproved project servers and the command that approves them", async () => {
     const root = createRoot(undefined, { mcpServers: { proj: fixtureServer() } });
     gateway = startFakeGateway([fakeGatewayFinalText("done")], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
@@ -518,5 +719,49 @@ describe("fx ask on MCP-v2", () => {
     });
     expect(result.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. Approve with fx mcp approve <name> before retrying.");
     expect(result.stderr).not.toContain("trust");
+  }, 60_000);
+
+  test("a project server whose name holds an escape sequence is skipped with an escaped note, never printed raw", async () => {
+    // An OSC sequence that would retitle the terminal if printed as is.
+    const evil = "evil\u001b]0;pwned\u0007";
+    const root = createRoot(undefined, { mcpServers: { proj: fixtureServer(), [evil]: fixtureServer() } });
+    const note = "note: .mcp.json server 'evil\\x1b]0;pwned\\x07' was skipped: its name has a character fx won't print.";
+
+    const list = await runFx(["mcp", "list"], { cwd: root.workspace, env: root.env, timeoutMs: 30_000 });
+    expect(list.code).toBe(0);
+    expect(list.stderr).toContain(note);
+    expect(list.stdout).toContain("proj");
+    expect(list.stdout).not.toContain("evil");
+    expect(list.stdout + list.stderr).not.toContain("\u001b");
+
+    gateway = startFakeGateway([fakeGatewayFinalText("done")], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    const ask = await runFx(["ask", "--no-save", "hello"], {
+      cwd: root.workspace,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      timeoutMs: 30_000,
+    });
+    expect(ask.stderr).toContain(note);
+    expect(ask.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. Approve");
+    expect(ask.stdout + ask.stderr).not.toContain("\u001b");
+  }, 60_000);
+
+  test("a profile with both mcp and mcpServers names each server it leaves out", async () => {
+    const root = createRoot({ mcp: { alpha: fixtureServer() }, mcpServers: { beta: fixtureServer() } });
+    const note = "note: ~/.fx/mcp.json server 'beta' was skipped: the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one.";
+
+    const list = await runFx(["mcp", "list"], { cwd: root.workspace, env: root.env, timeoutMs: 30_000 });
+    expect(list.code).toBe(0);
+    expect(list.stdout).toContain("alpha");
+    expect(list.stdout).not.toContain("beta");
+    expect(list.stderr).toContain(note);
+
+    gateway = startFakeGateway([fakeGatewayFinalText("done")], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    const ask = await runFx(["ask", "--no-save", "hello"], {
+      cwd: root.workspace,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      timeoutMs: 30_000,
+    });
+    expect(ask.code).toBe(0);
+    expect(ask.stderr).toContain(note);
   }, 60_000);
 });

@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const model_provider = @import("model_provider.zig");
+const image_route = @import("../images/image_route.zig");
 
 pub const ResolvedProviderOptions = struct {
     reasoning: ?types.ReasoningEffort = null,
@@ -33,11 +34,7 @@ pub const ReasoningEffortOptions = struct {
     }
 };
 
-pub const ImageInputSupport = enum {
-    unknown,
-    non_native,
-    native,
-};
+pub const ImageInputSupport = image_route.Support;
 
 pub const GatewayMetadata = struct {
     supports_reasoning: bool = false,
@@ -97,10 +94,10 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_tool_use = metadata.supports_tool_use;
         capabilities.supports_vision = metadata.supports_vision;
         capabilities.supports_file_input = metadata.supports_file_input;
-        capabilities.image_input_support = if (metadata.supports_vision and metadata.supports_file_input)
-            .native
-        else
-            .non_native;
+        capabilities.image_input_support = image_route.supportFromCatalog(.{ .listed = .{
+            .vision = metadata.supports_vision,
+            .file_input = metadata.supports_file_input,
+        } });
         capabilities.supports_web_search = metadata.supports_web_search;
         capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
@@ -302,17 +299,19 @@ test "image input support distinguishes unknown native and non native capability
         capabilitiesForModel("provider/unknown").image_input_support,
     );
 
-    const native = mergeCapabilities(.{}, .{
-        .supports_vision = true,
-        .supports_file_input = true,
-    });
-    try std.testing.expectEqual(ImageInputSupport.native, native.image_input_support);
+    for ([_]bool{ false, true }) |file_input| {
+        const native = mergeCapabilities(.{}, .{
+            .supports_vision = true,
+            .supports_file_input = file_input,
+        });
+        try std.testing.expectEqual(ImageInputSupport.native, native.image_input_support);
 
-    const non_native = mergeCapabilities(.{}, .{
-        .supports_vision = true,
-        .supports_file_input = false,
-    });
-    try std.testing.expectEqual(ImageInputSupport.non_native, non_native.image_input_support);
+        const non_native = mergeCapabilities(.{}, .{
+            .supports_vision = false,
+            .supports_file_input = file_input,
+        });
+        try std.testing.expectEqual(ImageInputSupport.non_native, non_native.image_input_support);
+    }
 }
 
 test "reasoning effort picker helpers prepend default and preserve Gateway order" {

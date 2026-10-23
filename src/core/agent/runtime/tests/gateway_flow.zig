@@ -2630,7 +2630,7 @@ test "processQueuedPrompt never uses the vision fallback for Codex" {
     try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
 }
 
-test "processQueuedPrompt routes images natively only when vision and file input are both supported" {
+test "processQueuedPrompt routes images natively whenever the catalog lists vision" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
         label: []const u8,
@@ -2639,7 +2639,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         expect_native: bool,
     }{
         .{ .label = "vision-file", .supports_vision = true, .supports_file_input = true, .expect_native = true },
-        .{ .label = "vision-no-file", .supports_vision = true, .supports_file_input = false, .expect_native = false },
+        .{ .label = "vision-no-file", .supports_vision = true, .supports_file_input = false, .expect_native = true },
         .{ .label = "file-no-vision", .supports_vision = false, .supports_file_input = true, .expect_native = false },
         .{ .label = "neither", .supports_vision = false, .supports_file_input = false, .expect_native = false },
     };
@@ -2657,7 +2657,10 @@ test "processQueuedPrompt routes images natively only when vision and file input
         const capability_overrides = [_]ModelCapabilityOverride{.{
             .model = model,
             .capabilities = .{
-                .image_input_support = if (entry.expect_native) .native else .non_native,
+                .image_input_support = model_capabilities.mergeCapabilities(.{}, .{
+                    .supports_vision = entry.supports_vision,
+                    .supports_file_input = entry.supports_file_input,
+                }).image_input_support,
                 .supports_vision = entry.supports_vision,
                 .supports_file_input = entry.supports_file_input,
             },

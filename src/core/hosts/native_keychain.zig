@@ -23,9 +23,10 @@ const FindGenericPasswordFn = *const fn (
 ) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
-const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
-/// The sign-in credentials MCP-v2 hands fx to keep, a different format.
-const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V2";
+/// The sign-in credentials the MCP engine hands fx to keep, a different format.
+/// Not `FX_MCP_OAUTH_CREDENTIALS_V2`: fx builds that still run read and
+/// rewrite that item (`mcp_host/credentials.zig` says why).
+pub const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V3";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.
@@ -200,23 +201,8 @@ fn containsService(service: []const u8) Error!host.SecretStorePresence {
     return error.KeychainReadFailed;
 }
 
-pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {
-    return loadMcpValueMacControlled(alloc, mcp_credentials_service_name, null);
-}
-
 pub fn loadOAuthSession(alloc: std.mem.Allocator) !?[]u8 {
     return loadMcpValueMacControlled(alloc, oauth_session_service_name, null);
-}
-
-pub fn loadMcpCredentialsCancellable(
-    alloc: std.mem.Allocator,
-    cancel_flag: *const std.atomic.Value(bool),
-) !?[]u8 {
-    return loadMcpValueMacControlled(
-        alloc,
-        mcp_credentials_service_name,
-        cancel_flag,
-    );
 }
 
 fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
@@ -379,46 +365,12 @@ pub fn storeValue(value: []const u8) Error!void {
     return error.UnsupportedPlatform;
 }
 
-pub fn storeMcpCredentials(value: []const u8) Error!void {
-    return storeMcpCredentialsControlled(value, null);
-}
-
 pub fn storeOAuthSession(value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0 or value.len > max_oauth_session_bytes) {
         return error.KeychainWriteFailed;
     }
     return storeMcpValueMac(oauth_session_service_name, value);
-}
-
-pub fn storeMcpCredentialsCancellable(
-    value: []const u8,
-    cancel_flag: *const std.atomic.Value(bool),
-) Error!void {
-    return storeMcpCredentialsControlled(value, cancel_flag);
-}
-
-fn storeMcpCredentialsControlled(
-    value: []const u8,
-    cancel_flag: ?*const std.atomic.Value(bool),
-) Error!void {
-    if (!isAvailable()) return error.UnsupportedPlatform;
-    if (value.len == 0 or value.len > max_mcp_credentials_bytes) {
-        return error.KeychainWriteFailed;
-    }
-
-    if (comptime builtin.target.os.tag == .macos) {
-        return storeMcpValueMacControlled(
-            mcp_credentials_service_name,
-            value,
-            cancel_flag,
-        );
-    }
-    return error.UnsupportedPlatform;
-}
-
-pub fn deleteMcpCredentials(alloc: std.mem.Allocator) Error!bool {
-    return deleteMcpValueMac(alloc, mcp_credentials_service_name);
 }
 
 pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {

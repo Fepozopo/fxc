@@ -8,7 +8,6 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const project_config = @import("../mcp/project_config.zig");
-const mcp_menu_state = @import("../mcp/menu_state.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -55,7 +54,6 @@ const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const compact_command_menu_presentation = @import("../../ui/footer/compact_command_menu_presentation.zig");
-const mcp_menu_presentation = @import("../../ui/footer/mcp_menu_presentation.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
@@ -112,24 +110,6 @@ const ExplicitModelSelectionParse = union(enum) {
     invalid,
     selection: ExplicitModelSelection,
 };
-
-const ProjectMcpPromptInputState = struct {
-    active: bool,
-    question_active: bool,
-    approval_active: bool,
-    subagent_active: bool,
-    menu_active: bool,
-    authentication_active: bool,
-};
-
-fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
-    return state.active and
-        !state.question_active and
-        !state.approval_active and
-        !state.subagent_active and
-        !state.menu_active and
-        !state.authentication_active;
-}
 
 fn parseExplicitModelSelection(input: []const u8) ExplicitModelSelectionParse {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
@@ -640,11 +620,6 @@ pub fn Runtime(comptime App: type) type {
             }
 
             var replay_byte = ingress.replay_byte_after_routing;
-            if (replay_byte) |byte| {
-                if (byte != 0x1b and try routeProjectMcpPromptByte(app, byte)) {
-                    replay_byte = null;
-                }
-            }
             if (ingress.event) |event| {
                 switch (event) {
                     .paste_byte => |byte| {
@@ -861,86 +836,6 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        fn projectMcpPromptOwnsInput(app: *App) bool {
-            if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
-            const menu_active = activeCompactCommandMenu(app) != null or
-                settingsMenuActive(app) or
-                skillsMenuActive(app) or
-                modelMenuActive(app) or
-                sessionMenuActive(app) or
-                forkMenuActive(app) or
-                mcpMenuActive(app) or
-                mcpHostMenuActive(app) or
-                helpMenuActive(app);
-            var authentication_active = false;
-            if (comptime runtime_profile.allows(App, .native_auth)) {
-                authentication_active = app.auth.apiKeyEntryActive();
-            }
-            return projectMcpPromptMayOwnInput(.{
-                .active = app.projectMcpPromptActive(),
-                .question_active = app.question_prompt.isActive(),
-                .approval_active = app.approval_prompt.isActive(),
-                .subagent_active = false,
-                .menu_active = menu_active,
-                .authentication_active = authentication_active,
-            });
-        }
-
-        fn routeProjectMcpPromptByte(app: *App, byte: u8) !bool {
-            if (comptime !@hasDecl(App, "projectMcpPromptName")) return false;
-            const owns_input = projectMcpPromptOwnsInput(app);
-            debug_trace.logf(
-                "mcp",
-                "project prompt input byte={d} owns_input={s}",
-                .{ byte, if (owns_input) "true" else "false" },
-            );
-            if (!owns_input) return false;
-            const action: project_config.ProjectMcpAction = switch (byte) {
-                '1' => {
-                    const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
-                    defer app.alloc.free(name);
-                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
-                    defer app.alloc.free(display.bytes);
-                    const body = try app.alloc.print(
-                        "Approving project MCP server '{s}'.",
-                        .{display.bytes},
-                    );
-                    defer app.alloc.free(body);
-                    try app_commands.Handlers(App).applyProjectMcpAction(
-                        app,
-                        .{ .approve = name },
-                        body,
-                    );
-                    return true;
-                },
-                '2' => .approve_all,
-                '3' => {
-                    const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
-                    defer app.alloc.free(name);
-                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
-                    defer app.alloc.free(display.bytes);
-                    const body = try app.alloc.print(
-                        "Rejecting project MCP server '{s}'.",
-                        .{display.bytes},
-                    );
-                    defer app.alloc.free(body);
-                    try app_commands.Handlers(App).applyProjectMcpAction(
-                        app,
-                        .{ .reject = name },
-                        body,
-                    );
-                    return true;
-                },
-                else => return true,
-            };
-            try app_commands.Handlers(App).applyProjectMcpAction(
-                app,
-                action,
-                "Approving all project MCP servers for this workspace.",
-            );
-            return true;
-        }
-
         fn handleRawTerminalInputWithLimits(
             app: *App,
             raw: input_action.RawTerminalInput,
@@ -974,7 +869,6 @@ pub fn Runtime(comptime App: type) type {
                 if (try app_auth_runtime.Runtime(App).routeAuthPickerByte(app, byte)) return;
             }
             if (try full_transcript_rt.routeByte(app, byte)) return;
-            if (try routeProjectMcpPromptByte(app, byte)) return;
             if (try routeActiveModalInput(app, raw, input_limits.decision_bytes)) return;
             if (byte >= 0x80) {
                 try handleTextByte(app, .composer, byte, max_input_len);
@@ -1021,18 +915,6 @@ pub fn Runtime(comptime App: type) type {
                 if (try full_transcript_rt.routeAction(app, resolved)) {
                     _ = disarmEscapeInterrupt(app, "full_transcript");
                     return .done;
-                }
-                if (comptime @hasDecl(App, "suppressProjectMcpPrompts")) {
-                    if (projectMcpPromptOwnsInput(app)) {
-                        _ = disarmEscapeInterrupt(app, "mcp_prompt_suppressed");
-                        app.suppressProjectMcpPrompts();
-                        try app.writeDomainNotice(.{
-                            .topic = "mcp",
-                            .tone = .neutral,
-                            .body = "Project MCP approval prompts dismissed for this process.",
-                        }, true);
-                        return .done;
-                    }
                 }
                 const now = io_mod.milliTimestamp();
                 expireEscClearArm(app, now);
@@ -1098,21 +980,6 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
-            if (mcpMenuActive(app)) {
-                switch (resolved) {
-                    .cursor_up => _ = moveMcpMenu(app, -1),
-                    .cursor_down => _ = moveMcpMenu(app, 1),
-                    .cursor_left => _ = try cycleMcpMenuSection(app, -1),
-                    .cursor_right => _ = try cycleMcpMenuSection(app, 1),
-                    else => {},
-                }
-                if (resolved == .cursor_up or resolved == .cursor_down or
-                    resolved == .cursor_left or resolved == .cursor_right)
-                {
-                    return .done;
-                }
-            }
-
             if (settingsMenuActive(app) and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
@@ -1126,7 +993,6 @@ pub fn Runtime(comptime App: type) type {
             if (try full_transcript_rt.routeComposerAction(app, resolved)) return .done;
 
             if (composer_shortcut) |action| {
-                if (routeMcpFilterShortcut(app, action)) return .done;
                 try routeComposerShortcutAction(app, action, max_input_len);
                 return .done;
             }
@@ -1314,59 +1180,6 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (try routeMcpHostMenuByte(app, byte)) return true;
-            if (mcpMenuActive(app)) {
-                if (comptime @hasField(App, "mcp")) {
-                    if (app.mcp.menu.screen == .add) {
-                        return try handleMcpAddInput(app, byte, max_input_len);
-                    }
-                    if (app.mcp.menu.screen == .arguments) {
-                        return try handleMcpArgumentInput(app, byte, max_input_len);
-                    }
-                    if (app.mcp.menu.filter_active) {
-                        if (byte == 0x7f) {
-                            _ = applyMcpMenuEvent(app, .delete_filter_byte);
-                            return true;
-                        }
-                        if (byte >= 0x20 and byte < 0x7f and byte != '\r') {
-                            _ = applyMcpMenuEvent(app, .{ .append_filter_byte = byte });
-                            return true;
-                        }
-                    }
-                }
-                if (byte >= 0x80) {
-                    input_reset.resetPendingTextScalarWithTrace(
-                        &app.input_runtime.text_scalar,
-                        "mcp_menu_active",
-                    );
-                    return true;
-                }
-                switch (byte) {
-                    '\t' => _ = try cycleMcpMenuSection(app, 1),
-                    '\r' => _ = try submitMcpMenuSelection(app),
-                    'a', 'A' => _ = try handleMcpMenuPrimaryAction(app),
-                    's', 'S' => {
-                        if (comptime @hasDecl(App, "addMcpSlack") and @hasField(App, "mcp")) {
-                            if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
-                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
-                                try app.addMcpSlack();
-                            }
-                        }
-                    },
-                    'd', 'D' => _ = confirmMcpMenuAction(app, .remove),
-                    'l', 'L' => _ = confirmMcpMenuAction(app, .logout),
-                    'x', 'X' => _ = confirmMcpMenuAction(app, .trust_reject),
-                    'p', 'P' => _ = confirmMcpMenuAction(app, .trust_approve_all),
-                    'z', 'Z' => _ = confirmMcpMenuAction(app, .trust_reset),
-                    'c', 'C' => _ = applyMcpMenuEvent(app, .show_info),
-                    'r', 'R' => _ = try refreshMcpMenu(app),
-                    'i', 'I' => _ = try insertMcpMenuPreview(app, max_input_len),
-                    '/' => _ = applyMcpMenuEvent(app, .begin_filter),
-                    10 => _ = moveMcpMenu(app, 1),
-                    11 => _ = moveMcpMenu(app, -1),
-                    else => {},
-                }
-                return true;
-            }
             if (activeCompactCommandMenu(app)) |menu| {
                 if (byte >= 0x80) {
                     input_reset.resetPendingTextScalarWithTrace(
@@ -1923,17 +1736,22 @@ pub fn Runtime(comptime App: type) type {
             return app.input_runtime.settings_menu.active;
         }
 
-        fn mcpMenuActive(app: *App) bool {
-            if (comptime @hasField(App, "mcp")) {
-                return app.mcp.menu.active;
-            }
-            return false;
-        }
-
-        /// The `/mcp` menu on MCP-v2.
+        /// The `/mcp` menu.
         fn mcpHostMenuActive(app: *App) bool {
             if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
             return app.mcp.hostMenuActive();
+        }
+
+        fn cancelMcpHostMenu(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            // Back a screen; closing the list clears its filter too.
+            try app.mcpHostMenuKey(.escape);
+            if (!mcpHostMenuActive(app)) {
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            }
+            return true;
         }
 
         /// On the list and on a server's screen, typing goes to the composer,
@@ -1959,404 +1777,6 @@ pub fn Runtime(comptime App: type) type {
             if (!mcpHostMenuActive(app)) return false;
             try app.mcpHostMenuKey(.enter);
             return true;
-        }
-
-        fn mcpMenuProjection(app: *App) render_input.McpMenuProjection {
-            if (comptime @hasField(App, "mcp")) {
-                const view = app.mcp.menuView();
-                return .{
-                    .state = view.state,
-                    .servers = if (view.health) |health| health.servers else &.{},
-                    .tools = view.tools,
-                    .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
-                    .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
-                    .prompts = if (view.prompts) |catalog| catalog.items else &.{},
-                    .configuration_issues = if (view.health) |health| health.configuration_issues else &.{},
-                    .preview = view.preview,
-                    .feedback = view.feedback,
-                    .add_name = view.add_form.name.items,
-                    .add_target = view.add_form.target.items,
-                    .add_arguments = view.add_form.arguments.items,
-                    .add_draft = app.input_runtime.edit_state.input.items,
-                    .arguments = view.argument_fields,
-                    .argument_draft = app.input_runtime.edit_state.input.items,
-                };
-            }
-            return .{};
-        }
-
-        fn applyMcpMenuEvent(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
-            const effect = applyMcpMenuEventDeferred(app, event);
-            app.shell.render_requests.request(.footer);
-            return effect;
-        }
-
-        fn applyMcpMenuEventDeferred(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
-            if (comptime @hasField(App, "mcp")) {
-                return mcp_menu_state.apply(&app.mcp.menu, event);
-            }
-            return null;
-        }
-
-        fn routeMcpFilterShortcut(app: *App, action: input_action.ShortcutAction) bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                if (!app.mcp.menu.filter_active) return false;
-                switch (action) {
-                    .delete_backward => _ = applyMcpMenuEvent(app, .delete_filter_byte),
-                    .delete_word_left, .delete_whitespace_word_left, .delete_to_line_start => _ = applyMcpMenuEvent(app, .clear_filter_text),
-                    else => return false,
-                }
-                return true;
-            }
-            return false;
-        }
-
-        fn startMcpMenuEffect(app: *App, effect: mcp_menu_state.Effect) !void {
-            if (comptime !@hasDecl(App, "beginMcpMenuEffect")) return;
-            app.beginMcpMenuEffect(effect) catch |err| {
-                const generation = switch (effect) {
-                    .load_catalog => |request| request.generation,
-                    .load_preview => |request| request.generation,
-                    .complete_argument => |request| request.generation,
-                    .action => |request| request.generation,
-                    .cancel => |value| value,
-                };
-                if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
-                    try app.recordMcpMenuEffectFailure(generation, err);
-                }
-            };
-        }
-
-        fn moveMcpMenu(app: *App, delta: i8) bool {
-            if (!mcpMenuActive(app)) return false;
-            const projection = mcpMenuProjection(app);
-            if (projection.state.screen == .preview) {
-                _ = applyMcpMenuEvent(app, .{ .scroll_preview = .{
-                    .delta = delta,
-                    .row_count = mcp_menu_presentation.previewVisualRowCount(
-                        projection.preview,
-                        app.shell.layout.cols,
-                    ),
-                } });
-                return true;
-            }
-            _ = applyMcpMenuEvent(app, .{ .move = .{
-                .delta = delta,
-                .item_count = projection.itemCount(),
-                .visible_count = mcp_menu_presentation.visibleItemsForBudget(
-                    mcp_menu_presentation.max_inline_rows,
-                ),
-            } });
-            return true;
-        }
-
-        fn cycleMcpMenuSection(app: *App, delta: i8) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (applyMcpMenuEventDeferred(app, .{ .cycle_section = delta })) |effect| {
-                try startMcpMenuEffect(app, effect);
-            }
-            if (comptime @hasField(App, "mcp")) {
-                if (app.mcp.menu.load_state == .loading) return true;
-            }
-            app.shell.render_requests.request(.footer);
-            return true;
-        }
-
-        fn submitMcpMenuSelection(app: *App) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                const state = app.mcp.menu;
-                if (state.screen == .browse and state.section == .servers and
-                    mcpMenuProjection(app).itemCount() > 0)
-                {
-                    _ = applyMcpMenuEvent(app, .show_details);
-                } else if (state.screen == .browse and state.section != .servers and
-                    mcpMenuProjection(app).itemCount() > 0)
-                {
-                    if (try app.mcp.prepareMenuArguments(app.alloc)) {
-                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                        app.shell.render_requests.request(.footer);
-                    } else {
-                        if (applyMcpMenuEvent(app, .begin_preview)) |effect| {
-                            try startMcpMenuEffect(app, effect);
-                        }
-                    }
-                } else if (state.screen == .details) {
-                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (mcp_menu_state.serverActionAvailable(.authenticate, server)) {
-                        try authenticateMcpMenuServer(app);
-                    }
-                } else if (state.screen == .confirm) {
-                    if (state.confirmation_action) |action| {
-                        const effect = applyMcpMenuEvent(
-                            app,
-                            .{ .request_action = action },
-                        ) orelse return true;
-                        switch (effect) {
-                            .action => |request| try executeMcpMenuAction(app, request),
-                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-
-        fn insertMcpMenuPreview(app: *App, max_input_len: usize) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                const view = app.mcp.menuView();
-                const insert = view.insert orelse return true;
-                const effect = applyMcpMenuEvent(
-                    app,
-                    .{ .request_action = .insert_preview },
-                ) orelse return true;
-                switch (effect) {
-                    .action => |request| {
-                        if (request.action != .insert_preview) return true;
-                        switch (try insertComposerSliceBounded(
-                            app,
-                            insert,
-                            max_input_len,
-                            false,
-                        )) {
-                            .inserted => {
-                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
-                                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                                    if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
-                                }
-                            },
-                            .limit_exceeded => try input_limit_feedback.report(
-                                App,
-                                app,
-                                .composer,
-                                insert.len,
-                            ),
-                            .inactive => {},
-                        }
-                        app.shell.render_requests.request(.footer);
-                    },
-                    .load_catalog, .load_preview, .complete_argument, .cancel => {},
-                }
-            }
-            return true;
-        }
-
-        fn refreshMcpMenu(app: *App) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                if (app.mcp.menu.screen != .browse or app.mcp.menu.section != .servers) return true;
-            }
-            const effect = applyMcpMenuEvent(
-                app,
-                .{ .request_action = .refresh },
-            ) orelse return true;
-            switch (effect) {
-                .action => |request| {
-                    if (request.action != .refresh) return true;
-                    if (comptime @hasDecl(App, "beginMcpMenuReload")) {
-                        app.beginMcpMenuReload(request.generation) catch |err| {
-                            if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
-                                try app.recordMcpMenuEffectFailure(request.generation, err);
-                            }
-                        };
-                    }
-                },
-                .load_catalog, .load_preview, .complete_argument, .cancel => {},
-            }
-            return true;
-        }
-
-        fn authenticateMcpMenuServer(app: *App) !void {
-            const effect = applyMcpMenuEvent(
-                app,
-                .{ .request_action = .authenticate },
-            ) orelse return;
-            switch (effect) {
-                .action => |request| {
-                    if (request.action == .authenticate) try executeMcpMenuAction(app, request);
-                },
-                .load_catalog, .load_preview, .complete_argument, .cancel => {},
-            }
-        }
-
-        fn confirmMcpMenuAction(app: *App, action: mcp_menu_state.Action) bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                if (app.mcp.menu.screen != .details and
-                    !(app.mcp.menu.screen == .browse and
-                        app.mcp.menu.section == .servers and
-                        (action == .trust_approve_all or action == .trust_reset))) return true;
-                if (app.mcp.menu.screen == .details) {
-                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (!mcp_menu_state.serverActionAvailable(action, server)) return true;
-                }
-                _ = applyMcpMenuEvent(app, .{ .show_confirmation = action });
-            }
-            return true;
-        }
-
-        fn executeMcpMenuAction(
-            app: *App,
-            request: mcp_menu_state.ActionRequest,
-        ) !void {
-            const result = switch (request.action) {
-                .authenticate => if (comptime @hasDecl(App, "beginMcpMenuAuthentication"))
-                    app.beginMcpMenuAuthentication(request.generation)
-                else
-                    error.McpMenuActionUnavailable,
-                .remove => if (comptime @hasDecl(App, "removeMcpMenuServer"))
-                    app.removeMcpMenuServer(request.generation)
-                else
-                    error.McpMenuActionUnavailable,
-                .logout => if (comptime @hasDecl(App, "beginMcpMenuEffect"))
-                    app.beginMcpMenuEffect(.{ .action = request })
-                else
-                    error.McpMenuActionUnavailable,
-                .trust_approve, .trust_reject, .trust_approve_all, .trust_reset => if (comptime @hasDecl(App, "applyMcpMenuTrustAction"))
-                    app.applyMcpMenuTrustAction(request.generation, request.action)
-                else
-                    error.McpMenuActionUnavailable,
-                else => error.McpMenuActionUnavailable,
-            };
-            result catch |err| {
-                if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
-                    try app.recordMcpMenuEffectFailure(request.generation, err);
-                }
-            };
-        }
-
-        fn handleMcpMenuPrimaryAction(app: *App) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                if (app.mcp.menu.screen == .details) {
-                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (mcp_menu_state.serverActionAvailable(.trust_approve, server)) {
-                        const effect = applyMcpMenuEvent(
-                            app,
-                            .{ .request_action = .trust_approve },
-                        ) orelse return true;
-                        switch (effect) {
-                            .action => |request| try executeMcpMenuAction(app, request),
-                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
-                        }
-                    }
-                    return true;
-                }
-                if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
-                    _ = applyMcpMenuEvent(app, .show_add);
-                }
-            }
-            return true;
-        }
-
-        fn handleMcpAddInput(app: *App, byte: u8, max_input_len: usize) !bool {
-            if (comptime !@hasField(App, "mcp")) return false;
-            switch (byte) {
-                '\t' => {
-                    try commitMcpAddDraft(app);
-                    _ = applyMcpMenuEvent(app, .cycle_add_transport);
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                },
-                '\r' => {
-                    try commitMcpAddDraft(app);
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    const field_count: usize = if (app.mcp.menu.add_transport == .local) 3 else 2;
-                    if (app.mcp.menu.add_field_index + 1 < field_count) {
-                        _ = applyMcpMenuEvent(app, .{ .move_add_field = .{
-                            .delta = 1,
-                            .field_count = field_count,
-                        } });
-                    } else {
-                        const action: mcp_menu_state.Action = if (app.mcp.menu.add_transport == .local)
-                            .add_local
-                        else
-                            .add_http;
-                        const effect = applyMcpMenuEvent(
-                            app,
-                            .{ .request_action = action },
-                        ) orelse return true;
-                        switch (effect) {
-                            .action => |request| {
-                                if (comptime @hasDecl(App, "saveMcpMenuAdd")) {
-                                    app.saveMcpMenuAdd(
-                                        request.generation,
-                                        app.mcp.menu.add_transport,
-                                    ) catch |err| {
-                                        if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
-                                            try app.recordMcpMenuEffectFailure(request.generation, err);
-                                        }
-                                    };
-                                }
-                            },
-                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
-                        }
-                    }
-                    app.shell.render_requests.request(.footer);
-                },
-                else => try handleTextByte(app, .composer, byte, max_input_len),
-            }
-            return true;
-        }
-
-        fn commitMcpAddDraft(app: *App) !void {
-            if (comptime @hasField(App, "mcp")) {
-                try app.mcp.setMenuAddField(
-                    app.alloc,
-                    app.mcp.menu.add_field_index,
-                    app.input_runtime.edit_state.input.items,
-                );
-            }
-        }
-
-        fn handleMcpArgumentInput(app: *App, byte: u8, max_input_len: usize) !bool {
-            if (comptime !@hasField(App, "mcp")) return false;
-            if (app.mcp.menu.pending_generation != null) return true;
-            switch (byte) {
-                '\t' => {
-                    try commitMcpArgumentDraft(app);
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    const effect = applyMcpMenuEvent(app, .request_completion) orelse return true;
-                    try startMcpMenuEffect(app, effect);
-                },
-                '\r' => {
-                    try commitMcpArgumentDraft(app);
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    const field_count = mcpMenuProjection(app).arguments.len;
-                    if (app.mcp.menu.argument_index + 1 < field_count) {
-                        _ = applyMcpMenuEvent(app, .{ .move_argument = .{
-                            .delta = 1,
-                            .field_count = field_count,
-                        } });
-                    } else if (!app.mcp.menuArgumentsValid()) {
-                        try app.mcp.setMenuFeedback(app.alloc, "Complete every required MCP argument.");
-                        app.shell.render_requests.request(.footer);
-                    } else if (applyMcpMenuEvent(app, .begin_preview)) |effect| {
-                        try startMcpMenuEffect(app, effect);
-                    }
-                },
-                else => try handleTextByte(app, .composer, byte, max_input_len),
-            }
-            return true;
-        }
-
-        fn commitMcpArgumentDraft(app: *App) !void {
-            if (comptime @hasField(App, "mcp")) {
-                const draft = app.input_runtime.edit_state.input.items;
-                const arguments = mcpMenuProjection(app).arguments;
-                if (draft.len == 0 and
-                    app.mcp.menu.argument_index < arguments.len and
-                    arguments[app.mcp.menu.argument_index].value.items.len > 0)
-                {
-                    return;
-                }
-                try app.mcp.setMenuArgumentField(
-                    app.alloc,
-                    app.mcp.menu.argument_index,
-                    draft,
-                );
-            }
         }
 
         const CompactCommandMenuKind = enum {
@@ -2491,7 +1911,7 @@ pub fn Runtime(comptime App: type) type {
         /// borrowing a composer they are already using.
         fn modelPickerShortcutBlocked(app: *App) bool {
             if (settingsMenuActive(app) or helpMenuActive(app) or
-                skillsMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or mcpMenuActive(app) or mcpHostMenuActive(app)) return true;
+                skillsMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or mcpHostMenuActive(app)) return true;
             if (comptime @hasField(App, "auth")) {
                 if (app.auth.pickerView().active) return true;
             }
@@ -3036,7 +2456,17 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) return;
             const picker = &app.session_persistence.session_picker;
             if (!picker.active) return;
-            picker.setQuery(app.input_runtime.edit_state.input.items);
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                picker.setQuery(app.input_runtime.edit_state.input.items);
+                return;
+            }
+            app_session_runtime.Runtime(App).searchSessionPicker(app) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "session picker search dropped the listed sessions err={s}",
+                    .{@errorName(err)},
+                );
+            };
         }
 
         fn skillTokenEnd(items: []const u8, start: usize) usize {
@@ -3211,7 +2641,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -3258,7 +2688,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -3332,43 +2762,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn cancelHelpMenu(app: *App) bool {
             return closeHelpMenu(app, true);
-        }
-
-        fn cancelMcpMenu(app: *App) !bool {
-            if (comptime @hasDecl(App, "mcpHostMenuKey")) if (mcpHostMenuActive(app)) {
-                // Back a screen; closing the list clears its filter too.
-                try app.mcpHostMenuKey(.escape);
-                if (!mcpHostMenuActive(app)) {
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-                }
-                return true;
-            };
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                debug_trace.logf("mcp", "MCP menu escape screen={s} filter={}", .{ @tagName(app.mcp.menu.screen), app.mcp.menu.filter_active });
-                if (app.mcp.menu.filter_active) {
-                    _ = applyMcpMenuEvent(app, .clear_filter);
-                    return true;
-                }
-                if (app.mcp.menu.screen != .browse) {
-                    if (app.mcp.menu.screen == .add or app.mcp.menu.screen == .arguments) {
-                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    }
-                    if (applyMcpMenuEvent(app, .back)) |effect| switch (effect) {
-                        .cancel => app.mcp.cancelMenuOperation(),
-                        .load_catalog, .load_preview, .complete_argument, .action => {},
-                    };
-                    return true;
-                }
-            }
-            if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
-            app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
-            }
-            return true;
         }
 
         fn cancelSettingsMenu(app: *App) bool {
@@ -3657,7 +3050,6 @@ const RoutingSubagents = struct {
         switch (self.manager_paste.paste.settleDeliveryEpoch()) {
             .none => return false,
             .finish => self.manager_paste.paste.resetWithTrace(.decision_prompt_active),
-            .reject => self.manager_paste.paste.resetWithTrace(.unsafe_suffix),
         }
         return true;
     }
@@ -3872,36 +3264,6 @@ fn armEscapeClearForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i
         input_runtime.gestures,
         armed_ms,
     ).next;
-}
-
-test "project MCP prompt waits for every existing modal owner" {
-    const base = ProjectMcpPromptInputState{
-        .active = true,
-        .question_active = false,
-        .approval_active = false,
-        .subagent_active = false,
-        .menu_active = false,
-        .authentication_active = false,
-    };
-    try std.testing.expect(projectMcpPromptMayOwnInput(base));
-    var blocked = base;
-    blocked.question_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    blocked = base;
-    blocked.approval_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    blocked = base;
-    blocked.subagent_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    blocked = base;
-    blocked.menu_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    blocked = base;
-    blocked.authentication_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    var inactive = base;
-    inactive.active = false;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(inactive));
 }
 
 const RoutingFakeApp = struct {
@@ -9961,7 +9323,7 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     try std.testing.expectEqualStrings("keep", app.submitted_prompt[0..app.submitted_prompt_len]);
 }
 
-test "app_input_runtime rejects a same-epoch enter after an otherwise valid paste" {
+test "app_input_runtime keeps a paste but not a same-epoch enter after it" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9969,7 +9331,7 @@ test "app_input_runtime rejects a same-epoch enter after an otherwise valid past
 
     try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
-    try std.testing.expectEqualStrings("prior", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("priornew", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
 }
@@ -10227,7 +9589,7 @@ test "app_input_runtime question freeform accepts bracketed paste atomically" {
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 }
 
-test "app_input_runtime rejects unsafe suffixes for every root modal paste owner" {
+test "app_input_runtime keeps a modal paste but never runs its same-epoch suffix" {
     const alloc = std.testing.allocator;
 
     {
@@ -10254,7 +9616,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
 
         try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
-        try std.testing.expectEqualStrings("keep", app.approval_prompt.decision.selectedDraft());
+        try std.testing.expectEqualStrings("keepnew", app.approval_prompt.decision.selectedDraft());
         try std.testing.expect(app.worker.submitted_permission == null);
         try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     }
@@ -10276,7 +9638,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
         try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
         try std.testing.expectEqualStrings(
-            "keep",
+            "keepnew",
             app.question_prompt.entries.items[0].freeform_buffer.items,
         );
         try std.testing.expect(app.question_prompt.isActive());

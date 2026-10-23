@@ -45,5 +45,28 @@
     "stress": "SharedLogins.stress.cfg",
     "findings": [],
     "repair": []
+  },
+  {
+    "module": "SubagentAccess",
+    "smoke": "SubagentAccess.cfg",
+    "stress": "SubagentAccess.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "UrlRetry",
+    "smoke": "UrlRetry.cfg",
+    "stress": "UrlRetry.stress.cfg",
+    "findings": [
+      { "config": "UrlRetry.findings.cfg", "invariant": "EndsByUserOrServer" }
+    ],
+    "repair": []
+  },
+  {
+    "module": "MixedBuilds",
+    "smoke": "MixedBuilds.cfg",
+    "stress": "MixedBuilds.stress.cfg",
+    "findings": [],
+    "repair": []
   }
 ]

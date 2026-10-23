@@ -1562,6 +1562,41 @@ test "rebuilt full transcript page keeps the entry the viewer was reading" {
     );
 }
 
+test "a full transcript page prepared while the transcript is closed needs no frame" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(24) };
+    defer runtime.deinit(alloc);
+    for (0..3) |_| {
+        _ = try runtime.appendRawTranscriptEntryClassified(alloc, "row\n", .unknown_raw);
+    }
+
+    const request = runtime.desiredFullTranscriptPageRequest();
+    const task = try std.heap.c_allocator.create(full_transcript_worker.Task);
+    task.* = .{
+        .source = .{
+            .request = request,
+            .range = full_transcript_page.sourceRange(request, runtime.entries.items.len),
+            .styles = .{},
+        },
+        .projection = .{ .styles = .{}, .measured_total_rows = 3 },
+        .prepared_window = .{
+            .source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+                std.heap.c_allocator,
+                try std.heap.c_allocator.dupe(u8, "row\nrow\nrow\n"),
+                runtime.layout.cols,
+                null,
+            ),
+            .start_row = 0,
+        },
+    };
+    task.done.store(true, .release);
+    runtime.full_transcript_page_load.task = task;
+
+    // The page is kept for the next Ctrl+O, but nothing on screen changed.
+    try std.testing.expect(!try runtime.pollFullTranscriptPageLoad());
+    try std.testing.expect(runtime.fullTranscriptPreparedForOpen());
+}
+
 test "opening the full transcript leaves compact command projection unchanged" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = .{
@@ -10707,7 +10742,6 @@ pub const TranscriptRuntime = struct {
 
         const request = task.source.request;
         const desired = self.desiredFullTranscriptPageRequest();
-        var installed = false;
         if (task.cancel_requested.load(.acquire)) {
             // Closing, resizing, or superseding a page intentionally cancels
             // its worker. It must not poison the next open request.
@@ -10750,11 +10784,13 @@ pub const TranscriptRuntime = struct {
                 };
                 self.full_transcript_installed_page_retired = false;
                 self.full_transcript_failed_request = null;
-                installed = true;
             }
         }
 
-        return installed or self.full_transcript.depth == .full;
+        // A page prepared while the full transcript is closed changes nothing
+        // on screen. Asking for a frame anyway would leave a file approval
+        // unsettled and drop the user's answer until that frame painted.
+        return self.full_transcript.depth == .full;
     }
 
     pub fn prewarmFullTranscriptPage(

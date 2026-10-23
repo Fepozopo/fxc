@@ -1002,7 +1002,8 @@ Settled while moving off the side folder (2026-10-01):
   session is open. Prompt images are captured before the
   session is on disk, where no blob can be written, so they are saved
   inside the user's item, as libfx saves them; a large item is a blob
-  already, and D79 also keeps each image as a blob. fx's own size limits stay where they are. **Why:** one folder per session,
+  already. D89 saves them as blobs when their turn starts. fx's own size
+  limits stay where they are. **Why:** one folder per session,
   forks that hard-link instead of copying, no orphan side folders, and
   content addressing that makes a stored body unforgeable. **Alternative:**
   keep today's handle names with an index from name to blob, which grows
@@ -1393,24 +1394,16 @@ Settled while removing v1 (2026-10-17):
   `InvalidSessionFormat`, the file and the reason the converter's check
   gives, and points at `fx doctor`. **Why:** the user can act on it.
   **Alternative:** a generic message that the session is corrupt.
-- **D79 Decision (amends D44):** prompt images are also kept as blobs.
-  When a turn's user item is written, by a stream, a commit or a
-  conversion's import, each inline prompt image is put as a blob of the
-  session and listed on that item, and the item saves its
-  `snapshot_path` as that blob's path; the bytes stay inside the item.
-  Each request names that blob for every prompt image it sends, as
+- **D79 Decision (amends D44; D89 amends it):** each request names the
+  saved file of every prompt image it sends, as
   `[Image #N (type) is saved at "<path>".]` ahead of the prompt, and the
   notice for an image too large to send, or left out to keep a request
   within its size limit, names the same file, in the running process and
-  after a resume alike: the blob is the file named by
-  the image's hash in the session's blob folder, and the turn writes it
-  with the user item before any of its tools runs, so the model can open
-  the file it is told about. Without a saved session the notice names the
-  copy fx captured in its temporary folder, which lasts while fx runs, and
-  the note is left out. A recalled image has the same bytes, so it names
-  the same blob. **Why:**
-  the model can read the original to make a smaller copy, or open the
-  image it sees with tools, as v1's `images/` folder let it.
+  after a resume alike. That file is the image's blob (D89). An image
+  with no saved file, one the store did not save or one in a session
+  that is not saved, is named by no note, and its notices name no file.
+  **Why:** the model can read the original to make a smaller copy, or
+  open the image it sees with tools, as v1's `images/` folder let it.
   **Alternative:** tell the model no local file is available.
 - **D80 Decision:** when fx is killed while a response is being retried,
   the reopened session shows the turn's finished pieces, such as a tool
@@ -1449,7 +1442,7 @@ Settled while removing v1 (2026-10-17):
   image bytes saved with the prompt, checked against their digest, so a
   damaged or deleted captured file no longer refuses the recall. The
   recalled image keeps those bytes inline and writes no file, so its turn
-  saves it as a blob as it does any prompt image (D79); a copy in the
+  saves it as a blob as it does any prompt image (D89); a copy in the
   temporary folder would be gone once fx exits. The composer tests pin
   that the recall succeeds and names the same blob. **Why:** the saved
   bytes are the prompt's image; the captured file is a temporary copy.
@@ -1489,6 +1482,52 @@ Settled while removing v1 (2026-10-17):
   family converts without it. **Why:** no v1 session is left unexplained.
   **Alternative:** convert descendants at every depth, for sessions no
   build opens.
+
+Settled for prompt images (2026-10-19, after a model searched the disk
+for an image pasted into its prompt):
+- **D89 Decision (amends D44 and D79):** each prompt image becomes its own
+  blob, named by its digest, when its turn starts and before the turn's
+  first request is built (`AgentRuntimeDeps.save_prompt_images`). D44's
+  reason for keeping prompt images inside the user's item holds when an
+  image is captured, before the session is on disk, but not when its turn
+  starts.
+  - The `user` item names the image by `blob`, without its base64 bytes or
+    the temporary snapshot path of the process that captured it. The blob
+    is listed on the turn's next item, so a fork hard-links it and
+    `verify` checks it.
+  - A conversion's import saves each converted prompt image the same way,
+    and a recalled image keeps its bytes (D84), so its turn saves it too.
+  - In memory a saved image is only its handle too: the blob's path and
+    its digest. Whatever needs the bytes, a request, Vision or a recall,
+    reads them from the blob and checks them against the digest, as v1
+    read an image's snapshot file. A resumed session loads no image bytes,
+    and the turn's own copy drops them once the blob is saved. The
+    request still sends the bytes inline. Its note and every notice for an
+    image left out of it name the blob's path (D79), so the model can open
+    the image with its tools.
+  - Every save lists the blob again, so the next turn that sends an image
+    repairs a listing a crash lost. The session remembers the digests it
+    saved, so every copy of the turn a host commits encodes the same way
+    and the commit matches what was streamed.
+  - An image the store does not save keeps its bytes inline, as before,
+    and no note or notice names a file for it. A blob an item names that
+    is gone damages the session when it opens (D39). One whose bytes were
+    damaged is found by `verify` and by any reader, which leaves the image
+    out as it does a damaged snapshot. Items written before D89 read as
+    they did.
+  - `PromptImages.tla` checks that a note names only a saved, listed blob,
+    that every request sends every image, and that a fork holds every blob
+    its items name, for a conversion's import as for a turn. `mutants.py`
+    plants eight bugs against it.
+
+  **Why:** D79 kept each image twice, as its blob and as base64 inside the
+  item, a third larger than its bytes, and wrote both only when the user
+  item was written, after the first request named the blob. Keeping the
+  bytes in memory too would hold every image of a long session for as long
+  as it is open, and copy them again for each turn's Vision catalog.
+  **Alternative:** save at capture, when no session is on disk (D44);
+  keep D79's two copies; load every blob when the session opens; or name
+  the temporary snapshot, which is gone when its process exits.
 
 ## Design Risks And Failure Behavior
 

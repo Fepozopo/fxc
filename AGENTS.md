@@ -74,7 +74,7 @@ Key rules:
 
 * `src/core/shell_command/safe_git.zig` runs git for the `fx pr` and `fx issue` snapshot and for the agent's direct read-only `git status`, `git diff`, and `git log` when the command does not use the user's own shell environment. It turns off every program a repository's own config can name and refuses to run when git would use a different repository than the one fx read. In `auto` mode a git command it refuses is returned to the agent without running. Commands that run in a shell use git with the repository's full config: git in the shell tool's default `user` environment, and the routine commands `auto` mode runs without review, such as `git status` with other flags, `git fetch`, or `npm test`.
 
-* `src/mcp/` is the MCP-v2 engine. `FX_MCP_ENGINE=v2` selects it in place of the default v1 client in `src/core/mcp/`. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`.
+* `src/mcp/` is the MCP engine. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`. `src/core/mcp/` holds the MCP types, config parsing, schema checks, search, and tool naming that the host, the tools, ACP, and the UI share.
 
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
@@ -166,6 +166,8 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * Host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations are not proof of an attack, and handling plans or test instructions as data is not itself prompt injection
 
+* A command form that fx runs without review, through `command_effect.plan` or `command_effect.knownReversibleAutoCommand`, must be listed in `parity_review_free_commands` in `src/core/shell_command/command_effect.zig`. The shell parity tests check that sh, dash, bash, and zsh, with and without `extendedglob`, run each one exactly as fx parsed it, and the nightly `shell_parity` fuzz target checks generated commands the same way
+
 Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns
@@ -243,6 +245,8 @@ fx does not use declarations that Zig 0.17 deprecates. They still compile, so ch
 * Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in ReleaseSafe in **CI** after the feature branch is pushed, and it must pass before the draft PR is marked ready.
 
 * In test blocks, use `std.testing.io` for the `Io` parameter. `io_mod.getIo()` automatically returns `std.testing.io` in test builds.
+
+* A new `std.testing.fuzz` test needs an entry in `tests/fuzz/targets.json` and its saved inputs passed as its corpus, as **Fuzz a parser** in `CONTRIBUTING.md` describes. The nightly Fuzz workflow fuzzes every entry.
 
 * Use `io_mod.dirRealpathAlloc(alloc, dir, sub_path)` to resolve paths within `std.testing.tmpDir()`.
 

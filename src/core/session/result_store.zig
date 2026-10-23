@@ -16,7 +16,7 @@ pub const preview_bytes: usize = 4 * 1024;
 pub const read_default_bytes: usize = 8 * 1024;
 pub const read_max_bytes: usize = 64 * 1024;
 pub const full_read_chunk_bytes: usize = 64 * 1024;
-const stored_text_max_bytes: usize = 8 * 1024 * 1024;
+pub const stored_text_max_bytes: usize = 8 * 1024 * 1024;
 
 pub const PreparedResult = struct {
     model_output: []const u8,

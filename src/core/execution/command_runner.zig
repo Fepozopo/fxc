@@ -832,34 +832,172 @@ fn executeWithSnapshot(
         &nonce,
     });
     const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker);
-    const script = try shell_resolver.snapshotScript(scratch, generation.replay, command);
+    const kind = shell_resolver.shellKind(generation.shell_path) orelse return error.UnsupportedShell;
+    const script = try shell_resolver.snapshotScript(scratch, kind, generation.replay, command);
     debug_trace.logf(
         "core",
         "command runner snapshot generation={d} shell={s} replay_bytes={d}",
         .{ generation.id, generation.shell_path, generation.replay.len },
     );
-    const result = try executeProcessWithScript(
+    var snapshot_cfg = cfg;
+    var presented: ?ReplayMarkerFilter = null;
+    var accepted: ?ReplayMarkerFilter = null;
+    ReplayMarkerFilter.install(
+        &presented,
+        failure_marker,
+        &snapshot_cfg.output_chunk_ctx,
+        &snapshot_cfg.on_output_chunk,
+    );
+    ReplayMarkerFilter.install(
+        &accepted,
+        failure_marker,
+        &snapshot_cfg.accepted_output_chunk_ctx,
+        &snapshot_cfg.on_accepted_output_chunk,
+    );
+    const result = executeProcessWithScript(
         scratch,
-        cfg,
+        snapshot_cfg,
         invocation.argv(),
         cwd,
         script,
         &generation.environ,
-    );
+    ) catch |err| {
+        // A run that timed out or was cancelled still reports the output it
+        // produced, including any bytes held as a possible marker.
+        if (presented) |*filter| filter.finishOrLog();
+        if (accepted) |*filter| filter.finishOrLog();
+        return err;
+    };
     if (snapshotReplayFailed(result, failure_marker)) {
         // The replay stopped before the command started, so the command has
         // not run. Fail this snapshot and let the caller run it once with
         // full startup.
         debug_trace.logf(
             "core",
-            "command runner snapshot replay failed generation={d}; rerunning with full startup",
+            "command runner snapshot replay failed generation={d}; dropped its failure marker from the live output; rerunning with full startup",
             .{generation.id},
         );
         owner.markReplayFailed(generation);
         return null;
     }
+    if (presented) |*filter| filter.finishOrLog();
+    if (accepted) |*filter| try filter.finish();
     return try formatCollectedOutput(arena, command, cwd, result);
 }
+
+/// Passes a snapshot run's output on to one of the caller's callbacks without
+/// the replay failure marker. A run whose replay failed is discarded and the
+/// command reruns with full startup, so the marker must reach neither the live
+/// view nor the output the model reads. Stderr bytes that could begin the
+/// marker wait for the next chunk, or for `finish` when the run is kept.
+const ReplayMarkerFilter = struct {
+    const marker_bytes = shell_resolver.snapshot_replay_failure_prefix.len + foreground_session_failure_nonce_hex_bytes;
+
+    marker: []const u8,
+    ctx: *anyopaque,
+    callback: CommandOutputCallback,
+    lifecycle_id: ?types.ToolLifecycleId = null,
+    held: [marker_bytes]u8 = undefined,
+    held_len: usize = 0,
+
+    /// Puts a filter in `slot` in front of the callback the two fields name,
+    /// and points the fields at it. Leaves `slot` null when there is no
+    /// callback. `slot` must outlive the run.
+    fn install(
+        slot: *?ReplayMarkerFilter,
+        marker: []const u8,
+        ctx_field: *?*anyopaque,
+        callback_field: *?CommandOutputCallback,
+    ) void {
+        std.debug.assert(marker.len == marker_bytes);
+        const ctx = ctx_field.* orelse return;
+        const callback = callback_field.* orelse return;
+        slot.* = .{ .marker = marker, .ctx = ctx, .callback = callback };
+        ctx_field.* = &slot.*.?;
+        callback_field.* = onChunk;
+    }
+
+    fn onChunk(
+        raw: *anyopaque,
+        lifecycle_id: ?types.ToolLifecycleId,
+        stream: CommandOutputStream,
+        chunk: []const u8,
+    ) anyerror!void {
+        const self: *ReplayMarkerFilter = @ptrCast(@alignCast(raw));
+        if (stream == .stdout) return self.callback(self.ctx, lifecycle_id, stream, chunk);
+        self.lifecycle_id = lifecycle_id;
+        var rest = chunk;
+        if (self.held_len > 0) rest = try self.resolveHeld(chunk) orelse return;
+        while (std.mem.find(u8, rest, self.marker)) |index| {
+            try self.forward(rest[0..index]);
+            rest = rest[index + self.marker.len ..];
+        }
+        const keep = markerPrefixAtEnd(rest, self.marker);
+        try self.forward(rest[0 .. rest.len - keep]);
+        @memcpy(self.held[0..keep], rest[rest.len - keep ..]);
+        self.held_len = keep;
+    }
+
+    /// Delivers the bytes still held when a kept run ends.
+    fn finish(self: *ReplayMarkerFilter) !void {
+        const held_len = self.held_len;
+        self.held_len = 0;
+        try self.forward(self.held[0..held_len]);
+    }
+
+    /// `finish` for a path that cannot return the callback's error.
+    fn finishOrLog(self: *ReplayMarkerFilter) void {
+        const held_len = self.held_len;
+        self.finish() catch |err| debug_trace.logf(
+            "core",
+            "command output dropped {d} held stderr bytes err={s}",
+            .{ held_len, @errorName(err) },
+        );
+    }
+
+    /// Decides the held bytes against the start of `chunk`: forwards the ones
+    /// that cannot begin the marker and drops a completed marker. Returns the
+    /// part of `chunk` still to scan, or null when all of it is held.
+    fn resolveHeld(self: *ReplayMarkerFilter, chunk: []const u8) !?[]const u8 {
+        var window: [2 * marker_bytes]u8 = undefined;
+        const held_len = self.held_len;
+        const take = @min(chunk.len, self.marker.len);
+        @memcpy(window[0..held_len], self.held[0..held_len]);
+        @memcpy(window[held_len..][0..take], chunk[0..take]);
+        const joined = window[0 .. held_len + take];
+        self.held_len = 0;
+
+        var start: usize = 0;
+        while (start < held_len) : (start += 1) {
+            const candidate = joined[start..];
+            const compared = @min(candidate.len, self.marker.len);
+            if (std.mem.eql(u8, candidate[0..compared], self.marker[0..compared])) break;
+        }
+        try self.forward(joined[0..start]);
+        if (start == held_len) return chunk;
+        const candidate = joined[start..];
+        if (candidate.len >= self.marker.len) return chunk[start + self.marker.len - held_len ..];
+        // Still a partial marker, which means `take` consumed the whole chunk.
+        std.debug.assert(take == chunk.len);
+        @memcpy(self.held[0..candidate.len], candidate);
+        self.held_len = candidate.len;
+        return null;
+    }
+
+    fn forward(self: *ReplayMarkerFilter, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.callback(self.ctx, self.lifecycle_id, .stderr, bytes);
+    }
+
+    /// Length of the longest proper prefix of `marker` that `bytes` ends with.
+    fn markerPrefixAtEnd(bytes: []const u8, marker: []const u8) usize {
+        var keep = @min(bytes.len, marker.len - 1);
+        while (keep > 0) : (keep -= 1) {
+            if (std.mem.eql(u8, bytes[bytes.len - keep ..], marker[0..keep])) return keep;
+        }
+        return 0;
+    }
+};
 
 fn snapshotReplayFailed(result: CollectedProcess, failure_marker: []const u8) bool {
     return switch (result.status) {
@@ -2079,8 +2217,10 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
 
     // The startup files ran once into the snapshot. The aliased `builtin`
     // could not intercept the alias-safe `\builtin eval` that runs the
-    // command, and the replayed TRAPDEBUG still observed it.
-    const debug_output = try readAbsoluteFile(arena, debug_log, 64 * 1024);
+    // command, and the replayed TRAPDEBUG still observed it. The log holds a
+    // line for each command TRAPDEBUG saw, and Debian's and Ubuntu's global
+    // compinit defines hundreds of functions, so it can pass 64 KiB.
+    const debug_output = try readAbsoluteFile(arena, debug_log, 4 * 1024 * 1024);
     try std.testing.expect(std.mem.find(u8, debug_output, "builtin eval") != null);
     try std.testing.expect(std.mem.find(u8, debug_output, "kill -TERM $$") != null);
     try std.testing.expect(std.mem.find(u8, signaled.output, "INTERCEPTED") == null);
@@ -2165,12 +2305,14 @@ test "bash user profile commands reuse one startup-file snapshot" {
     const first = try executeCommandInEnvironment(
         config,
         arena,
-        "fxsnap_alias; echo; fxsnap_fn; echo; echo $FXSNAP_EXPORT; " ++
+        "trap 'echo trap-ok >&2' EXIT; echo stderr-ok >&2; " ++
+            "fxsnap_alias; echo; fxsnap_fn; echo; echo $FXSNAP_EXPORT; " ++
             "case :$PATH: in *:$HOME/marker-bin:*) echo path-ok;; esac; cat; echo stdin-closed",
         paths.workspace,
         .{ .user = paths.shell },
     );
-    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "stdin-closed" }) |expected| {
+    // The command and its exit trap write to stderr after the replay hid it.
+    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "stdin-closed", "stderr-ok", "trap-ok" }) |expected| {
         try std.testing.expect(std.mem.find(u8, first.output, expected) != null);
     }
     try std.testing.expect(std.mem.startsWith(u8, first.output, "exit_code=0\n"));
@@ -2218,13 +2360,15 @@ test "user profile commands reuse one startup-file snapshot" {
     const first = try executeCommandInEnvironment(
         config,
         arena,
-        "fxsnap_alias; fxsnap_fn; print -r -- $FXSNAP_EXPORT; " ++
+        "trap 'print -r -- trap-ok >&2' EXIT; print -r -- stderr-ok >&2; " ++
+            "fxsnap_alias; fxsnap_fn; print -r -- $FXSNAP_EXPORT; " ++
             "case :$PATH: in *:$HOME/marker-bin:*) print -r -- path-ok;; esac; " ++
             "fxsnap_bulk_2999; cat; print -r -- stdin-closed",
         paths.workspace,
         .{ .user = paths.shell },
     );
-    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "bulk-2999", "stdin-closed" }) |expected| {
+    // The command and its exit trap write to stderr after the replay hid it.
+    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "bulk-2999", "stdin-closed", "stderr-ok", "trap-ok" }) |expected| {
         try std.testing.expect(std.mem.find(u8, first.output, expected) != null);
     }
     try std.testing.expect(std.mem.startsWith(u8, first.output, "exit_code=0\n"));
@@ -2252,6 +2396,37 @@ test "user profile commands reuse one startup-file snapshot" {
     const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
     const loads = try readAbsoluteFile(arena, loads_path, 4096);
     try std.testing.expectEqualStrings("loaded\n", loads);
+}
+
+test "zsh user profile snapshot restores a function that replaces a default alias" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // zsh starts with a `run-help` alias, and Debian's and Ubuntu's global
+    // zshrc replace it with a function, as this startup file does.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
+            "unalias run-help\n" ++
+            "run-help() { print -r -- run-help-function; }\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "run-help", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nrun-help-function\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
 test "user profile command with an approval from an earlier shell epoch does not run" {
@@ -2308,6 +2483,37 @@ fn brokenReplayCapture(request: shell_snapshot.CaptureRequest) shell_snapshot.Ca
     return .{ .ready = generation };
 }
 
+/// Runs `command` once with both output callbacks captured, through a replay
+/// that fails, and checks that only the full-startup rerun's stdout `done\n`
+/// reached either callback: no replay error and no failure marker.
+fn expectFailedReplayHidden(
+    arena: Allocator,
+    command: []const u8,
+    paths: SnapshotTestShell,
+) !void {
+    var presented: StreamCapture = .{ .alloc = arena };
+    var accepted: StreamCapture = .{ .alloc = arena };
+    const config = Config{
+        .max_command_output_bytes = 16 * 1024,
+        .output_chunk_ctx = &presented,
+        .on_output_chunk = StreamCapture.onChunk,
+        .accepted_output_chunk_ctx = &accepted,
+        .on_accepted_output_chunk = StreamCapture.onChunk,
+    };
+    const result = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    for ([_]*const StreamCapture{ &presented, &accepted }) |capture| {
+        var streamed: std.ArrayList(u8) = .empty;
+        for (capture.streams.items, capture.chunks.items) |stream, chunk| {
+            try std.testing.expectEqual(CommandOutputStream.stdout, stream);
+            try streamed.appendSlice(arena, chunk);
+        }
+        try std.testing.expectEqualStrings("done\n", streamed.items);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "exit_code=0\n"));
+    try std.testing.expect(std.mem.find(u8, result.output, "done") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, shell_resolver.snapshot_replay_failure_prefix) == null);
+}
+
 test "user profile command reruns once with full startup after a failed replay" {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
@@ -2329,10 +2535,7 @@ test "user profile command reruns once with full startup after a failed replay" 
     const command = try arena.print("print -r -- ran >> {s}; print -r -- done", .{try shellQuote(arena, marker_path)});
     const config = Config{ .max_command_output_bytes = 16 * 1024 };
 
-    const result = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
-    try std.testing.expect(std.mem.startsWith(u8, result.output, "exit_code=0\n"));
-    try std.testing.expect(std.mem.find(u8, result.output, "done") != null);
-    try std.testing.expect(std.mem.find(u8, result.output, shell_resolver.snapshot_replay_failure_prefix) == null);
+    try expectFailedReplayHidden(arena, command, paths);
     try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
 
     // Later commands fall back to full startup without retrying the replay.
@@ -2343,6 +2546,150 @@ test "user profile command reruns once with full startup after a failed replay" 
     var notice_buffer: [256]u8 = undefined;
     const notice = shell_snapshot.processOwner().takeUiNotice(&notice_buffer).?;
     try std.testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
+}
+
+test "bash user profile command hides a failed replay from its output" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "bash", ".bash_profile", "");
+    try expectFailedReplayHidden(arena, "echo done", paths);
+}
+
+test "timed-out user profile command keeps stderr that could begin the replay marker" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "");
+    // Capture the snapshot first so the timeout covers only the command.
+    _ = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 1024 },
+        arena,
+        "true",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+
+    // The trailing `f` could begin the marker, so the filter holds it until
+    // the run ends, which here is a timeout.
+    var accepted: StreamCapture = .{ .alloc = arena };
+    try std.testing.expectError(error.TimeoutExpired, executeCommandInEnvironment(.{
+        .max_command_output_bytes = 1024,
+        .accepted_output_chunk_ctx = &accepted,
+        .on_accepted_output_chunk = StreamCapture.onChunk,
+        .timeout_ms = 1000,
+    }, arena, "printf 'waiting f' >&2; sleep 30", paths.workspace, .{ .user = paths.shell }));
+    var streamed: std.ArrayList(u8) = .empty;
+    for (accepted.streams.items, accepted.chunks.items) |stream, chunk| {
+        try std.testing.expectEqual(CommandOutputStream.stderr, stream);
+        try streamed.appendSlice(arena, chunk);
+    }
+    try std.testing.expectEqualStrings("waiting f", streamed.items);
+}
+
+test "replay marker filter drops the marker however chunks split it" {
+    const marker = shell_resolver.snapshot_replay_failure_prefix ++ "0123456789abcdef0123456789abcdef";
+    const Sink = struct {
+        alloc: Allocator,
+        stdout: std.ArrayList(u8) = .empty,
+        stderr: std.ArrayList(u8) = .empty,
+
+        fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, stream: CommandOutputStream, chunk: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const list = switch (stream) {
+                .stdout => &self.stdout,
+                .stderr => &self.stderr,
+            };
+            try list.appendSlice(self.alloc, chunk);
+        }
+    };
+    const cases = [_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = marker, .expected = "" },
+        .{ .input = "warning\n" ++ marker, .expected = "warning\n" },
+        .{ .input = "ff" ++ marker ++ "f", .expected = "fff" },
+        // Partial markers that never complete pass through unchanged.
+        .{ .input = "err\nfx-shell-snapshot\nfx-done\n", .expected = "err\nfx-shell-snapshot\nfx-done\n" },
+        .{ .input = "ends with fx-shell-snap", .expected = "ends with fx-shell-snap" },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (cases) |case| {
+        // Every cut into two chunks, then one byte per chunk.
+        for (0..case.input.len + 2) |cut| {
+            var sink: Sink = .{ .alloc = arena };
+            var slot: ?ReplayMarkerFilter = null;
+            var ctx: ?*anyopaque = &sink;
+            var callback: ?CommandOutputCallback = Sink.onChunk;
+            ReplayMarkerFilter.install(&slot, marker, &ctx, &callback);
+            if (cut <= case.input.len) {
+                try callback.?(ctx.?, null, .stderr, case.input[0..cut]);
+                // Stdout is never filtered.
+                try callback.?(ctx.?, null, .stdout, marker);
+                try callback.?(ctx.?, null, .stderr, case.input[cut..]);
+            } else {
+                for (case.input, 0..) |_, index| {
+                    try callback.?(ctx.?, null, .stderr, case.input[index..][0..1]);
+                }
+                try callback.?(ctx.?, null, .stdout, marker);
+            }
+            try slot.?.finish();
+            try std.testing.expectEqualStrings(case.expected, sink.stderr.items);
+            try std.testing.expectEqualStrings(marker, sink.stdout.items);
+        }
+    }
+}
+
+test "zsh commands keep words that start with = literal in every captured profile" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Startup files that turn the option on explicitly do not reach the command.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\nsetopt equals\n",
+    );
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const command = "echo before; echo ======; [ x == x ] && echo same; echo after";
+    const expected = "exit_code=0\n<stdout>\nbefore\n======\nsame\nafter\n</stdout>\n";
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+
+    const clean = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .clean = "/bin/zsh" });
+    try std.testing.expectEqualStrings(expected, clean.output);
+
+    const snapshot = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings(expected, snapshot.output);
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    const full_startup = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings(expected, full_startup.output);
+    try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {

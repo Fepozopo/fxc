@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const glob_pattern = @import("../../core/workspace/glob_pattern.zig");
 const grep_search = @import("../../core/workspace/grep_search.zig");
 const tool_files = @import("../../core/workspace/tool_files.zig");
@@ -165,7 +166,22 @@ pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) to
 
 /// Searches the resolved root and returns an owned tool result body.
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return callWithOps(ctx, erased, .{});
+    const result = try callWithOps(ctx, erased, .{});
+    holdForTest();
+    return result;
+}
+
+// Only `tests/e2e/tui-interrupt-recovery.test.ts` sets
+// `FX_E2E_GREP_RELEASE`: a finished search then waits until the file it
+// names exists, so the test can cancel the turn while the tool is still
+// running. The libfx artifacts leave it out.
+fn holdForTest() void {
+    if (comptime build_options.libfx) return;
+    const release_path = io_mod.getenv("FX_E2E_GREP_RELEASE") orelse return;
+    while (true) : (io_mod.sleep(std.time.ns_per_ms)) {
+        std.Io.Dir.accessAbsolute(io_mod.getIo(), release_path, .{}) catch continue;
+        return;
+    }
 }
 
 const StatRootFn = *const fn ([]const u8) anyerror!std.Io.File.Stat;

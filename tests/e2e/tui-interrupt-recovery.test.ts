@@ -853,20 +853,14 @@ while :; do sleep 1; done
       const corpus = join(workspace, "corpus");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
+      const releasePath = join(root, "grep-release");
       const pattern = "LATE_SUCCESS_NEEDLE";
       const callId = "late_success_grep";
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(corpus, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      // The search must still be running when the second Escape lands, about
-      // half a second after it starts. Linux searches 30,000 files in about a
-      // third of a second, so it needs a larger corpus than macOS.
-      const corpusFiles = process.platform === "darwin" ? 30_000 : 120_000;
-      for (let index = 0; index < corpusFiles; index += 1) {
-        writeFileSync(
-          join(corpus, `candidate-${String(index).padStart(6, "0")}.txt`),
-          "ordinary corpus text\n",
-        );
+      for (let index = 0; index < 3; index += 1) {
+        writeFileSync(join(corpus, `candidate-${index}.txt`), "ordinary corpus text\n");
       }
 
       gateway = startFakeGateway([
@@ -892,6 +886,9 @@ while :; do sleep 1; done
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},tool,ui_activity`,
           FX_TRACE_LOG: tracePath,
+          // The search holds its result until this file exists, so it is
+          // still running when the turn is cancelled.
+          FX_E2E_GREP_RELEASE: releasePath,
         },
       });
       await session.waitForComposer(TIMEOUT);
@@ -909,6 +906,10 @@ while :; do sleep 1; done
       await session.sendKeys("Escape");
       await session.waitForText("What can fx do differently?", TIMEOUT);
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
+      expect(readTrace(tracePath)).not.toContain(
+        `event=after_tool_execution call_id=${callId}`,
+      );
+      writeFileSync(releasePath, "");
       await waitForTrace(tracePath, `event=after_tool_execution`, TIMEOUT);
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
 

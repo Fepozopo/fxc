@@ -278,6 +278,8 @@ export async function codexEngine(): Promise<FxEngine> {
   });
   // @ts-expect-error a Codex engine needs credentials()
   await createFxEngine({ provider: "codex", model });
+  // @ts-expect-error a Codex engine needs a model: fx's default is an AI Gateway id
+  await createFxEngine({ provider: "codex", credentials: ({ provider, sessionId }) => tokenStore.load(provider, sessionId) });
   // @ts-expect-error credentials() needs provider "codex"
   await createFxEngine({ apiKey, model, credentials: () => tokenStore.load("codex") });
   // @ts-expect-error onCredentials needs provider "codex"
@@ -328,5 +330,7 @@ export async function grokEngine(): Promise<FxEngine> {
   });
   // @ts-expect-error a Grok request names provider "grok"
   await createFxEngine({ provider: "grok", model, credentials: ({ provider }) => tokenStore.load(provider) });
+  // @ts-expect-error a Grok engine needs a model: fx's default is an AI Gateway id
+  await createFxEngine({ provider: "grok", credentials: ({ provider, sessionId }) => planTokens.load(provider, sessionId) });
   return engine;
 }

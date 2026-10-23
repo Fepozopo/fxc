@@ -336,8 +336,8 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
                 else
                     null,
-                .image_blob_dir = if (comptime @hasField(App, "session_persistence"))
-                    if (app.session_persistence.v2) |v2| v2.blobsPath() else null
+                .save_prompt_images = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentSavePromptImages else null
                 else
                     null,
                 .propagate_grant = agentPropagateGrant,
@@ -1191,6 +1191,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
+        }
+
+        fn agentSavePromptImages(ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).savePromptImages(app, alloc, images);
         }
 
         fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {

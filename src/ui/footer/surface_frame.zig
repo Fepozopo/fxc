@@ -19,7 +19,6 @@ const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
-const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
@@ -400,7 +399,7 @@ fn buildFooterSurfaceProjection(
     const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
     const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active and !inline_api_key;
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
-    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and (ctx.mcp_menu.state.active or ctx.mcp_host_menu.active());
+    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_host_menu.active();
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
     const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
     const show_fork_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.fork_menu.active();
@@ -575,7 +574,7 @@ fn buildFooterSurfaceProjection(
         shell.layout.rows,
         geometry.input_extra,
         banner_rows,
-        mcp_menu_presentation.max_inline_rows,
+        mcp_host_menu_presentation.max_inline_rows,
     );
     const fork_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
         shell.layout.rows,
@@ -616,15 +615,9 @@ fn buildFooterSurfaceProjection(
             shell.layout.cols,
             settings_picker_row_budget,
         )
-    else if (show_mcp_menu and ctx.mcp_host_menu.active())
+    else if (show_mcp_menu)
         mcp_host_menu_presentation.menuRowCount(
             ctx.mcp_host_menu,
-            shell.layout.cols,
-            mcp_picker_row_budget,
-        )
-    else if (show_mcp_menu)
-        mcp_menu_presentation.menuRowCount(
-            ctx.mcp_menu,
             shell.layout.cols,
             mcp_picker_row_budget,
         )

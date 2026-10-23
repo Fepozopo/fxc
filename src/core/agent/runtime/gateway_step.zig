@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const image_route = @import("../../images/image_route.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const io_mod = @import("../../shared/io.zig");
@@ -261,68 +262,61 @@ pub const ToolImageProjection = struct {
     stripped: bool,
 };
 
-/// Projects stored tool images into the request only when the model accepts
-/// inline image input. Otherwise the images stay in the session image store
-/// and the tool message explains exactly why they were withheld and what the
-/// model can do instead, so the next step is never a dead end.
+/// Projects stored tool images into the request as `disposition` says, which
+/// the image route core decided (`src/core/images/image_route.zig`). Withheld
+/// images stay in the session image store, and each tool message that held
+/// one says why and what the model can do instead, so the next step is never
+/// a dead end.
 pub fn projectToolImageMessages(
     alloc: Allocator,
     messages: []const types.ChatMessage,
-    image_input_support: model_capabilities.ImageInputSupport,
-    vision_fallback_available: bool,
+    disposition: image_route.ToolImages,
     text_limit: usize,
 ) !ToolImageProjection {
-    if (image_input_support == .native) return .{ .messages = messages, .stripped = false };
-    const has_images = for (messages) |message| {
-        if (message.tool_result_memory) |memory| if (memory.tool_images.len > 0 or memory.tool_image_handle != null) break true;
-    } else false;
-    if (!has_images) return .{ .messages = messages, .stripped = false };
-    const notice: []const u8 = switch (image_input_support) {
-        .native => unreachable,
-        .non_native => if (vision_fallback_available)
-            "[Tool images were retained but not sent: this model receives image input through the vision tool, not inline. Call vision with the image file's local path to inspect it.]\n"
-        else
-            "[Tool images were retained but not sent: this model does not accept inline images and no vision fallback is available. Ask the user to attach the image directly or switch to a vision-capable model.]\n",
-        .unknown => "[Tool images were retained but not sent: fx could not confirm image input support for this model (the model is not listed in the model catalog, or the catalog is unavailable). This can recover later in the session, so a retry may succeed; otherwise ask the user to attach the image directly.]\n",
+    const notice: []const u8 = switch (disposition) {
+        .none, .attached => return .{ .messages = messages, .stripped = false },
+        .withheld_fallback => "[Tool images were retained but not sent: this model receives image input through the vision tool, not inline. Call vision with the image file's local path to inspect it.]\n",
+        .withheld_dead_end => "[Tool images were retained but not sent: this model does not accept inline images and no vision fallback is available. Ask the user to attach the image directly or switch to a vision-capable model.]\n",
+        .withheld_unknown => "[Tool images were retained but not sent: fx could not confirm image input support for this model (the model is not listed in the model catalog, or the catalog is unavailable). This can recover later in the session, so a retry may succeed; otherwise ask the user to attach the image directly.]\n",
     };
-    const projected = try alloc.dupe(types.ChatMessage, messages);
-    for (projected) |*message| {
-        if (message.tool_result_memory) |*memory| {
-            if (memory.tool_images.len == 0 and memory.tool_image_handle == null) continue;
-            memory.tool_images = &.{};
-            const content = message.content orelse "";
-            const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, text_limit -| notice.len);
-            memory.truncated = memory.truncated or keep < content.len;
-            message.content = try std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, text_limit)], content[0..keep] });
-        }
+    var projected: ?[]types.ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        var memory = message.tool_result_memory orelse continue;
+        if (memory.tool_images.len == 0 and memory.tool_image_handle == null) continue;
+        const out = projected orelse try alloc.dupe(types.ChatMessage, messages);
+        projected = out;
+        memory.tool_images = &.{};
+        const content = message.content orelse "";
+        const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, text_limit -| notice.len);
+        memory.truncated = memory.truncated or keep < content.len;
+        out[index].tool_result_memory = memory;
+        out[index].content = try std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, text_limit)], content[0..keep] });
     }
-    return .{ .messages = projected, .stripped = true };
+    return .{ .messages = projected orelse messages, .stripped = projected != null };
 }
 
-test "projectToolImageMessages passes images through for native models" {
-    const alloc = std.testing.allocator;
-    const messages = [_]types.ChatMessage{.{
-        .role = .tool,
-        .content = "shot",
-        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
-    }};
-    const projected = try projectToolImageMessages(alloc, &messages, .native, false, 1024);
+fn freeProjection(alloc: Allocator, projection: ToolImageProjection) void {
+    if (!projection.stripped) return;
+    for (projection.messages) |message| alloc.free(message.content.?);
+    alloc.free(projection.messages);
+}
+
+const shot_messages = [_]types.ChatMessage{.{
+    .role = .tool,
+    .content = "shot",
+    .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+}};
+
+test "projectToolImageMessages passes images through when they are attached" {
+    const projected = try projectToolImageMessages(std.testing.allocator, &shot_messages, .attached, 1024);
     try std.testing.expect(!projected.stripped);
-    try std.testing.expect(projected.messages.ptr == (&messages).ptr);
+    try std.testing.expect(projected.messages.ptr == (&shot_messages).ptr);
 }
 
 test "projectToolImageMessages explains the vision fallback for non native models" {
     const alloc = std.testing.allocator;
-    const messages = [_]types.ChatMessage{.{
-        .role = .tool,
-        .content = "shot",
-        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
-    }};
-    const projected = try projectToolImageMessages(alloc, &messages, .non_native, true, 1024);
-    defer {
-        for (projected.messages) |message| alloc.free(message.content.?);
-        alloc.free(projected.messages);
-    }
+    const projected = try projectToolImageMessages(alloc, &shot_messages, .withheld_fallback, 1024);
+    defer freeProjection(alloc, projected);
     try std.testing.expect(projected.stripped);
     const memory = projected.messages[0].tool_result_memory.?;
     try std.testing.expectEqual(@as(usize, 0), memory.tool_images.len);
@@ -332,16 +326,8 @@ test "projectToolImageMessages explains the vision fallback for non native model
 
 test "projectToolImageMessages tells the truth when the catalog is unavailable" {
     const alloc = std.testing.allocator;
-    const messages = [_]types.ChatMessage{.{
-        .role = .tool,
-        .content = "shot",
-        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
-    }};
-    const projected = try projectToolImageMessages(alloc, &messages, .unknown, true, 1024);
-    defer {
-        for (projected.messages) |message| alloc.free(message.content.?);
-        alloc.free(projected.messages);
-    }
+    const projected = try projectToolImageMessages(alloc, &shot_messages, .withheld_unknown, 1024);
+    defer freeProjection(alloc, projected);
     try std.testing.expect(projected.stripped);
     const content = projected.messages[0].content.?;
     try std.testing.expect(std.mem.find(u8, content, "could not confirm image input support") != null);
@@ -350,30 +336,22 @@ test "projectToolImageMessages tells the truth when the catalog is unavailable" 
 
 test "projectToolImageMessages names the dead end when no fallback exists" {
     const alloc = std.testing.allocator;
-    const messages = [_]types.ChatMessage{.{
-        .role = .tool,
-        .content = "shot",
-        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
-    }};
-    const projected = try projectToolImageMessages(alloc, &messages, .non_native, false, 1024);
-    defer {
-        for (projected.messages) |message| alloc.free(message.content.?);
-        alloc.free(projected.messages);
-    }
+    const projected = try projectToolImageMessages(alloc, &shot_messages, .withheld_dead_end, 1024);
+    defer freeProjection(alloc, projected);
     try std.testing.expect(projected.stripped);
-    const content = projected.messages[0].content.?;
-    try std.testing.expect(std.mem.find(u8, content, "no vision fallback is available") != null);
+    try std.testing.expect(std.mem.find(u8, projected.messages[0].content.?, "no vision fallback is available") != null);
 }
 
 test "projectToolImageMessages leaves image free history untouched" {
-    const alloc = std.testing.allocator;
     const messages = [_]types.ChatMessage{.{
         .role = .tool,
         .content = "plain",
     }};
-    const projected = try projectToolImageMessages(alloc, &messages, .unknown, false, 1024);
-    try std.testing.expect(!projected.stripped);
-    try std.testing.expect(projected.messages.ptr == (&messages).ptr);
+    for ([_]image_route.ToolImages{ .none, .withheld_unknown }) |disposition| {
+        const projected = try projectToolImageMessages(std.testing.allocator, &messages, disposition, 1024);
+        try std.testing.expect(!projected.stripped);
+        try std.testing.expect(projected.messages.ptr == (&messages).ptr);
+    }
 }
 
 pub fn snapshotDynamicTools(alloc: Allocator, deps: *const @import("deps.zig").AgentRuntimeDeps, selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool)) ![]const agent_stream_provider.DynamicFunctionTool {

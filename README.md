@@ -143,7 +143,7 @@ fx/
 │   ├── tools/       built-in tools: files, shell, web, skills, subagents
 │   ├── ui/          terminal rendering and input
 │   ├── gateway/     model provider transport
-│   ├── mcp/         MCP v2 engine, behind FX_MCP_ENGINE=v2
+│   ├── mcp/         MCP engine
 │   └── acp/         Agent Client Protocol server
 ├── sdk/             libfx, the JavaScript library
 ├── tests/           end-to-end tests and model evals

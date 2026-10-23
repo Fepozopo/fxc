@@ -81,7 +81,7 @@ pub fn base_command_token(command: []const u8) ?[]const u8 {
     while (next_token(command, cursor)) |token| {
         if (is_env_assignment(token.text)) {
             if (!is_safe_env_assignment(token.text)) return null;
-            cursor = token.end;
+            cursor = word_end(command, token.start) orelse return null;
             continue;
         }
 
@@ -101,7 +101,7 @@ pub fn analysis_command_tail(command: []const u8) []const u8 {
     while (next_token(command, cursor)) |token| {
         if (is_env_assignment(token.text)) {
             if (!is_safe_env_assignment(token.text)) return original;
-            cursor = token.end;
+            cursor = word_end(command, token.start) orelse return original;
             peeled = true;
             continue;
         }
@@ -109,7 +109,7 @@ pub fn analysis_command_tail(command: []const u8) []const u8 {
         if (is_safe_env_command(token.text)) {
             const env_arg = next_token(command, token.end) orelse return original;
             if (!is_env_assignment(env_arg.text) or !is_safe_env_assignment(env_arg.text)) return original;
-            cursor = env_arg.end;
+            cursor = word_end(command, env_arg.start) orelse return original;
             peeled = true;
             continue;
         }
@@ -205,6 +205,41 @@ pub fn next_token(input: []const u8, start: usize) ?Token {
     var token_end = token_start;
     while (token_end < input.len and !is_whitespace(input[token_end])) : (token_end += 1) {}
     return .{ .text = input[token_start..token_end], .start = token_start, .end = token_end };
+}
+
+/// Where the shell word that starts at `start` ends, reading quotes and
+/// backslash escapes as the shell does, or null when a quote is never closed
+/// or the input ends in a backslash. `next_token` splits only on whitespace,
+/// so for `CI='x ls' rm` it would stop after `CI='x`.
+pub fn word_end(input: []const u8, start: usize) ?usize {
+    var in_single = false;
+    var in_double = false;
+    var i = start;
+    while (i < input.len) : (i += 1) {
+        const ch = input[i];
+        if (in_single) {
+            if (ch == '\'') in_single = false;
+            continue;
+        }
+        if (ch == '\\') {
+            if (i + 1 >= input.len) return null;
+            i += 1;
+            continue;
+        }
+        if (in_double) {
+            if (ch == '"') in_double = false;
+            continue;
+        }
+        if (ch == '\'') {
+            in_single = true;
+        } else if (ch == '"') {
+            in_double = true;
+        } else if (is_whitespace(ch)) {
+            break;
+        }
+    }
+    if (in_single or in_double) return null;
+    return i;
 }
 
 fn is_whitespace(ch: u8) bool {
@@ -434,4 +469,95 @@ test "terminal segment declines short circuit and background operators" {
 test "terminal segment ignores quoted pipe and rejects unbalanced quote" {
     try std.testing.expectEqualStrings("grep 'foo|bar' baz", terminal_exit_segment("grep 'foo|bar' baz").?);
     try std.testing.expect(terminal_exit_segment("grep 'foo bar") == null);
+}
+
+test "assignment values with quotes or escapes stay one word" {
+    for ([_][]const u8{ "CI='x ls' rm -rf .", "CI=\"x ls\" rm -rf .", "CI=x\\ ls rm -rf ." }) |command| {
+        try std.testing.expectEqualStrings("rm", base_command_token(command).?);
+        try std.testing.expectEqualStrings("rm -rf .", analysis_command_tail(command));
+    }
+    try std.testing.expectEqualStrings("rm -rf .", analysis_command_tail("env CI=x\\ ls rm -rf ."));
+    // The whole command is one assignment, so no command runs.
+    try std.testing.expect(base_command_token("CI=\\ [") == null);
+    try std.testing.expect(base_command_token("CI='x ls rm") == null);
+    try std.testing.expectEqualStrings("CI='x ls rm", analysis_command_tail("CI='x ls rm"));
+}
+
+test "word end reads quotes and escapes as the shell does" {
+    try std.testing.expectEqual(@as(?usize, 8), word_end("CI='x y' z", 0));
+    try std.testing.expectEqual(@as(?usize, 8), word_end("CI=\"x y\" z", 0));
+    try std.testing.expectEqual(@as(?usize, 7), word_end("CI=x\\ y z", 0));
+    try std.testing.expectEqual(@as(?usize, 4), word_end("CI=1", 0));
+    try std.testing.expect(word_end("CI='x", 0) == null);
+    try std.testing.expect(word_end("CI=x\\", 0) == null);
+}
+
+/// Pieces of generated commands: the wrappers and environment assignments
+/// the classifier peels, and the quotes and escapes that move a word boundary
+/// that a split on whitespace cannot see.
+const fuzz_fragments = [_][]const u8{
+    " ",    "\t",   "\n",   "ls",    "rm",   "grep",   "git",  "find",
+    "-rf",  "x",    "[",    "CI=",   "CI=1", "TERM=",  "FOO=", "env",
+    "nice", "-n",   "5",    "-5",    "time", "stdbuf", "-oL",  "timeout",
+    "10s",  "sudo", "bash", "nohup", "'",    "\"",     "\\",   "\\ ",
+    "|",    "&&",   "&",    ";",     ">",    "=",      "-",    "\u{e9}",
+};
+
+fn writeFuzzCommand(smith: *std.testing.Smith, out: *std.Io.Writer) std.Io.Writer.Error!void {
+    for (0..smith.valueRangeAtMost(u8, 0, 16)) |_| {
+        if (smith.boolWeighted(7, 1)) {
+            try out.writeAll(fuzz_fragments[smith.index(fuzz_fragments.len)]);
+            continue;
+        }
+        var raw: [4]u8 = undefined;
+        try out.writeAll(raw[0..smith.slice(&raw)]);
+    }
+}
+
+fn isWithin(outer: []const u8, inner: []const u8) bool {
+    const start = @intFromPtr(inner.ptr);
+    return start >= @intFromPtr(outer.ptr) and start + inner.len <= @intFromPtr(outer.ptr) + outer.len;
+}
+
+fn fuzzClassification(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writeFuzzCommand(smith, &writer) catch |err| switch (err) {
+        // A full buffer ends the command early, which is still a command.
+        error.WriteFailed => {},
+    };
+    const command = writer.buffered();
+
+    const tail = analysis_command_tail(command);
+    try std.testing.expect(isWithin(command, tail));
+    try std.testing.expectEqual(@intFromPtr(command.ptr) + command.len, @intFromPtr(tail.ptr) + tail.len);
+    if (terminal_exit_segment(command)) |segment| {
+        try std.testing.expect(isWithin(command, segment) and segment.len > 0);
+        try std.testing.expectEqualStrings(std.mem.trim(u8, segment, whitespace), segment);
+    }
+
+    const base = base_command_token(command) orelse return;
+    try std.testing.expect(isWithin(command, base));
+    try std.testing.expect(std.mem.findAny(u8, base, whitespace) == null);
+    // The base command is the first word the shell runs after the
+    // environment assignments. Callers look for shell operators before they
+    // ask for it, so only a simple command, with no operators, is compared.
+    var argv = lex.tokenize_argv(std.testing.allocator, command) catch return;
+    defer argv.deinit(std.testing.allocator);
+    for (argv.tokens) |token| {
+        if (!token.quoted and std.mem.findNone(u8, token.raw, "&|;<>(){}") == null) return;
+    }
+    for (argv.tokens) |token| {
+        if (is_env_assignment(token.value)) continue;
+        try std.testing.expectEqualStrings(token.value, base);
+        return;
+    }
+    // Every word the shell reads is an assignment, so no command runs.
+    return error.TestBaseCommandMissing;
+}
+
+test "classifying generated commands stays inside the command and agrees with the lexer" {
+    try std.testing.fuzz({}, fuzzClassification, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").command_classification.*),
+    });
 }

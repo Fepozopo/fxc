@@ -327,6 +327,8 @@ const agent = createFxAgent({
 });
 ```
 
+Name a model the plan serves, here or in `agent.session(id, { model })`. fx's default model is an AI Gateway id, so libfx refuses a Codex engine or session without one.
+
 libfx calls `credentials()` in whichever process runs the turn. It refreshes the credentials shortly before they expire and once after a rejected request, then passes the new ones to `onCredentials` for you to save. Codex doesn't accept requests from web pages, so these turns run on your server.
 
 To sign a user in, use `libfx/chatgpt`:
@@ -347,7 +349,7 @@ The sign-in uses the same OpenAI client as the Codex CLI, and the user's ChatGPT
 
 ### Grok plans
 
-`provider: "grok"` runs on a user's Grok plan, with the same `credentials` and `onCredentials` callbacks, called with `provider: "grok"`. libfx also checks that refreshed credentials still belong to the same xAI account. These turns run on your server too.
+`provider: "grok"` runs on a user's Grok plan, with the same `credentials` and `onCredentials` callbacks, called with `provider: "grok"`. It needs a Grok model too, such as `model: "grok-4.7"`; the AI Gateway id `spacexai/grok-4.7` doesn't work on a Grok plan. libfx also checks that refreshed credentials still belong to the same xAI account. These turns run on your server too.
 
 To sign a user in, use `libfx/grok`. Device code is the simplest:
 
@@ -437,7 +439,7 @@ const agent = createFxAgent({
 
 `wait.start` and `wait.end` describe actual input requests separately from permission evaluation. Their `kind` is `approval`, `question`, `mcp_form`, or `mcp_url`; request IDs pair outcomes, including denial, cancellation, and failure. Native delegation events carry the child session and durable work ID. Child events retain that work ID, their own session/turn/execution identity, and the root and parent session IDs, so the host can join them even if delivery interleaves.
 
-MCP events include the configured server, original remote tool name, and owning fx call ID. `mcp.request.data.requestIdKind` distinguishes a native JSON-RPC ID, an MCP-v2 engine handle, and an explicitly propagated host correlation token. Hooks don't change remote MCP requests by default: the host adapter emits `mcp.start` and `mcp.end` without adding metadata or emitting a request ID. Opt in with `createMcpAdapter(client, { propagateCorrelation: true })` to send an opaque UUID as `_meta["libfx/correlationId"]` and record it in `mcp.request`. It contains no internal execution/call IDs and doesn't request progress notifications. Give the adapter a `serverName` for a stable local identity; otherwise it uses the client's reported server name when available. Native resource/prompt operations also report their server and action.
+MCP events include the configured server, original remote tool name, and owning fx call ID. `mcp.request.data.requestIdKind` distinguishes a native JSON-RPC ID, an MCP engine handle, and an explicitly propagated host correlation token. Hooks don't change remote MCP requests by default: the host adapter emits `mcp.start` and `mcp.end` without adding metadata or emitting a request ID. Opt in with `createMcpAdapter(client, { propagateCorrelation: true })` to send an opaque UUID as `_meta["libfx/correlationId"]` and record it in `mcp.request`. It contains no internal execution/call IDs and doesn't request progress notifications. Give the adapter a `serverName` for a stable local identity; otherwise it uses the client's reported server name when available. Native resource/prompt operations also report their server and action.
 
 `mcp.end.status` uses `success`, `failure`, `cancelled`, `input_required`, `unavailable`, or `unknown`. Native tool/protocol failures map to `failure`; `unavailable` means no operation result was available, and `unknown` means observation couldn't classify a returned host result.
 

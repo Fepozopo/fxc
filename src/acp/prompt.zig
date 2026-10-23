@@ -38,7 +38,7 @@ const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const catalog_state = @import("../core/mcp/catalog_state.zig");
 const mcp_model_catalog = @import("../core/mcp/model_catalog.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
@@ -189,10 +189,13 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
     };
 }
 
-const ProviderTerminalPublication = enum {
-    not_applicable,
-    pending,
-    published,
+/// Where an announced tool-call card stands. A card is open until ACP sends
+/// its final update; a provider-executed search waits for its terminal
+/// lifecycle event instead of a tool result.
+const ToolCallCard = enum {
+    open,
+    awaiting_provider_terminal,
+    finished,
 };
 
 /// Pure final admission for every ACP model request. A persisted or
@@ -240,10 +243,10 @@ const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
     session_id: []const u8,
-    /// Tool-call IDs already announced with a pending update. Keys are owned
-    /// copies of provider call ids so the ID stays stable from permission
-    /// review through execution.
-    published_tool_calls: std.StringHashMapUnmanaged(ProviderTerminalPublication) = .empty,
+    /// Tool-call IDs already announced with a pending update, and where each
+    /// card stands. Keys are owned copies of provider call ids so the ID
+    /// stays stable from permission review through execution.
+    published_tool_calls: std.StringHashMapUnmanaged(ToolCallCard) = .empty,
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
@@ -323,10 +326,11 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
-    fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?mcp_runtime.McpRuntime.ToolIdentity {
+    fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?catalog_state.ToolIdentity {
         if (comptime host_target.is_wasm) return null;
-        const mcp = activeMcp(self) orelse return null;
-        return mcp.toolIdentity(arena, name) catch |err| {
+        const session = if (self.state.active_session) |*active| active else return null;
+        const h = session.mcp_host orelse return null;
+        return h.catalog.toolIdentity(arena, name) catch |err| {
             debug_trace.logf("acp", "tool call MCP identity unavailable tool={s} err={s}", .{ name, @errorName(err) });
             return null;
         };
@@ -334,7 +338,7 @@ const AcpContext = struct {
 
     /// Keeps the identity shown for `name` so session/load can replay it
     /// before its server reconnects. A failure costs only replay detail.
-    fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
+    fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: catalog_state.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
         // The session keeps the record as a setting (D46).
         const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else .none;
@@ -378,7 +382,7 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
-            if (tool_presentation.isProviderSearchAlias(call.name)) .pending else .not_applicable,
+            if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open,
         );
         return owned_id;
     }
@@ -389,8 +393,8 @@ const AcpContext = struct {
         outcome: types.ToolOutcome,
         result: ?[]const u8,
     ) !void {
-        const publication = self.published_tool_calls.getPtr(tool_call_id) orelse return;
-        if (publication.* != .pending) return;
+        const card = self.published_tool_calls.get(tool_call_id) orelse return;
+        if (card != .awaiting_provider_terminal) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
 
         const detail = if (self.state.cfg.minimal_kernel) result else null;
@@ -399,14 +403,29 @@ const AcpContext = struct {
             .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, detail orelse "Web search failed", null),
             .pending, .in_progress => unreachable,
         }
-        const updated = self.published_tool_calls.getPtr(tool_call_id) orelse
-            return error.ToolCallPublicationStateLost;
-        updated.* = .published;
     }
 
-    fn providerTerminalPublished(self: *const AcpContext, tool_call_id: []const u8) bool {
-        const publication = self.published_tool_calls.get(tool_call_id) orelse return false;
-        return publication == .published;
+    fn finalUpdateSent(self: *const AcpContext, tool_call_id: []const u8) bool {
+        const card = self.published_tool_calls.get(tool_call_id) orelse return false;
+        return card == .finished;
+    }
+
+    fn markCardFinished(self: *AcpContext, tool_call_id: []const u8) void {
+        if (self.published_tool_calls.getPtr(tool_call_id)) |card| card.* = .finished;
+    }
+
+    /// Sends a final failed update for every announced card that never got
+    /// one. A cancel can stop a step before some of its calls run, and a
+    /// failed or paused turn can end with a provider search still announced,
+    /// so the turn's end is the last point where the client can learn that.
+    fn finishOpenToolCalls(self: *AcpContext, text: []const u8) void {
+        var cards = self.published_tool_calls.iterator();
+        while (cards.next()) |entry| {
+            if (entry.value_ptr.* == .finished) continue;
+            self.sendToolCallError(entry.key_ptr.*, text) catch |err| {
+                debug_trace.logf("acp", "tool call card left open call_id={s} err={s}", .{ entry.key_ptr.*, @errorName(err) });
+            };
+        }
     }
 
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
@@ -439,6 +458,7 @@ const AcpContext = struct {
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
         try self.sendUpdate(out.writer.buffered());
+        self.markCardFinished(tool_call_id);
     }
 
     fn sendToolCallError(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8) !void {
@@ -450,6 +470,7 @@ const AcpContext = struct {
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
         try self.sendUpdate(out.writer.buffered());
+        self.markCardFinished(tool_call_id);
     }
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
@@ -549,18 +570,7 @@ const AcpContext = struct {
             },
         };
         if (comptime !host_target.is_wasm) {
-            if (session.mcp_host) |h| {
-                h.catalog.wire(&tc);
-            } else if (session.mcp != null) {
-                tc.mcp_ctx = @ptrCast(self);
-                tc.mcp_has_tool = mcpHasTool;
-                tc.mcp_validate_tool = mcpValidateTool;
-                tc.mcp_call_tool = mcpCallTool;
-                tc.mcp_search_tools = mcpSearchTools;
-                tc.mcp_tool_schema = mcpToolSchemaJson;
-                tc.mcp_snapshot_tool = mcpSnapshotTool;
-                tc.mcp_call_feature = mcpCallFeature;
-            }
+            if (session.mcp_host) |h| h.catalog.wire(&tc);
         }
         return tc;
     }
@@ -1054,8 +1064,6 @@ pub fn handlePrompt(
         try v2.beginTurn();
     }
 
-    if (comptime !host_target.is_wasm) connectHostChannelServers(session);
-
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
@@ -1342,18 +1350,6 @@ fn refreshProjectContext(
     };
 }
 
-/// Connects MCP servers the client serves over this ACP connection. This runs
-/// on the prompt worker because each discovery request waits for a reply that
-/// only the connection reader can deliver. A server that fails to connect is
-/// reported in the model's server catalog.
-fn connectHostChannelServers(session: *server.ActiveSessionState) void {
-    const mcp = session.mcp orelse return;
-    if (!mcp.hasPendingHostChannelServers()) return;
-    mcp.connectHostChannelServers(builtin_tools.registry, &session.cancel_flag) catch |err| {
-        debug_trace.logf("mcp", "ACP host-channel MCP servers did not connect err={s}", .{@errorName(err)});
-    };
-}
-
 /// Host tools plus every tool of the session's always-loaded MCP servers, so
 /// client-provided tools stay callable on each turn without a search. The
 /// result is allocated in `arena`, which must outlive the turn.
@@ -1364,12 +1360,7 @@ fn initialDynamicTools(
     const host_tools = ctx.state.host_tools.dynamic_tools;
     if (comptime host_target.is_wasm) return host_tools;
     const session = if (ctx.state.active_session) |*active| active else return host_tools;
-    const loaded = if (session.mcp) |mcp| try mcp.snapshotAlwaysLoadedTools(
-        arena,
-        session.permission_rules,
-        ctx.state.context_limits,
-        .unrestricted,
-    ) else if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
+    const loaded = if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
         arena,
         session.permission_rules,
         ctx.state.context_limits,
@@ -1933,13 +1924,13 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
-        .image_blob_dir = if (session.v2) |v2| v2.blobsPath() else null,
         .append_turn_piece = if (session.v2 != null)
             appendTurnPiece
         else if (session.journal != null)
             appendJournalToolIntent
         else
             null,
+        .save_prompt_images = if (session.v2 != null) savePromptImages else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
             .{
@@ -2223,6 +2214,31 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
     }
+    // The core reports no more tool events once a turn finishes, so close
+    // what it left open, as the terminal transcript does at the same point.
+    const cancel_requested = if (ctx.state.active_session) |*session| session.cancel_flag.load(.seq_cst) else false;
+    ctx.finishOpenToolCalls(unfinishedToolCallText(outcome, cancel_requested));
+}
+
+/// The text of the final update for a tool call a finished turn left open.
+/// It matches the terminal transcript's wording for the same outcome. A
+/// requested cancel reads as one even when the turn ends as failed.
+fn unfinishedToolCallText(outcome: types.TurnPresentationOutcome, cancel_requested: bool) []const u8 {
+    if (cancel_requested) return "Cancelled";
+    return switch (outcome) {
+        .completed => "Tool completion was not reported",
+        .interrupted => "Cancelled",
+        .failed => "Tool failed",
+        .paused => "Tool state preserved for recovery",
+    };
+}
+
+test "a tool call a finished turn left open reads as the turn's outcome" {
+    try std.testing.expectEqualStrings("Tool completion was not reported", unfinishedToolCallText(.completed, false));
+    try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.interrupted, false));
+    try std.testing.expectEqualStrings("Tool failed", unfinishedToolCallText(.failed, false));
+    try std.testing.expectEqualStrings("Tool state preserved for recovery", unfinishedToolCallText(.paused, false));
+    try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.failed, true));
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -2246,8 +2262,6 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     var snapshot = if (active_session) |session|
         if (session.mcp_host) |h|
             try h.catalog.modelSnapshot(arena)
-        else if (session.mcp) |mcp|
-            try mcp.snapshotModelCatalog(arena, session.permission_rules, false)
         else
             try mcp_model_catalog.Snapshot.empty(arena)
     else
@@ -2494,7 +2508,7 @@ fn lifecycleDynamicMcpToolAvailable(ctx: *AcpContext, name: []const u8, advertis
         const capabilities = h.catalog.runtimeCapabilities();
         return dynamicMcpToolAvailable(ctx.toolRegistry(), name, advertised_dynamic_tool_names, capabilities.context, capabilities.has_tool, .unrestricted);
     };
-    return dynamicMcpToolAvailable(ctx.toolRegistry(), name, advertised_dynamic_tool_names, @ptrCast(ctx), mcpHasTool, .unrestricted);
+    return false;
 }
 
 fn dynamicMcpToolAvailable(registry: tool_dispatch.Registry, name: []const u8, advertised_dynamic_tool_names: []const []const u8, mcp_ctx: ?*anyopaque, has_tool: ?McpHasToolFn, access: tool_mcp_runtime.Access) bool {
@@ -2707,11 +2721,12 @@ fn recordToolCallRejected(
     command_result_json: ?[]const u8,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    // A call named like a provider search gets its final update from the
-    // terminal lifecycle event, under the id it streamed with.
-    if (ctx.providerTerminalPublished(call.id)) return;
+    // A card gets one final update. A call named like a provider search is
+    // finished from the terminal lifecycle event, under the id it streamed
+    // with, before this hook runs.
+    if (ctx.finalUpdateSent(call.id)) return;
     if (call.provisional_id) |provisional_id| {
-        if (ctx.providerTerminalPublished(provisional_id)) return;
+        if (ctx.finalUpdateSent(provisional_id)) return;
     }
     const acp_id = ctx.sendToolCallPending(arena, call) catch "call_unknown";
     ctx.sendToolCallErrorWithCommandResult(
@@ -2771,6 +2786,21 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     const v2 = session.v2 orelse return;
     v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
+    };
+}
+
+/// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images become
+/// the session's blobs before its first request (D89). A failure leaves the
+/// rest inline, with no path, as the adapter does for one image the store
+/// refuses.
+fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    v2.savePromptImages(alloc, images) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_prompt_images_inline session={s} err={s}", .{ v2.id(), @errorName(err) });
     };
 }
 
@@ -3338,13 +3368,6 @@ fn requestAcpElicitation(
             responder.acp.session_id,
             responder.tool_call_id,
         )) return error.McpInputRequired;
-        if (activeMcp(responder.acp)) |runtime| {
-            runtime.reconcileLegacyUrlCompletion(
-                origin,
-                source_id,
-                server.legacyUrlCompletionSink(state),
-            );
-        }
     }
     defer if (legacy_source_id != null and !legacy_url_retained) {
         server.removeLegacyUrl(state, url_id.?);
@@ -3423,19 +3446,15 @@ fn requestAcpElicitation(
         .{},
     );
     var transition_state: mcp_elicitation.RequestState = .pending;
-    const live_witness = if (activeMcp(responder.acp)) |runtime|
-        runtime.inputIdentityWitness(origin.server_name)
-    else
-        null;
-    // MCP-v2 ties an answer to the call that asked, and drops it once that
+    // The MCP engine ties an answer to the call that asked, and drops it once that
     // call has ended, so its server counts as live here.
     const host_session = if (responder.acp.state.active_session) |*active| active.mcp_host != null else false;
     const transition = mcp_elicitation.decideTransition(
         transition_state,
         bindingForAcpInput(responder, origin),
-        answerBindingForAcpInput(responder, origin, live_witness),
+        answerBindingForAcpInput(responder, origin, null),
         acpAwakeMillis(),
-        live_witness != null or host_session,
+        host_session,
     );
     switch (transition) {
         .consume => transition_state = .consumed,
@@ -3446,14 +3465,10 @@ fn requestAcpElicitation(
     if (input_request.mode == .url and action == .accept) {
         if (legacy_source_id != null) {
             const sink = server.legacyUrlCompletionSink(state);
-            // MCP-v2's host has no generations to check: the sink takes the
+            // The MCP host has no generations to check: the sink takes the
             // consent itself.
-            const accept_result = if (activeMcp(responder.acp)) |runtime|
-                runtime.acceptLegacyUrlCompletion(origin, url_id.?, sink) orelse return error.McpInputRequired
-            else if (host_session)
-                sink.settleAccept(sink.accept(sink.context, origin, url_id.?)) orelse return error.McpInputRequired
-            else
-                return error.McpInputRequired;
+            if (!host_session) return error.McpInputRequired;
+            const accept_result = sink.settleAccept(sink.accept(sink.context, origin, url_id.?)) orelse return error.McpInputRequired;
             if (accept_result == .awaiting_completion) {
                 const retained_acp_id = try state.alloc.dupe(u8, url_id.?);
                 errdefer state.alloc.free(retained_acp_id);
@@ -3649,76 +3664,6 @@ fn finishAcpUrlElicitations(
     responder.accepted_legacy_urls.clearRetainingCapacity();
 }
 
-fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return false;
-    return mcp.hasToolWithAccess(name, access);
-}
-
-fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activeMcp(ctx) orelse return .not_available;
-    return runtime.validateToolArgumentsByNameWithAccess(
-        arena,
-        name,
-        arguments_json,
-        access,
-    );
-}
-
-fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return null;
-    return mcp.callToolByNameWithOptions(
-        arena,
-        name,
-        arguments_json,
-        max_tool_result_bytes,
-        options,
-    );
-}
-
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return error.McpServerNotFound;
-    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
-}
-
-fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activeMcp(ctx) orelse return .unavailable;
-    return runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
-}
-
-fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return null;
-    return mcp.toolSchemaJsonByNameWithAccess(
-        arena,
-        name,
-        permission_rules,
-        limits,
-        access,
-        cancel_flag,
-    );
-}
-
-fn mcpCallFeature(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    request: tool_mcp_runtime.FeatureRequest,
-    options: tool_mcp_runtime.FeatureCallOptions,
-) anyerror!tool_mcp_runtime.FeatureResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return error.McpRuntimeUnavailable;
-    return mcp.callFeatureForModel(arena, request, options);
-}
-
-fn activeMcp(ctx: *AcpContext) ?*mcp_runtime.McpRuntime {
-    const session = if (ctx.state.active_session) |*active| active else return null;
-    return session.mcp;
-}
-
 pub const mapToolKind = tool_call_presentation.mapToolKind;
 
 const acpToolName = tool_call_presentation.acpToolName;
@@ -3787,55 +3732,6 @@ test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
     const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"shell"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
     try std.testing.expect(!builtin);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-}
-
-test "ACP lifecycle resolves dynamic MCP availability through session context" {
-    const alloc = std.testing.allocator;
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
-    defer state.deinit();
-
-    const runtime = try alloc.create(mcp_runtime.McpRuntime);
-    runtime.* = mcp_runtime.McpRuntime.init(alloc);
-    var runtime_owned = true;
-    defer if (runtime_owned) {
-        runtime.deinit();
-        alloc.destroy(runtime);
-    };
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "fixture"),
-    });
-    const mcp_server = runtime.servers.items[0];
-    mcp_server.state.store(.ready, .release);
-    try mcp_server.tool_catalog.tools.append(alloc, .{
-        .original_name = try alloc.dupe(u8, "echo"),
-        .prefixed_name = try alloc.dupe(u8, "mcp_fixture_echo"),
-        .description = try alloc.dupe(u8, "Echo input"),
-        .input_schema_json = try alloc.dupe(u8, "{\"type\":\"object\"}"),
-        .tags = &.{},
-    });
-    state.active_session.?.mcp = runtime;
-    runtime_owned = false;
-
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-    try std.testing.expect(lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_fixture_echo",
-        &.{"mcp_fixture_echo"},
-    ));
-    try std.testing.expect(!lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_fixture_echo",
-        &.{},
-    ));
-    try std.testing.expect(!lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_missing",
-        &.{"mcp_missing"},
-    ));
 }
 
 test "mapToolKind maps common tools" {
@@ -5022,6 +4918,65 @@ test "ACP rejection of a finished provider search sends no second card or update
         try std.testing.expect(std.mem.find(u8, line, "exa_search") == null);
     }
     try std.testing.expectEqual(@as(usize, 2), updates);
+}
+
+test "ACP finishes each open tool-call card once when a turn is cancelled" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-cancelled-cards.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+
+    for ([_][]const u8{ "ran", "skipped" }) |call_id| {
+        try pushToolLifecycle(&ctx, .{ .authoritative_started = .{
+            .id = .{ .turn_id = 1, .call_id = call_id },
+            .reconciles_provisional_call_id = null,
+            .tool_name = "read_file",
+            .activity_kind = .read,
+            .arguments_json = "{\"path\":\"README.md\"}",
+        } });
+    }
+    try ctx.sendToolCallCompletedWithCommandResult("ran", "read", null);
+    ctx.finishOpenToolCalls("Cancelled");
+    ctx.finishOpenToolCalls("Cancelled");
+    try capture.sync(io_mod.getIo());
+
+    var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-cancelled-cards.jsonl", .{});
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
+    var lines = std.mem.splitScalar(u8, captured, '\n');
+    var finals: [2]usize = .{ 0, 0 };
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        const update = parsed.value.object.get("params").?.object.get("update").?.object;
+        if (!std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call_update")) continue;
+        const status = update.get("status").?.string;
+        if (std.mem.eql(u8, update.get("toolCallId").?.string, "ran")) {
+            try std.testing.expectEqualStrings("completed", status);
+            finals[0] += 1;
+        } else {
+            try std.testing.expectEqualStrings("failed", status);
+            try std.testing.expectEqualStrings(
+                "Cancelled",
+                update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
+            );
+            finals[1] += 1;
+        }
+    }
+    try std.testing.expectEqual([2]usize{ 1, 1 }, finals);
 }
 
 test "ACP propagateGrant stores deduped runtime session grants" {

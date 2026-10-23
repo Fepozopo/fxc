@@ -54,6 +54,7 @@ const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const runtime_vision_contracts = @import("vision_contracts.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
+const image_route = @import("../../images/image_route.zig");
 const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
@@ -260,6 +261,26 @@ fn append_immediate_steering_after_cancel(
         });
     }
     try append_steering_guidance(arena, within_turn_suffix, guidance, .root);
+    return true;
+}
+
+/// Continues the turn with steering that waited out a Stop hook which allowed
+/// the reply, such as steering submitted while a provider-executed tool's
+/// step still counted as running. The reply stays in the turn, and the next
+/// one runs the hook again, as after steering that cancelled the hook.
+fn continue_steering_after_stop(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    turn_id: u64,
+    origin: runtime_config.TurnOrigin,
+    stop_state: *CommonStopState,
+) !bool {
+    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, origin, .finalizing);
+    if (action != .continued) return false;
+    stop_state.retained_candidate = null;
+    stop_state.latest_partial = null;
+    stop_state.dispatched = false;
     return true;
 }
 
@@ -3465,9 +3486,10 @@ fn streamReplaySafe(
 }
 
 /// Whether the current attempt has shown no output. A provider refuses a
-/// request for its size before any output, so a reply an earlier attempt
-/// streamed, such as one restored when a turn resumes, does not make sending
-/// it again with fewer images unsafe.
+/// request for its size or its context before any output, so a reply an
+/// earlier attempt streamed, such as one restarted or restored when a turn
+/// resumes, does not make sending it again with fewer images or a compacted
+/// conversation unsafe.
 fn attemptReplaySafe(
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) bool {
@@ -4668,12 +4690,11 @@ fn fitRequestImages(
     first_body: []const u8,
     limits: request_image_budget.Limits,
     tool_text_limit: usize,
-    blob_dir: ?[]const u8,
     trace_ctx: TraceContext,
 ) ![]const u8 {
     var body = first_body;
     while (true) {
-        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit, blob_dir);
+        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit);
         if (projection.withheld == 0) return body;
         var smaller = request.*;
         smaller.messages = projection.messages;
@@ -5960,6 +5981,19 @@ fn processQueuedPromptInner(
         try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
     }
 
+    // The turn's images are saved before any request is built, so a note
+    // never names a file the session failed to write (D89,
+    // `tests/tla/session_manager/PromptImages.tla` NoteNamesBlob). The copy
+    // borrows the worker's fields; only what the save sets lives in this
+    // arena, and a saved image keeps only its handle.
+    if (deps.save_prompt_images) |save| {
+        if (job.images.len > 0) {
+            const images = try arena.dupe(types.ImageAttachment, job.images);
+            try save(deps.ctx, arena, images);
+            job.images = images;
+        }
+    }
+
     const current_user_message: ChatMessage = .{
         .role = .user,
         .content = if (job.delivery.isContinuation())
@@ -6196,98 +6230,42 @@ fn buildToolExecutionRootUserContext(
     );
 }
 
-const ImageRoute = enum {
-    native,
-    fallback,
-    unavailable,
-};
-
-const VisionPolicy = struct {
-    route: ImageRoute,
-    mode: runtime_gateway_step.VisionToolMode,
-};
-
-fn visionPolicy(
-    image_input_support: model_capabilities.ImageInputSupport,
-    fallback_available: bool,
-    tool_registered: bool,
-    pending_images: bool,
-) VisionPolicy {
-    return switch (image_input_support) {
-        .native => .{ .route = .native, .mode = .unavailable },
-        .unknown => .{ .route = .unavailable, .mode = .unavailable },
-        .non_native => if (!fallback_available or !tool_registered)
-            .{ .route = .unavailable, .mode = .unavailable }
-        else
-            .{
-                .route = .fallback,
-                .mode = if (pending_images) .required else .optional,
-            },
+/// The vision tool mode the request offers, for the mode the image route chose.
+fn visionToolMode(mode: image_route.VisionMode) runtime_gateway_step.VisionToolMode {
+    return switch (mode) {
+        .unavailable => .unavailable,
+        .optional => .optional,
+        .required => .required,
     };
 }
 
-test "vision policy keeps image route and tool visibility coherent" {
-    const cases = [_]struct {
-        image_input_support: model_capabilities.ImageInputSupport,
-        fallback_available: bool,
-        tool_registered: bool,
-        pending_images: bool,
-        expected_route: ImageRoute,
-        expected_mode: runtime_gateway_step.VisionToolMode,
-    }{
-        .{ .image_input_support = .native, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .native, .expected_mode = .unavailable },
-        .{ .image_input_support = .native, .fallback_available = false, .tool_registered = false, .pending_images = false, .expected_route = .native, .expected_mode = .unavailable },
-        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .fallback, .expected_mode = .required },
-        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = true, .pending_images = false, .expected_route = .fallback, .expected_mode = .optional },
-        .{ .image_input_support = .non_native, .fallback_available = false, .tool_registered = true, .pending_images = true, .expected_route = .unavailable, .expected_mode = .unavailable },
-        .{ .image_input_support = .non_native, .fallback_available = true, .tool_registered = false, .pending_images = false, .expected_route = .unavailable, .expected_mode = .unavailable },
-        .{ .image_input_support = .unknown, .fallback_available = true, .tool_registered = true, .pending_images = true, .expected_route = .unavailable, .expected_mode = .unavailable },
-    };
-
-    for (cases) |case| {
-        const policy = visionPolicy(
-            case.image_input_support,
-            case.fallback_available,
-            case.tool_registered,
-            case.pending_images,
-        );
-        try std.testing.expectEqual(case.expected_route, policy.route);
-        try std.testing.expectEqual(case.expected_mode, policy.mode);
-        try std.testing.expect((policy.route == .fallback) == (policy.mode != .unavailable));
-    }
-
-    const support_values = [_]model_capabilities.ImageInputSupport{
-        .unknown,
-        .non_native,
-        .native,
-    };
-    const boolean_values = [_]bool{ false, true };
-    for (support_values) |support| {
-        for (boolean_values) |fallback_available| {
-            for (boolean_values) |tool_registered| {
-                for (boolean_values) |pending_images| {
-                    const policy = visionPolicy(
-                        support,
-                        fallback_available,
-                        tool_registered,
-                        pending_images,
-                    );
-                    try std.testing.expect((policy.route == .fallback) == (policy.mode != .unavailable));
-                    if (support == .native) {
-                        try std.testing.expectEqual(ImageRoute.native, policy.route);
-                        try std.testing.expectEqual(runtime_gateway_step.VisionToolMode.unavailable, policy.mode);
-                    }
-                    if (support == .unknown) {
-                        try std.testing.expectEqual(ImageRoute.unavailable, policy.route);
-                        try std.testing.expectEqual(runtime_gateway_step.VisionToolMode.unavailable, policy.mode);
-                    }
-                    if (!fallback_available or !tool_registered) {
-                        try std.testing.expect(policy.mode == .unavailable or support == .native);
-                    }
-                }
-            }
+/// Whether a tool image in `messages` still reaches the request: one the
+/// session keeps, or a handle to materialize. `image_attachments.withholdDroppedImages`
+/// turns the others into notes.
+fn requestHasToolImages(messages: []const ChatMessage) bool {
+    for (messages) |message| {
+        const memory = message.tool_result_memory orelse continue;
+        if (memory.tool_image_handle != null) return true;
+        for (memory.tool_images) |image| {
+            if (!image.droppedFromSession()) return true;
         }
     }
+    return false;
+}
+
+test "requestHasToolImages ignores images the session dropped" {
+    var kept_bytes = "png".*;
+    var mime = "image/png".*;
+    const kept = [_]types.ToolImage{.{ .data = &kept_bytes, .mime_type = &mime }};
+    const dropped = [_]types.ToolImage{.{ .data = &.{}, .mime_type = &mime, .name = @as([64]u8, @splat('0')) }};
+    const with_kept = [_]ChatMessage{.{ .role = .tool, .content = "a", .tool_result_memory = .{ .tool_images = @constCast(&kept) } }};
+    const with_dropped = [_]ChatMessage{.{ .role = .tool, .content = "b", .tool_result_memory = .{ .tool_images = @constCast(&dropped) } }};
+    const with_handle = [_]ChatMessage{.{ .role = .tool, .content = "c", .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") } }};
+    const plain = [_]ChatMessage{.{ .role = .tool, .content = "d" }};
+    try std.testing.expect(requestHasToolImages(&with_kept));
+    try std.testing.expect(!requestHasToolImages(&with_dropped));
+    try std.testing.expect(requestHasToolImages(&with_handle));
+    try std.testing.expect(!requestHasToolImages(&plain));
 }
 
 fn buildProviderPromptForCompactionWindow(
@@ -6958,7 +6936,9 @@ fn processQueuedPromptLoop(
     agent: *runtime_agent.Agent,
 ) !void {
     var request_capabilities = initial_request_capabilities;
-    var tool_image_capabilities_resolved = false;
+    // The image route core's turn state. This loop is its shell: it runs each
+    // effect `image_route.step` returns and feeds the result back.
+    var image_route_state = image_route.step(.{}, .{ .turn_started = request_capabilities.image_input_support }).state;
     var stable_prefix = stable_prefix_ptr.*;
     defer stable_prefix_ptr.* = stable_prefix;
     const history_messages = history_messages_ptr.*;
@@ -7094,7 +7074,6 @@ fn processQueuedPromptLoop(
         selected_fast_mode;
     var fast_unavailable_notified = false;
     var ultrafast_unconfirmed_notified = false;
-    var tool_image_strip_notified = false;
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
@@ -7387,41 +7366,81 @@ fn processQueuedPromptLoop(
             gateway_messages = provider_prompt.messages;
             current_user_message_index = provider_prompt.current_user_index;
             debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_instructions.items.len + gateway_messages.items.len });
-            const vision_policy = visionPolicy(
-                request_capabilities.image_input_support,
-                config.provider_capabilities.vision_fallback,
-                deps.tool_registry.lookup("vision") != null,
-                pending_image_ids.len > 0,
-            );
-            const vision_route: runtime_vision_contracts.VisionRoute = if (vision_policy.route == .fallback)
-                .text_only
-            else
-                .native_images;
-            const vision_mode = vision_policy.mode;
-            debug_trace.eventf(
-                "agent",
-                "vision_policy",
-                step_ctx,
-                "model={s} image_support={s} route={s} mode={s} pending_images={d}",
-                .{
-                    gateway_model,
-                    @tagName(request_capabilities.image_input_support),
-                    @tagName(vision_policy.route),
-                    @tagName(vision_mode),
-                    pending_image_ids.len,
-                },
-            );
             try appendRecoveryConversationContext(
                 overlay_arena,
                 &gateway_messages,
                 recovery_strategy,
             );
             const recovery_source_messages = gateway_messages.items;
+            // One image decision per request, read from one capability
+            // snapshot: the core asks for capabilities first when it must,
+            // and every route, mode, and tool image choice below follows the
+            // decision it returns (`tests/tla/image_route/spec/ImageRoute.tla`
+            // OneSnapshot).
+            var image_event: image_route.Event = .{ .request_ready = .{
+                .user_images = job.authorized_image_catalog.len > 0 or job.images.len > 0,
+                .pending_images = pending_image_ids.len > 0,
+                .tool_images = requestHasToolImages(recovery_source_messages),
+                .fallback = config.provider_capabilities.vision_fallback and deps.tool_registry.lookup("vision") != null,
+                .catalog_down = if (deps.model_catalog_unavailable) |unavailable| unavailable(deps.ctx) else false,
+            } };
+            var image_decision: ?image_route.Decision = null;
+            var image_failure: ?image_route.FailReason = null;
+            var notify_catalog_down = false;
+            // Ends: the core asks for capabilities at most once per turn, and
+            // its reply never asks again (ImageRoute.tla ResolveOncePerTurn).
+            while (true) {
+                const image_out = image_route.step(image_route_state, image_event);
+                image_route_state = image_out.state;
+                var reply: ?image_route.Event = null;
+                for (image_out.effects()) |effect| switch (effect) {
+                    .resolve_capabilities => {
+                        request_capabilities = try deps.resolve_model_capabilities(deps.ctx, overlay_arena, gateway_model);
+                        reply = .{ .capabilities_resolved = request_capabilities.image_input_support };
+                    },
+                    .notify_catalog_down => notify_catalog_down = true,
+                    .send => |chosen| image_decision = chosen,
+                    .fail => |reason| image_failure = reason,
+                };
+                image_event = reply orelse break;
+            }
+            if (image_failure) |reason| switch (reason) {
+                .capability_unknown => {
+                    diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
+                    return error.ModelImageCapabilityUnavailable;
+                },
+                .no_native_image => {
+                    diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=non_native err=SubscriptionNativeImageUnavailable", .{gateway_model});
+                    return error.SubscriptionNativeImageUnavailable;
+                },
+            };
+            // Each request ends in exactly one send or fail (ImageRoute.tla
+            // Answered), so a missing decision is a bug in the core.
+            const image_choice = image_decision.?;
+            const vision_route: runtime_vision_contracts.VisionRoute = if (image_choice.route == .fallback)
+                .text_only
+            else
+                .native_images;
+            const vision_mode = visionToolMode(image_choice.mode);
+            debug_trace.eventf(
+                "agent",
+                "vision_policy",
+                step_ctx,
+                "model={s} image_support={s} route={s} mode={s} pending_images={d} tool_images={s}",
+                .{
+                    gateway_model,
+                    @tagName(image_route_state.support),
+                    @tagName(image_choice.route),
+                    @tagName(image_choice.mode),
+                    pending_image_ids.len,
+                    @tagName(image_choice.tool_images),
+                },
+            );
             const projected_request_messages = blk: {
                 if (job.authorized_image_catalog.len == 0 and job.images.len == 0) {
                     break :blk recovery_source_messages;
                 }
-                break :blk switch (vision_policy.route) {
+                break :blk switch (image_choice.route) {
                     .native => try runtime_vision_contracts.project_native_messages(
                         overlay_arena,
                         recovery_source_messages,
@@ -7440,20 +7459,11 @@ fn processQueuedPromptLoop(
                             job.authorized_image_catalog,
                         );
                     },
-                    .unavailable => switch (request_capabilities.image_input_support) {
-                        .unknown => {
-                            diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
-                            return error.ModelImageCapabilityUnavailable;
-                        },
-                        .non_native => {
-                            diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=non_native err=SubscriptionNativeImageUnavailable", .{gateway_model});
-                            return error.SubscriptionNativeImageUnavailable;
-                        },
-                        .native => unreachable,
-                    },
+                    // The core fails a request whose user images have no route.
+                    .unavailable => unreachable,
                 };
             };
-            if (vision_policy.route == .native and projected_request_messages.len < recovery_source_messages.len) {
+            if (image_choice.route == .native and projected_request_messages.len < recovery_source_messages.len) {
                 debug_trace.logf("history", "native_vision_history_projected removed_messages={d} reason=native_image_input", .{
                     recovery_source_messages.len - projected_request_messages.len,
                 });
@@ -7500,16 +7510,7 @@ fn processQueuedPromptLoop(
                 read_tool_result_request_eligible,
                 subagent_request_messages,
             ));
-            if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
-                for (result_request_messages) |message| {
-                    const memory = message.tool_result_memory orelse continue;
-                    if (memory.tool_images.len == 0 and memory.tool_image_handle == null) continue;
-                    request_capabilities = try deps.resolve_model_capabilities(deps.ctx, overlay_arena, gateway_model);
-                    tool_image_capabilities_resolved = true;
-                    break;
-                }
-            }
-            const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
+            const materialized_messages = if (image_choice.route == .native) native: {
                 const loaded_messages = try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages);
                 const max_dimension = image_data.requestMaxDimension(image_data.countRequestImages(loaded_messages));
                 const safe_tool_messages = try runtime_execution_memory.withholdRequestToolImages(overlay_arena, loaded_messages, max_dimension, config.max_tool_result_bytes);
@@ -7519,31 +7520,26 @@ fn processQueuedPromptLoop(
                     &attachment_dimensions,
                     safe_tool_messages,
                     max_dimension,
-                    deps.image_blob_dir,
                 );
                 break :native projection.messages;
             } else result_request_messages;
-            const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
+            const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, image_choice.tool_images, config.max_tool_result_bytes);
             // Saved turns keep steering without its envelope; the model gets it
             // back as the live update it saw when the turn took it.
             const steering_messages = try runtime_execution_memory.rewrapRestoredSteering(overlay_arena, image_projection.messages);
             // After the steering rewrap, which recognizes a parent's steering
             // by how its text starts.
-            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages, deps.image_blob_dir);
+            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
             if (request_messages.ptr != located_messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
             }
             // Tool images withheld because the catalog could not confirm image
-            // input are invisible in the transcript otherwise. Tell the user
-            // once per turn, and only when the catalog itself is known to be
-            // down; a confirmed model without image input relies on the
-            // model-facing notice instead.
-            if (image_projection.stripped and !tool_image_strip_notified and
-                request_capabilities.image_input_support == .unknown and
-                deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
-            {
-                tool_image_strip_notified = true;
+            // input are invisible in the transcript otherwise. The core asks
+            // to tell the user once per turn, and only when the catalog itself
+            // is known to be down; a confirmed model without image input
+            // relies on the model-facing notice instead.
+            if (notify_catalog_down) {
                 try deps.push_text(deps.ctx, .{ .operational = "Images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers." });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
@@ -7595,7 +7591,6 @@ fn processQueuedPromptLoop(
                 request_data.messages,
                 request_image_budget.largestRequestBytes(agent.requestByteLimit(gateway_model)),
                 config.max_tool_result_bytes,
-                deps.image_blob_dir,
             );
             if (past_limit.withheld > 0) {
                 debug_trace.eventf("images", "request_images_withheld_before_build", step_ctx, "withheld={d}", .{past_limit.withheld});
@@ -7618,7 +7613,6 @@ fn processQueuedPromptLoop(
                         deps.agent_stream_provider.max_request_bytes,
                     ) },
                     config.max_tool_result_bytes,
-                    deps.image_blob_dir,
                     step_ctx,
                 );
                 prepared_request_body = request_body;
@@ -8459,7 +8453,7 @@ fn processQueuedPromptLoop(
                 if (shouldRecoverContextOverflow(
                     failure,
                     has_compactable_context,
-                    streamReplaySafe(&stream_ctx),
+                    attemptReplaySafe(&stream_ctx),
                     context_overflow_recovery == .ready,
                     config.cancel_flag.load(.seq_cst),
                 )) {
@@ -9798,6 +9792,9 @@ fn processQueuedPromptLoop(
             stop_state.dispatched = true;
             switch (stop_outcome) {
                 .allow => {
+                    if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,
@@ -12599,6 +12596,17 @@ fn processQueuedPromptLoop(
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
+                    if (try append_immediate_steering_after_cancel(
+                        deps,
+                        arena,
+                        &within_turn_suffix,
+                        turn_id,
+                        "",
+                    )) {
+                        stop_state.retained_candidate = null;
+                        stop_state.latest_partial = null;
+                        continue :agent_steps_loop;
+                    }
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try runtime_interruption.persistInterruptedTurnOnce(
                         deps,
@@ -12622,6 +12630,9 @@ fn processQueuedPromptLoop(
             stop_state.dispatched = true;
             switch (stop_outcome) {
                 .allow => {
+                    if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,

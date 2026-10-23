@@ -114,13 +114,7 @@ await waitFor(() => terminal.buffer.active.type === "normal", "full transcript c
 
 await command("/login", "Vercel sign-in failed. The current credential is unchanged.");
 await command("/resume", "Session resume is owned by the embedding SDK");
-runtime.write("/mcp list\r");
-await waitFor(
-  () => grid().includes("MCP 0") && grid().includes("[Servers]") && grid().includes("No MCP servers configured"),
-  "MCP server menu",
-);
-runtime.write("\x1b");
-await waitFor(() => !grid().includes("[Servers]"), "MCP server menu close");
+await command("/mcp list", "MCP servers are unavailable in this host");
 await command("/skills list", "Skills are unavailable in this host");
 
 runtime.write("/model\r");

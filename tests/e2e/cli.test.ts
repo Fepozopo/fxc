@@ -5363,8 +5363,8 @@ describe("cli: workspace access", () => {
   );
 });
 
-describe("cli: MCP profile add", () => {
-  test("status and doctor inspect MCP without transport while list --connect discovers it", async () => {
+describe("cli: MCP profile", () => {
+  test("status, doctor, and list start no MCP server, and show connects one", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-inspect-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -5379,7 +5379,7 @@ describe("cli: MCP profile add", () => {
           fixture: {
             type: "local",
             command: [process.execPath, MODERN_MCP_FIXTURE],
-            environment: { FX_MCP_PID_PATH: pidPath, FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+            environment: { FX_MCP_PID_PATH: pidPath },
           },
         },
       }),
@@ -5407,229 +5407,59 @@ describe("cli: MCP profile add", () => {
       );
       expect(existsSync(pidPath)).toBe(false);
 
-      const passive = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(passive.code).toBe(0);
-      expect(passive.stdout).toContain("state=disconnected");
+      const listed = await runFx(["mcp", "list"], { cwd: workspace, env });
+      expect(listed.code).toBe(0);
+      expect(listed.stdout).toMatch(/fixture +~\/\.fx\/mcp\.json +stdio +not started/);
       expect(existsSync(pidPath)).toBe(false);
 
-      const connected = await runFx(
-        ["mcp", "list", "--connect"],
+      const shown = await runFx(
+        ["mcp", "show", "fixture"],
         { cwd: workspace, env, timeoutMs: TIMEOUT },
       );
-      expect(connected.code).toBe(0);
-      expect(connected.stderr).toBe("");
-      expect(connected.stdout).toContain("state=ready");
-      expect(connected.stdout).toContain("tools=1");
+      expect(shown.code).toBe(0);
+      expect(shown.stderr).toBe("");
+      expect(shown.stdout).toContain("ready, 1 tool");
       expect(existsSync(pidPath)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("lists paths and removes profile servers without launching MCP transport", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-manage-")));
+  test("add refuses a profile with both mcp and mcpServers and leaves it as it was", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-keys-")));
     const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const profileMarker = join(root, "profile-launched");
-    const workspaceMarker = join(root, "workspace-launched");
-    mkdirSync(join(home, ".fx"), { recursive: true });
-    mkdirSync(workspace, { recursive: true });
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
-    writeFileSync(
-      join(home, ".fx", "mcp.json"),
-      JSON.stringify({
-        mcp: {
-          shared: {
-            command: ["/bin/sh", "-c", `touch ${profileMarker}`],
-          },
-        },
-      }),
-    );
-    writeFileSync(
-      join(workspace, ".mcp.json"),
-      JSON.stringify({
-        mcpServers: {
-          shared: {
-            command: "/bin/sh",
-            args: ["-c", `touch ${workspaceMarker}`],
-          },
-          "workspace-only": {
-            command: "/bin/sh",
-            args: ["-c", `touch ${workspaceMarker}`],
-          },
-          broken: {
-            command: "${MISSING_LIST_COMMAND}",
-          },
-        },
-      }),
-    );
-    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    const profilePath = join(home, ".fx", "mcp.json");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    const both = JSON.stringify({
+      mcp: { alpha: { command: "alpha-server" } },
+      mcpServers: { beta: { command: "beta-server" } },
+    });
+    writeFileSync(profilePath, both, { mode: 0o600 });
     try {
-      const path = await runFx(["mcp", "path"], { cwd: workspace, env });
-      expect(path.code).toBe(0);
-      expect(path.stderr).toBe("");
-      expect(path.stdout.trim()).toBe(join(home, ".fx", "mcp.json"));
-
-      const before = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(before.code).toBe(0);
-      expect(before.stderr).toBe("");
-      expect(before.stdout).toMatch(/shared source=profile scope=profile/);
-      expect(before.stdout).toMatch(
-        /workspace-only source=workspace scope=workspace/,
-      );
-      expect(before.stdout).not.toMatch(/shared source=workspace scope=workspace/);
-      expect(before.stdout).not.toContain("MISSING_LIST_COMMAND");
-      expect(existsSync(profileMarker)).toBe(false);
-      expect(existsSync(workspaceMarker)).toBe(false);
-
-      const removed = await runFx(["mcp", "remove", "shared"], {
-        cwd: workspace,
-        env,
-      });
-      expect(removed.code).toBe(0);
-      expect(removed.stderr).toBe("");
-      expect(removed.stdout).toContain("Removed MCP server 'shared'");
-      expect(JSON.parse(readFileSync(join(home, ".fx", "mcp.json"), "utf8")))
-        .toEqual({ mcp: {} });
-
-      const after = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(after.code).toBe(0);
-      expect(after.stdout).toMatch(/shared source=workspace scope=workspace/);
-      expect(existsSync(profileMarker)).toBe(false);
-      expect(existsSync(workspaceMarker)).toBe(false);
-
-      const missing = await runFx(["mcp", "remove", "missing"], {
-        cwd: workspace,
-        env,
-      });
-      expect(missing.code).not.toBe(0);
-      expect(missing.stderr).toContain("MCP server 'missing' was not found");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("adds local and HTTP servers without launching either server", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-add-")));
-    const home = join(root, "home");
-    const marker = join(root, "launched");
-    mkdirSync(home, { recursive: true });
-    try {
-      const help = await runFx(["mcp", "--help"], {
-        env: { HOME: home, ...NO_GATEWAY_AUTH },
-      });
-      expect(help.code).toBe(0);
-      for (const command of [
-        "fx mcp add NAME COMMAND [ARGS...]",
-        "fx mcp auth NAME",
-        "fx mcp list",
-        "fx mcp logout NAME",
-        "fx mcp path",
-        "fx mcp remove NAME",
-        "fx mcp trust approve|reject NAME",
-        "fx mcp trust approve-all|reset",
-      ]) expect(help.stdout).toContain(command);
-
-      const local = await runFx(
-        ["mcp", "add", "local", "/bin/sh", "-c", `touch ${marker}`],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      const bare = await runFx(["mcp"], { env: { HOME: home, ...NO_GATEWAY_AUTH } });
-      expect(bare.code).toBe(0);
-      expect(bare.stdout).toBe(help.stdout);
-      expect(existsSync(marker)).toBe(false);
-      const missingAuthName = await runFx(["mcp", "auth"], {
-        env: { HOME: home, ...NO_GATEWAY_AUTH },
-      });
-      expect(missingAuthName.code).toBe(1);
-      expect(missingAuthName.stderr).toBe("usage: fx mcp auth NAME\n");
-      expect(existsSync(marker)).toBe(false);
-      expect(local.code).toBe(0);
-      expect(local.stderr).toBe("");
-      expect(local.stdout).toContain("Saved MCP server 'local'");
-      expect(existsSync(marker)).toBe(false);
-
-      const remote = await runFx(
-        [
-          "mcp",
-          "add",
-          "--transport",
-          "http",
-          "remote",
-          "https://example.test/mcp",
-        ],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      expect(remote.code).toBe(0);
-      expect(remote.stderr).toBe("");
-
-      const profile = JSON.parse(
-        readFileSync(join(home, ".fx", "mcp.json"), "utf8"),
-      );
-      expect(profile).not.toHaveProperty("mcpServers");
-      expect(profile.mcp.local.command).toEqual([
-        "/bin/sh",
-        "-c",
-        `touch ${marker}`,
-      ]);
-      expect(profile.mcp.remote).toMatchObject({
-        type: "http",
-        url: "https://example.test/mcp",
-      });
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("canonicalizes alias input and refuses ambiguous server-like keys", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-alias-")));
-    const home = join(root, "home");
-    const fxDir = join(home, ".fx");
-    mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-    const profilePath = join(fxDir, "mcp.json");
-    try {
-      writeFileSync(
-        profilePath,
-        JSON.stringify({ mcpServers: { old: { command: "old-server" } } }),
-        { mode: 0o600 },
-      );
-      const migrated = await runFx(
-        ["mcp", "add", "new", "new-server"],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      expect(migrated.code).toBe(0);
-      const canonical = JSON.parse(readFileSync(profilePath, "utf8"));
-      expect(Object.keys(canonical.mcp).sort()).toEqual(["new", "old"]);
-      expect(canonical).not.toHaveProperty("mcpServers");
-
-      const ambiguous = JSON.stringify({
-        mcp: { canonical: { command: "canonical-server" } },
-        "MCP-Servers": { blocked: { command: "blocked-server" } },
-        metadata: { owner: "team" },
-      });
-      writeFileSync(profilePath, ambiguous, { mode: 0o600 });
       const refused = await runFx(
-        ["mcp", "add", "unsafe", "must-not-save"],
+        ["mcp", "add", "gamma", "--", "gamma-server"],
         { env: { HOME: home, ...NO_GATEWAY_AUTH } },
       );
-      expect(refused.code).not.toBe(0);
-      expect(refused.stderr).toContain("McpConfigAmbiguousServerKey");
-      expect(readFileSync(profilePath, "utf8")).toBe(ambiguous);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toBe(
+          "Couldn't add gamma to ~/.fx/mcp.json: the file has both \"mcp\" and \"mcpServers\"; merge them into one.\n",
+      );
+      expect(readFileSync(profilePath, "utf8")).toBe(both);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("serializes concurrent different-name additions", async () => {
+  test("concurrent adds of different names keep both", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-race-")));
     const home = join(root, "home");
     mkdirSync(home, { recursive: true });
     try {
       const [first, second] = await Promise.all([
-        runFx(["mcp", "add", "first", "first-server"], {
+        runFx(["mcp", "add", "first", "--", "first-server"], {
           env: { HOME: home, ...NO_GATEWAY_AUTH },
         }),
-        runFx(["mcp", "add", "second", "second-server"], {
+        runFx(["mcp", "add", "second", "--", "second-server"], {
           env: { HOME: home, ...NO_GATEWAY_AUTH },
         }),
       ]);
@@ -5638,24 +5468,24 @@ describe("cli: MCP profile add", () => {
       const profile = JSON.parse(
         readFileSync(join(home, ".fx", "mcp.json"), "utf8"),
       );
-      expect(Object.keys(profile.mcp).sort()).toEqual(["first", "second"]);
+      expect(Object.keys(profile.mcpServers).sort()).toEqual(["first", "second"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("fails precisely without HOME or valid add syntax", async () => {
-    const missingHome = await runFx(["mcp", "add", "fixture", "node"], {
+  test("add fails precisely without HOME and on a flag it doesn't have", async () => {
+    const missingHome = await runFx(["mcp", "add", "fixture", "--", "node"], {
       env: { HOME: undefined, ...NO_GATEWAY_AUTH },
     });
-    expect(missingHome.code).not.toBe(0);
-    expect(missingHome.stderr).toContain("HomeNotSet");
+    expect(missingHome.code).toBe(1);
+    expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
 
-    const invalid = await runFx(
+    const flagged = await runFx(
       ["mcp", "add", "--transport", "sse", "fixture", "https://example.test"],
       { env: { HOME: tmpdir(), ...NO_GATEWAY_AUTH } },
     );
-    expect(invalid.code).not.toBe(0);
-    expect(invalid.stderr).toContain("mcp add NAME COMMAND");
+    expect(flagged.code).toBe(2);
+    expect(flagged.stderr).toStartWith("fx mcp add has no --transport flag.\nusage: fx mcp add");
   });
 });

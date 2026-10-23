@@ -1,6 +1,5 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
-const health = @import("health.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 
@@ -184,22 +183,6 @@ fn findCurrentEntry(current: []const ServerSummary, name: []const u8) ?ServerSum
     return null;
 }
 
-pub fn classifyAvailability(
-    connection: health.ConnectionState,
-    authentication: health.AuthenticationState,
-    deferred_for_ask: bool,
-) Availability {
-    return switch (health.classify(connection, authentication, deferred_for_ask)) {
-        .disabled => .disabled,
-        .connecting => .discovering,
-        .ready => .ready,
-        .needs_auth => .authentication_required,
-        .failed => .failed,
-        .unavailable => .unavailable,
-        .on_demand => .available_on_demand,
-    };
-}
-
 /// Returns an owned prompt section. The caller releases it with `deinit` unless
 /// both values are intentionally retained by the supplied request arena.
 pub fn render(alloc: Allocator, snapshot: Snapshot) Allocator.Error!PromptSection {
@@ -346,32 +329,6 @@ fn ownedSnapshot(
         initialized += 1;
     }
     return .{ .servers = servers };
-}
-
-test "availability follows canonical connection authentication and deferred state" {
-    const Case = struct {
-        connection: health.ConnectionState,
-        authentication: health.AuthenticationState = .none,
-        deferred_for_ask: bool = false,
-        expected: Availability,
-    };
-    const cases = [_]Case{
-        .{ .connection = .ready, .expected = .ready },
-        .{ .connection = .connecting, .expected = .discovering },
-        .{ .connection = .disconnected, .deferred_for_ask = true, .expected = .available_on_demand },
-        .{ .connection = .failed, .authentication = .required, .expected = .authentication_required },
-        .{ .connection = .disconnected, .authentication = .required, .expected = .authentication_required },
-        .{ .connection = .disabled, .expected = .disabled },
-        .{ .connection = .disabled, .authentication = .required, .expected = .disabled },
-        .{ .connection = .failed, .expected = .failed },
-        .{ .connection = .disconnected, .expected = .unavailable },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            classifyAvailability(case.connection, case.authentication, case.deferred_for_ask),
-        );
-    }
 }
 
 test "render exposes sorted server summaries without tool metadata" {

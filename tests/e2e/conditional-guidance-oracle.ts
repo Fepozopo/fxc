@@ -10,7 +10,6 @@ export const CANONICAL_BUILTIN_NAMES = [
   "skill",
   "install_skill",
   "mcp_select_tool",
-  "mcp_features",
   "ask_user_question",
   "web_fetch",
   "web_search",

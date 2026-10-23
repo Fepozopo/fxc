@@ -1519,12 +1519,19 @@ pub const ImageAttachment = struct {
     inline_data: ?[]u8 = null,
     /// Owned opaque host reference, never filesystem or network authority.
     source_ref: ?[]u8 = null,
+    /// Owned path of the v2 session's blob that holds these bytes (D89),
+    /// which the model's note names so its tools can open the image. An
+    /// image saved as a blob keeps only this handle: readers load its bytes
+    /// from the blob when they need them, checked against its digest. The
+    /// session store owns the file: fx never writes or deletes through this
+    /// path.
+    blob_path: ?[]u8 = null,
 
     /// Whether the session no longer holds this image: a libfx session with
     /// an image store keeps only its newest images, and an older one keeps
     /// its digest, which names it in the host's store, without its bytes.
     pub fn droppedFromSession(self: ImageAttachment) bool {
-        return self.inline_data == null and self.snapshot_path == null and self.snapshot_sha256 != null;
+        return self.inline_data == null and self.snapshot_path == null and self.blob_path == null and self.snapshot_sha256 != null;
     }
 };
 
@@ -3257,13 +3264,13 @@ fn fuzzToolArgumentDiagnostic(_: void, smith: *std.testing.Smith) anyerror!void 
 
 test "fuzz tool argument diagnostic" {
     try std.testing.fuzz({}, fuzzToolArgumentDiagnostic, .{
-        .corpus = &.{
+        .corpus = &(.{
             "{\"request\":{\"task\":\"cut",
             "{\"a\":1,}",
             "{\"a\":1,\"a\":2}",
             "{\"t\":\"\xc3\xa9\xe2\x82",
             "\xff\x00{",
-        },
+        } ++ @import("fuzz_corpus").tool_argument_diagnostic.*),
     });
 }
 
@@ -3304,45 +3311,57 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
     }
 
     for (attachments, 0..) |attachment, i| {
-        const path = try alloc.dupe(u8, attachment.path);
-        errdefer alloc.free(path);
-
-        const media_type = try alloc.dupe(u8, attachment.media_type);
-        errdefer alloc.free(media_type);
-
-        const snapshot_path = if (attachment.snapshot_path) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (snapshot_path) |value| alloc.free(value);
-
-        const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (snapshot_sha256) |value| alloc.free(value);
-
-        const inline_data = if (attachment.inline_data) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (inline_data) |value| alloc.free(value);
-        const source_ref = if (attachment.source_ref) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        copy[i] = .{
-            .id = attachment.id,
-            .path = path,
-            .media_type = media_type,
-            .snapshot_path = snapshot_path,
-            .snapshot_sha256 = snapshot_sha256,
-            .inline_data = inline_data,
-            .source_ref = source_ref,
-        };
+        copy[i] = try dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     return copy;
+}
+
+/// A copy of `attachment` that owns every field it has; free it with
+/// `freeImageAttachment`.
+pub fn dupeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment) !ImageAttachment {
+    const path = try alloc.dupe(u8, attachment.path);
+    errdefer alloc.free(path);
+
+    const media_type = try alloc.dupe(u8, attachment.media_type);
+    errdefer alloc.free(media_type);
+
+    const snapshot_path = if (attachment.snapshot_path) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (snapshot_path) |value| alloc.free(value);
+
+    const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (snapshot_sha256) |value| alloc.free(value);
+
+    const inline_data = if (attachment.inline_data) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (inline_data) |value| alloc.free(value);
+    const source_ref = if (attachment.source_ref) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (source_ref) |value| alloc.free(value);
+    const blob_path = if (attachment.blob_path) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    return .{
+        .id = attachment.id,
+        .path = path,
+        .media_type = media_type,
+        .snapshot_path = snapshot_path,
+        .snapshot_sha256 = snapshot_sha256,
+        .inline_data = inline_data,
+        .source_ref = source_ref,
+        .blob_path = blob_path,
+    };
 }
 
 /// Frees the owned fields in one attachment; caller owns any containing storage.
@@ -3353,6 +3372,7 @@ pub fn freeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment
     if (attachment.snapshot_sha256) |sha256| alloc.free(sha256);
     if (attachment.inline_data) |data| alloc.free(data);
     if (attachment.source_ref) |source_ref| alloc.free(source_ref);
+    if (attachment.blob_path) |path| alloc.free(path);
 }
 
 pub fn freeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []ImageAttachment) void {
@@ -3644,6 +3664,29 @@ test "ImageAttachment helpers duplicate empty and populated slices" {
 
     freeImageAttachmentSlice(alloc, copy);
     freeImageAttachmentSlice(alloc, originals);
+}
+
+test "dupeImageAttachment frees path when media_type allocation fails" {
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
+        .path = @constCast("/tmp/a.png"),
+        .media_type = @constCast("image/png"),
+    }));
+}
+
+test "dupeImageAttachment preserves stable image id" {
+    const alloc = std.testing.allocator;
+    const copy = try dupeImageAttachment(alloc, .{
+        .id = 41,
+        .path = @constCast("/tmp/a.png"),
+        .media_type = @constCast("image/png"),
+    });
+    defer {
+        alloc.free(copy.path);
+        alloc.free(copy.media_type);
+    }
+
+    try std.testing.expectEqual(@as(usize, 41), copy.id);
 }
 
 test "ImageAttachment source references clone independently and clean up allocation failures" {

@@ -304,7 +304,7 @@ pub const AgentCapabilities = struct {
     system_prompt: bool = false,
     /// Serves `type: "acp"` MCP servers over this connection.
     mcp_over_acp: bool = false,
-    /// Speaks MCP's HTTP+SSE transport (2024-11-05), which MCP-v2 doesn't.
+    /// Speaks MCP's HTTP+SSE transport (2024-11-05), which fx's MCP engine doesn't.
     mcp_sse: bool = true,
 };
 

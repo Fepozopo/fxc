@@ -12,7 +12,7 @@ const host_attachments = @import("core/hosts/host_attachments.zig");
 const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
-const streamable_http = @import("core/mcp/streamable_http.zig");
+const http_config = @import("core/mcp/http_config.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
 const host_xai_grok = @import("gateway/host_xai_grok.zig");
@@ -1047,7 +1047,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         else => return error.InvalidGatewayUrl,
     }) orelse (alloc.dupe(u8, builtin_gateway.default_chat_url) catch return error.OutOfMemory);
     errdefer alloc.free(gateway_chat_url);
-    streamable_http.validateEndpoint(gateway_chat_url) catch return error.InvalidGatewayUrl;
+    http_config.validateEndpoint(gateway_chat_url) catch return error.InvalidGatewayUrl;
     if (!std.mem.eql(u8, gateway_chat_url, builtin_gateway.default_chat_url)) {
         const uri = std.Uri.parse(gateway_chat_url) catch return error.InvalidGatewayUrl;
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidGatewayUrl;

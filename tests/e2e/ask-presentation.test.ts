@@ -1017,6 +1017,27 @@ describe("fx ask shell startup files", () => {
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);
 
+  test("a user-profile command with a quoting error carries rewrite guidance", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      userShellRun("unmatched", "echo \"oops"),
+      fakeGatewayFinalText("Guidance checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Check the guidance."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0" }, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    // The snapshot runs the command through eval, so zsh reports the error as
+    // `(eval):1:` and bash as `/dev/fd/0: eval:` instead of under the shell's name.
+    expect(result.stderr).not.toContain("shell snapshot unavailable");
+    expect(gateway.requests[1]!.body).toMatch(/\(eval\):1:|\/dev\/fd\/0: eval:/);
+    expect(gateway.requests[1]!.body).toContain("The shell could not parse this command");
+  }, TIMEOUT);
+
   test("startup files the snapshot cannot capture fall back with one notice", async () => {
     const root = createRoot();
     // A 9 MB alias exceeds the 8 MiB capture limit, while full startup still

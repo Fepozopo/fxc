@@ -690,6 +690,9 @@ fn applySessionPickerCatalogPage(
     append: bool,
 ) !void {
     const workspace = if (picker.scope == .current_workspace) workspace_root else null;
+    // Pages hold only the sessions the search lists, so the search reaches
+    // the whole catalog and "Load more" appears only while matches remain.
+    const query = picker.query();
     var selected_index: ?usize = null;
     var page_limit = limit;
     if (!append) {
@@ -697,9 +700,7 @@ fn applySessionPickerCatalogPage(
         if (picker.selectedId()) |selected_id| {
             var index: usize = 0;
             for (cache.catalog.summaries.items) |summary| {
-                if (workspace) |root| {
-                    if (summary.workspace_root == null or !std.mem.eql(u8, summary.workspace_root.?, root)) continue;
-                }
+                if (!session_catalog.pickerLists(summary, workspace, query)) continue;
                 if (std.mem.eql(u8, summary.id, selected_id)) {
                     selected_index = index;
                     page_limit = @max(page_limit, index + 1);
@@ -709,11 +710,11 @@ fn applySessionPickerCatalogPage(
             }
         }
     }
-    var page = try session_summary_codec.resumablePageFromSummaries(
+    var page = try session_catalog.resumablePage(
         alloc,
         cache.catalog.summaries.items,
         workspace,
-        null,
+        query,
         continuation,
         page_limit,
     );
@@ -741,12 +742,7 @@ fn applySessionPickerCatalogPage(
     picker.loading_more = false;
     picker.load_state = .ready;
     if (!append) {
-        if (selected_index) |index| {
-            picker.selected = session_catalog.filteredCount(
-                picker.summaries.items[0..index],
-                picker.query(),
-            );
-        }
+        if (selected_index) |index| picker.selected = index;
         picker.selected = @min(picker.selected, picker.filteredItemCount() -| 1);
         picker.window_start = @min(picker.window_start, picker.selected);
     } else if (selected_load_more) {
@@ -1469,6 +1465,10 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn beginFreshPersistedSession(app: *App) !void {
             closeWritableSession(app);
+            // A fresh session starts with no usage, whether or not it persists.
+            app.total_input_tokens = 0;
+            app.total_output_tokens = 0;
+            app.total_web_search_requests = 0;
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
                 try beginFreshJsHostSession(app);
             }
@@ -1497,9 +1497,6 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             app.session_persistence.degraded_warning_emitted = false;
-            app.total_input_tokens = 0;
-            app.total_output_tokens = 0;
-            app.total_web_search_requests = 0;
         }
 
         fn beginFreshJsHostSession(app: *App) !void {
@@ -1518,9 +1515,6 @@ pub fn Runtime(comptime App: type) type {
                 .revision = null,
             };
             state = undefined;
-            app.total_input_tokens = 0;
-            app.total_output_tokens = 0;
-            app.total_web_search_requests = 0;
         }
 
         pub fn clearSession(app: *App) !void {
@@ -2269,7 +2263,28 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            try listSessionPicker(app, scope);
+        }
 
+        /// Re-lists the open picker for the composer's current text, so the
+        /// search covers every saved session in scope, not only loaded pages.
+        pub fn searchSessionPicker(app: *App) !void {
+            const picker = &app.session_persistence.session_picker;
+            if (!picker.active) return;
+            // A listing still in flight applies the query when it lands.
+            if (picker.load_state != .ready) {
+                picker.setQuery(app.input_runtime.edit_state.input.items);
+                return;
+            }
+            listSessionPicker(app, picker.scope) catch |err| {
+                picker.load_state = .failed;
+                return err;
+            };
+        }
+
+        /// Lists the first page for `scope` and the composer's text from the
+        /// held catalog, refreshing a stale or missing catalog in the background.
+        fn listSessionPicker(app: *App, scope: SessionPickerScope) !void {
             var picker = &app.session_persistence.session_picker;
             const previous_generation = picker.generation;
             picker.deinit(app.alloc);
@@ -2823,6 +2838,15 @@ pub fn Runtime(comptime App: type) type {
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = app.session_persistence.v2 orelse return;
             try v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant });
+        }
+
+        /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images
+        /// become the session's blobs before its first request (D89).
+        pub fn savePromptImages(app: *App, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return;
+            try v2.savePromptImages(alloc, images);
         }
 
         pub fn commitRuntimePreferences(
@@ -4868,7 +4892,6 @@ pub fn Runtime(comptime App: type) type {
                     root_id,
                     root_id,
                     app.permission_engine.rules,
-                    !permissions.rulesDenyAllTargetsForTool(app.permission_engine.rules, "mcp_features"),
                 )
             else
                 null;
@@ -6377,6 +6400,39 @@ test "initializePersistence silently skips optional missing home and errors when
     try Runtime(TestApp).initializePersistence(&app, false);
     try std.testing.expect(app.session_persistence.v2_store == null);
     try std.testing.expectError(error.HomeNotSet, Runtime(TestApp).initializePersistence(&app, true));
+}
+
+test "a fresh session clears usage counters without a durable store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, null);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try Runtime(TestApp).initializePersistence(&app, false);
+    try std.testing.expect(app.session_persistence.v2_store == null);
+
+    // The previous session's usage, which the footer shows as context used.
+    app.total_input_tokens = 43_000;
+    app.total_output_tokens = 1_200;
+    app.total_web_search_requests = 3;
+
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    try std.testing.expect(app.session_persistence.v2 == null);
+    try std.testing.expectEqual(@as(u64, 0), app.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), app.total_output_tokens);
+    try std.testing.expectEqual(@as(u64, 0), app.total_web_search_requests);
 }
 
 test "v2 ultrafast resume applies process overrides without persisting them" {
@@ -9818,6 +9874,8 @@ test "session picker reuses a held catalog after resize and workspace switch" {
             const id = try std.mem.print(&id_buffer, "saved-{d}", .{index});
             var summary = try session_summary_codec.cloneSessionSummary(catalog_alloc, .{
                 .id = @constCast(id),
+                // The composer text "saved" searches the titles.
+                .title = @constCast(id),
                 .workspace_root = if (index % 2 == 0) paths.workspace else @constCast("/foreign-workspace"),
                 .created_at_ms = 1,
                 .updated_at_ms = @intCast(100 - index),
