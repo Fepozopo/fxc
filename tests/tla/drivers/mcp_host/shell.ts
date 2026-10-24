@@ -15,7 +15,7 @@ export function parseStatus(pane: string): Line | null {
   if ((m = /(\S+) is waiting for approval · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "waiting", r: 0, e: 0 };
   if ((m = /(\S+) needs login · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "login", r: 0, e: 0 };
   if ((m = /(\S+) failed · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "failed", r: 0, e: 0 };
-  if ((m = /(\d+) MCP servers need you · \/mcp/.exec(tail))) return { k: "many", who: "", why: "", r: Number(m[1]), e: 0 };
+  if ((m = /(\d+) MCP need attention · \/mcp/.exec(tail))) return { k: "many", who: "", why: "", r: Number(m[1]), e: 0 };
   return null;
 }
 

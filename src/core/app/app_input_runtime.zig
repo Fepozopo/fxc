@@ -990,6 +990,9 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            if (resolved == .cursor_left and try backMcpHostMenuScreen(app)) return .done;
+            if (resolved == .cursor_right and try enterMcpHostMenuItem(app)) return .done;
+
             if (try full_transcript_rt.routeComposerAction(app, resolved)) return .done;
 
             if (composer_shortcut) |action| {
@@ -1751,6 +1754,50 @@ pub fn Runtime(comptime App: type) type {
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             }
+            return true;
+        }
+
+        /// Whether the menu asks Remove or Reject on the choice's row, where
+        /// ← and → choose between yes and no.
+        fn mcpHostMenuAsksOnRow(app: *App) bool {
+            const menu_state = &app.mcp.host_menu;
+            if (menu_state.screen != .confirm) return false;
+            const c = menu_state.confirm orelse return false;
+            return c.asksOnRow();
+        }
+
+        /// ← goes back a screen, like Esc, from a server's screen or an
+        /// approval; on a question asked on its row it chooses yes. With a
+        /// filter typed it moves the composer's cursor, and on the list there
+        /// is nothing to go back to.
+        fn backMcpHostMenuScreen(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app) or app.mcp.host_menu.screen == .list) return false;
+            if (mcpHostMenuAsksOnRow(app)) {
+                try app.mcpHostMenuKey(.left);
+                return true;
+            }
+            if (app.input_runtime.edit_state.input.items.len > 0) return false;
+            try app.mcpHostMenuKey(.escape);
+            return true;
+        }
+
+        /// → acts like Enter on the list and on a server's screen: it opens
+        /// the server or runs the selected choice. On a question asked on its
+        /// row it chooses no, and an approval still takes Enter, so → never
+        /// confirms by accident. With the cursor inside a typed filter, →
+        /// moves it instead.
+        fn enterMcpHostMenuItem(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            if (mcpHostMenuAsksOnRow(app)) {
+                try app.mcpHostMenuKey(.right);
+                return true;
+            }
+            if (app.mcp.host_menu.screen == .confirm) return false;
+            const edit = &app.input_runtime.edit_state;
+            if (edit.cursor != edit.input.items.len) return false;
+            try app.mcpHostMenuKey(.enter);
             return true;
         }
 

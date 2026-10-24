@@ -1222,6 +1222,49 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "git fetch from a repository that names a remote helper remains reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const marker = join(root.root, "remote-helper-must-not-run");
+      const bin = installRecorder(root, "git-remote-probe", marker);
+      const gateway = startGateway(
+        [
+          // git runs `git-remote-probe` from `PATH` for each of these.
+          cleanCommandCall("git fetch probe::x", "helper_prefix"),
+          cleanCommandCall("git fetch -- probe::x", "helper_after_separator"),
+          cleanCommandCall("git fetch probe://host/repository", "helper_scheme"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("remote helpers stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "helper_prefix_review"),
+          fakeGatewayPermissionDecision("caution", "helper_after_separator_review"),
+          fakeGatewayPermissionDecision("caution", "helper_scheme_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Fetch the latest changes."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "existing startup targets remain reviewer owned",
     async () => {
       const root = createIsolatedRoot();

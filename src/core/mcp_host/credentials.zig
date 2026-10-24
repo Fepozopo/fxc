@@ -76,12 +76,18 @@ pub const Store = struct {
     /// The credential saved under `key`, or null, also when the store can't be
     /// read. The caller owns it and frees it with `secret.zeroAndFree`.
     pub fn get(s: Store, alloc: Allocator, key: Key) !?[]u8 {
+        return s.lookup(alloc, key) catch |err| switch (err) {
+            error.CredentialStoreUnreadable => null,
+            else => err,
+        };
+    }
+
+    /// `get`, except that a store it can't read fails with
+    /// `error.CredentialStoreUnreadable`, so null means none is saved.
+    pub fn lookup(s: Store, alloc: Allocator, key: Key) !?[]u8 {
         var locked = try s.lock();
         defer locked.release();
-        var doc = s.read(alloc, &locked.dir) catch |err| switch (err) {
-            error.CredentialStoreUnreadable => return null,
-            else => return err,
-        };
+        var doc = try s.read(alloc, &locked.dir);
         defer doc.deinit(alloc);
         const i = doc.find(key) orelse return null;
         return try alloc.dupe(u8, doc.entries.items[i].credential);
@@ -609,15 +615,21 @@ test "the credential file is private, and one this fx can't read is never writte
     try store.put(testing.allocator, .{ .name = "plain", .url = url }, "{\"access\":\"p1\"}");
     const stat = try tmp.dir.statFile(testing.io, test_path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    const found = (try store.lookup(testing.allocator, .{ .name = "plain", .url = url })).?;
+    defer testing.allocator.free(found);
+    try testing.expectEqualStrings("{\"access\":\"p1\"}", found);
+    try testing.expectEqual(@as(?[]u8, null), try store.lookup(testing.allocator, .{ .name = "linear", .url = url }));
 
-    // A damaged file, then one a newer fx saved: no login is found, a
-    // sign-in or sign-out fails, and the file stays as it was.
+    // A damaged file, then one a newer fx saved: no login is found, though
+    // `lookup` says it can't tell, a sign-in or sign-out fails, and the
+    // file stays as it was.
     for ([_][]const u8{
         "not json",
         "{\"version\":3,\"imported_v1\":true,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{}\"}]}",
     }) |bytes| {
         try tmp.dir.writeFile(testing.io, .{ .sub_path = test_path, .data = bytes });
         try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "plain", .url = url }));
+        try testing.expectError(error.CredentialStoreUnreadable, store.lookup(testing.allocator, .{ .name = "plain", .url = url }));
         try testing.expectError(error.CredentialStoreUnreadable, store.check(testing.allocator));
         try testing.expectError(error.CredentialStoreUnreadable, store.put(testing.allocator, .{ .name = "plain", .url = url }, "{\"access\":\"p2\"}"));
         try testing.expectError(error.CredentialStoreUnreadable, store.remove(testing.allocator, .{ .name = "plain", .url = url }));

@@ -125,7 +125,9 @@ pub const Event = union(enum) {
     /// that keeps its own copy lists again before its next call (CAT-05).
     tools_stale,
     /// A call ended. `answer` is set when the server answered, valid until the next `next`.
-    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
+    /// `oversized` says a lost call's answer was over the message limit: a
+    /// stdio line over `max_line`, or an HTTP answer over `max_message`.
+    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false },
     /// A call's server reported progress that the request core accepted.
     /// `message` is terminal-safe and cut to 160 bytes, valid until the
     /// next `next`.
@@ -273,6 +275,10 @@ pub const Server = struct {
     event_count: usize = 0,
     /// The answer an event points into, kept until the next `next`.
     held_answer: ?tools.Call = null,
+    /// Set while requests end lost because an answer was over the message
+    /// limit: a stdio process fx killed for an oversized line, or an HTTP
+    /// answer over `max_message`.
+    losing_oversized: bool = false,
     /// The message of an invalid reply's answer, kept as long as the line it
     /// came from: until the process is read again.
     refused_reply: [512]u8 = undefined,
@@ -755,7 +761,7 @@ pub const Server = struct {
             // With no sink for stderr.
             .stderr => {},
             .dropped => |d| try r.onRefusedLine(d.err, d.line),
-            .changed => |c| try r.onProcessChanged(c.state, c.lost),
+            .changed => |c| try r.onProcessChanged(c.state, c.lost, c.oversized),
             .timeout => unreachable,
         }
     }
@@ -783,10 +789,12 @@ pub const Server = struct {
         try r.onMessage(id, 200, .{ .response = .{ .id = id, .body = .{ .failure = .{ .code = wire.code.invalid_request, .message = w.buffered(), .data = null } } } });
     }
 
-    fn onProcessChanged(r: *Server, state: stdio_conn.State, lost: bool) Error!void {
+    fn onProcessChanged(r: *Server, state: stdio_conn.State, lost: bool, oversized: bool) Error!void {
         if (lost) {
             // What was in flight on the process is lost. The exit ends every
             // listen, and its elicitations are over.
+            r.losing_oversized = oversized;
+            defer r.losing_oversized = false;
             for (r.table_slots) |slot| if (slot.used) try r.stepRequest(.{ .transport_lost = slot.id });
             if (r.subs.up) try r.stepSubs(.transport_down);
             try r.endElicitations();
@@ -1240,6 +1248,12 @@ pub const Server = struct {
             if (l.what == .discover) try r.stepEra(era.classifyDiscoverHttp(r.detector.config, status, null));
             return r.stepExchange(l, .http_failure);
         }
+        // Another attempt would bring the same answer again (HTTP-14).
+        if (how == .too_large) {
+            r.losing_oversized = true;
+            defer r.losing_oversized = false;
+            return r.stepExchange(l, .too_large);
+        }
         try r.stepExchange(l, .stream_broken);
     }
 
@@ -1330,6 +1344,7 @@ pub const Server = struct {
                         .maybe_ran = o == .lost,
                         .timed_out = l.timed_out,
                         .answer = if (o == .result or o == .failure) r.held_answer else null,
+                        .oversized = o == .lost and r.losing_oversized,
                     },
                 });
                 l.used = false;
@@ -1636,7 +1651,7 @@ pub const Server = struct {
         const s = &r.legacy.?;
         const req = s.find(key) orelse return;
         if (req.state != .posted and req.state != .resuming) return;
-        try r.stepLegacy(if (status == 404)
+        const event: http_legacy.Event = if (status == 404)
             // `expired` takes a request without a session id for a refusal.
             .{ .expired = key }
         else if (status >= 300)
@@ -1645,8 +1660,13 @@ pub const Server = struct {
             // A stream that ended or broke before the answer, which the
             // server may have closed to be polled.
             .complete, .accepted, .broken => .{ .broke = key },
+            // Resuming would bring the same answer again (LHTTP-11).
+            .too_large => .{ .too_large = key },
             .http_failure, .rejected => .{ .refused = key },
-        });
+        };
+        r.losing_oversized = event == .too_large;
+        defer r.losing_oversized = false;
+        try r.stepLegacy(event);
     }
 
     /// Any refusal of the listening GET but a session 404 means the
@@ -1688,6 +1708,7 @@ pub const Server = struct {
                 .maybe_ran = outcome == .lost,
                 .timed_out = l.timed_out,
                 .answer = if (outcome == .result) r.held_answer else null,
+                .oversized = outcome == .lost and r.losing_oversized,
             },
         });
         if (l.what == .list and outcome != .result) {
