@@ -48,7 +48,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 37", 5_000);
+      const pane = await session.waitForText("Commands 38", 5_000);
       expect(pane).toContain("[All]");
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
@@ -274,13 +274,13 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         expect(initial.split(banner)).toHaveLength(2);
 
         for (const command of ["/clear", "/reset", "/new"]) {
-          await session.sendText("/status");
-          await session.waitForText("model=", 5_000);
+          await session.sendText("/allowlist");
+          await session.waitForText("* allowlist: effective", 5_000);
           await session.sendText(command);
           const pane = await session.waitForPane(
             (value) =>
               value.includes(banner) &&
-              !value.includes("model=") &&
+              !value.includes("* allowlist:") &&
               hasEmptyComposer(value),
             5_000,
           );
@@ -334,24 +334,24 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
         await session.waitForComposer(10_000);
         for (let i = 0; i < 8; i++) {
-          await session.sendText("/status");
+          await session.sendText("/allowlist");
           await session.waitForComposer(5_000);
         }
         const before = await session.captureFullScrollback();
-        const lastStatus = before.slice(before.lastIndexOf("* status:"));
-        expect(lastStatus).toContain("agent_step_limit=0");
+        const lastNotice = before.slice(before.lastIndexOf("* allowlist:"));
+        expect(lastNotice).toContain("* allowlist: effective persistent allow rules: (none)");
 
         await session.sendText("/new");
         await session.waitForPane(
-          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          (pane) => pane.includes(banner) && !pane.includes("* allowlist:") && hasEmptyComposer(pane),
           5_000,
         );
         const after = await session.captureFullScrollback();
-        const priorStatus = after.slice(after.lastIndexOf("* status:"), after.lastIndexOf(banner)).trimEnd();
-        expect(priorStatus).toBe(lastStatus.split("\n┃")[0]?.trimEnd());
-        expect(priorStatus).not.toContain("Commands 1");
-        expect(priorStatus).not.toContain("run /login ·");
-        expect(await session.capturePane()).not.toContain("model=");
+        const priorNotice = after.slice(after.lastIndexOf("* allowlist:"), after.lastIndexOf(banner)).trimEnd();
+        expect(priorNotice).toBe(lastNotice.split("\n┃")[0]?.trimEnd());
+        expect(priorNotice).not.toContain("Commands 1");
+        expect(priorNotice).not.toContain("run /login ·");
+        expect(await session.capturePane()).not.toContain("* allowlist:");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -449,34 +449,41 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 18,
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/status");
-        await session.waitForPane((pane) => pane.includes("agent_step_limit=0"), 5_000);
+        // Three local notices, one after another.
+        for (const view of ["effective", "local", "user"]) {
+          await session.sendText(`/allowlist view ${view}`);
+          await session.waitForPane((pane) => pane.includes(`* allowlist: ${view} persistent allow rules`), 5_000);
+        }
         const before = await session.captureFullScrollback();
-        const expectedStatus = before.slice(before.lastIndexOf("* status:")).split("\n┃")[0]?.trimEnd();
-        expect(expectedStatus).toContain("agent_step_limit=0");
+        const expectedNotice = before.slice(before.lastIndexOf("* allowlist: effective")).split("\n┃")[0]?.trimEnd();
+        expect(expectedNotice).toContain("* allowlist: user persistent allow rules: (none)");
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 18, 0);
         await Bun.sleep(40);
         session.sendKeysImmediate(["Enter"]);
 
         await session.waitForPane(
-          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          (pane) => pane.includes(banner) && !pane.includes("* allowlist:") && hasEmptyComposer(pane),
           10_000,
         );
         const history = await session.captureFullScrollback();
-        const oldStatus = history.slice(history.lastIndexOf("* status:"), history.lastIndexOf(banner));
+        const oldNotice = history.slice(history.lastIndexOf("* allowlist: effective"), history.lastIndexOf(banner));
         let lastIndex = -1;
-        for (const field of ["* status:", "permission_mode=auto", "workspace=", "history_turns=0", "session_permission_grants=0", "agent_step_limit=0"]) {
-          const index = oldStatus.indexOf(field);
+        for (const field of [
+          "* allowlist: effective persistent allow rules: (none)",
+          "* allowlist: local persistent allow rules: (none)",
+          "* allowlist: user persistent allow rules: (none)",
+        ]) {
+          const index = oldNotice.indexOf(field);
           expect(index).toBeGreaterThan(lastIndex);
           lastIndex = index;
         }
-        expect(oldStatus.replace(/\s+/g, "")).toBe(expectedStatus?.replace(/\s+/g, ""));
-        expect(oldStatus).not.toContain("Commands 1");
-        expect(oldStatus).not.toContain("run /login ·");
+        expect(oldNotice.replace(/\s+/g, "")).toBe(expectedNotice?.replace(/\s+/g, ""));
+        expect(oldNotice).not.toContain("Commands 1");
+        expect(oldNotice).not.toContain("run /login ·");
         expect(session.isAlive()).toBe(true);
-        await session.sendText("/status");
-        await session.waitForPane((pane) => pane.includes("agent_step_limit=0") && hasEmptyComposer(pane), 5_000);
+        await session.sendText("/allowlist");
+        await session.waitForPane((pane) => pane.includes("* allowlist: effective persistent allow rules") && hasEmptyComposer(pane), 5_000);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);
@@ -510,8 +517,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 18,
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/status");
-        await session.waitForText("agent_step_limit=0", 5_000);
+        await session.sendText("/allowlist");
+        await session.waitForText("* allowlist: effective persistent allow rules", 5_000);
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 3, 0);
         session.sendKeysImmediate(["Enter"]);

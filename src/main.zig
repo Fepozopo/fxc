@@ -2864,6 +2864,9 @@ const App = struct {
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        if (try app_commands.Handlers(App).collectInfoPanelFacts(self)) {
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+        }
         try app_commands.Handlers(App).collectMcpHostFacts(self);
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {

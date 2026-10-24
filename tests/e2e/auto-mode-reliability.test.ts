@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { readPermissionsPanel } from "./info-panel";
 import { logLines, rootSessionIds } from "./saved-sessions";
 import {
   fakeGatewayFinalText,
@@ -2461,12 +2462,8 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendKeys("1");
       await activeSession.waitForText("saved-session permission rule updated", TIMEOUT);
 
-      await activeSession.sendText("/permissions");
-      await activeSession.waitForText("saved-session permission rules (1):", TIMEOUT);
-      const listed = await activeSession.captureFullScrollback();
-      const idMatch = listed.match(
-        /saved-session permission rules \(1\):\n\s*(\d+) deny/,
-      );
+      const listed = await readPermissionsPanel(activeSession, TIMEOUT, (panel) => panel.fields["Saved rules"] === "1");
+      const idMatch = /^(\d+) deny /.exec(listed.items["Saved rules"]?.[0] ?? "");
       expect(idMatch).not.toBeNull();
       const ruleId = idMatch![1];
 
@@ -2480,8 +2477,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.waitForText("Revoke this saved-session permission rule?", TIMEOUT);
       await activeSession.sendKeys("1");
       await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("/permissions");
-      await activeSession.waitForText("saved-session permission rules: none", TIMEOUT);
+      await readPermissionsPanel(activeSession, TIMEOUT, (panel) => panel.fields["Saved rules"] === "none");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

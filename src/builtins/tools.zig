@@ -15,6 +15,7 @@ const compactor = @import("../core/compactor/compactor.zig");
 const capability_retrieval = @import("../core/tooling/capability_retrieval.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
+const question_answer = @import("../core/agent/question_answer.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
@@ -101,8 +102,10 @@ const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_select_tool_description =
     "Exact-select one configured MCP/dynamic tool by name so its executable schema is advertised on the next model step. When to use: after discovering the exact specialized tool name in configured metadata. When NOT to use: guessing partial names, selecting built-in tools, or executing the dynamic tool directly.";
-const ask_user_question_description =
-    "Ask the user 1-4 multiple-choice questions in interactive runs only when a concrete decision blocks progress after local files, git state, or tool output cannot answer it. When to use: choose among precise, mutually exclusive paths before acting, especially user-preference decisions. When NOT to use: safety-review escalation, discoverable facts, GitHub handles unless account/private-access specific, gh/auth/tool blockers, trivial yes/no checks, open-ended discussion, or noninteractive runs; noninteractive runs should surface a blocker in freeform text instead.";
+const ask_user_question_description = std.fmt.comptimePrint(
+    "Ask the user 1-{d} multiple-choice questions in interactive runs only when a concrete decision blocks progress after local files, git state, or tool output cannot answer it. When to use: choose among precise, mutually exclusive paths before acting, especially user-preference decisions. When NOT to use: safety-review escalation, discoverable facts, GitHub handles unless account/private-access specific, gh/auth/tool blockers, trivial yes/no checks, open-ended discussion, or noninteractive runs; noninteractive runs should surface a blocker in freeform text instead.",
+    .{question_answer.max_questions},
+);
 const ask_user_question_option_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "label", .json_type = .string, .description = "Short precise action label, 1-5 words." },
@@ -587,7 +590,7 @@ pub const ask_user_question = ToolSpec{
         .description = ask_user_question_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "questions", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = 4 }, .shape = &.{ .array_objects = &ask_user_question_question_schema } },
+                .{ .name = "questions", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = question_answer.max_questions }, .shape = &.{ .array_objects = &ask_user_question_question_schema } },
             },
             .required = &.{"questions"},
         },
@@ -807,7 +810,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "921f1c5cf785e28616633763f261d942f8cd646ba76731d85f6f98febe66b737",
+        "bb643f827a9ffa27608b14c0e26b3b0a195f2909e7f1f7763c161f585adb6449",
         &actual_hex,
     );
 }
@@ -1438,7 +1441,8 @@ test "built-in ask_user_question owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, ask_user_question.description, "interactive runs") != null);
     try std.testing.expect(std.mem.find(u8, ask_user_question.description, "noninteractive runs should surface a blocker in freeform text") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"name\":\"ask_user_question\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"questions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":4") != null);
+    try std.testing.expect(std.mem.startsWith(u8, ask_user_question.description, "Ask the user 1-20 multiple-choice questions"));
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"questions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":20") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"options\":{\"type\":\"array\",\"minItems\":2,\"maxItems\":6") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "Specific blocking decision shown to the user") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "do not ask for facts tools can inspect") != null);

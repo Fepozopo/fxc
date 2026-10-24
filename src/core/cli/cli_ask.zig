@@ -1919,7 +1919,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         @constCast(&.{});
     errdefer if (resolved_provider.len > 0) alloc.free(resolved_provider);
     const session_id = if (ctx.v2) |v2|
-        // A session exists once its first turn is written.
+        // A session exists once its log is on disk (D90).
         try alloc.dupe(u8, if (v2.saved()) v2.id() else "")
     else
         try alloc.dupe(u8, "");
