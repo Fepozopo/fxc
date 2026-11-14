@@ -108,7 +108,7 @@ for (const expected of ["first question", "first answer", "second question"]) {
 runtime.write("\x0f");
 await waitFor(() => terminal.buffer.active.type === "alternate", "full transcript alternate screen");
 runtime.write("\x1b[C");
-await waitFor(() => grid().includes("full detail"), "full transcript detail");
+await waitFor(() => grid().includes("esc close · pgup/pgdn scroll"), "full transcript detail");
 runtime.write("\x0f");
 await waitFor(() => terminal.buffer.active.type === "normal", "full transcript close");
 
@@ -218,7 +218,7 @@ async function runUltrafastTerminal(scenario) {
     assert.equal(gets, 0, "Ultrafast must not add synchronous catalog I/O to startup");
     if (scenario === "unsupported") {
       runtime.write("unsupported ultra request\r");
-      await waitFor(() => grid().includes("UltrafastUnavailable"), "fail-closed catalog rejection");
+      await waitFor(() => grid().includes("ultrafast unavailable"), "fail-closed catalog rejection");
       assert.equal(gets, 1);
       assert.equal(posts.length, 0);
       runtime.abort();

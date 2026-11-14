@@ -107,8 +107,8 @@ describe("tui: direct-write audit", () => {
           }`,
       },
       {
-        name: "top-level help TTY capability probe",
-        path: "src/main.zig",
+        name: "stdout terminal probe for help and session lists",
+        path: "src/core/shared/terminal_env.zig",
         accepted: true,
         source: `const std = @import("std");
           fn stdoutIsTerminal() bool {
@@ -292,7 +292,7 @@ describe("tui: direct-write audit", () => {
     ]);
 
     const main = sources.find(({ path }) => path === "src/main.zig")!.source;
-    expect(main.match(/RenderAppRuntime\.flushRequestedFrame\(self\)/g) ?? []).toHaveLength(1);
+    expect(main.match(/RenderAppRuntime\.flushRequestedFrame\(self, self\.screenAgent\(\)\)/g) ?? []).toHaveLength(1);
 
     const coordinator = sources.find(
       ({ path }) => path === "src/core/app/app_render_runtime.zig",
@@ -300,7 +300,7 @@ describe("tui: direct-write audit", () => {
     const productionCoordinator = coordinator.split('\ntest "')[0]!;
     expect(productionCoordinator.match(/flushRequestedFrame\(/g) ?? []).toHaveLength(1);
     expect(
-      productionCoordinator.match(/attemptRequestedFrame\(app, snapshot\)/g) ?? [],
+      productionCoordinator.match(/attemptRequestedFrame\(app, agent, snapshot\)/g) ?? [],
     ).toHaveLength(1);
   });
 });

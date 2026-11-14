@@ -3,12 +3,7 @@
     "module": "HostLifecycle",
     "smoke": "HostLifecycle.cfg",
     "stress": "HostLifecycle.stress.cfg",
-    "findings": [
-      {
-        "config": "HostLifecycle.findings.cfg",
-        "invariant": "AtMostOneOwner"
-      }
-    ],
+    "findings": [],
     "repair": []
   },
   {
@@ -66,6 +61,20 @@
     "module": "MixedBuilds",
     "smoke": "MixedBuilds.cfg",
     "stress": "MixedBuilds.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "StoreLockBudget",
+    "smoke": "StoreLockBudget.cfg",
+    "stress": "StoreLockBudget.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "RefreshLease",
+    "smoke": "RefreshLease.cfg",
+    "stress": "RefreshLease.stress.cfg",
     "findings": [],
     "repair": []
   }

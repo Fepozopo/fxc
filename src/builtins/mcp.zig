@@ -134,15 +134,17 @@ pub fn loadHost(
     try skipUnprintableNames(alloc, &loaded);
     // A host with no servers still carries the notes saying why.
     if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
-    const notes = try alloc.alloc([]const u8, loaded.diagnostics.items.len);
-    var rendered: usize = 0;
-    errdefer {
-        for (notes[0..rendered]) |note| alloc.free(note);
-        alloc.free(notes);
+    if (extras.reuse) |h| {
+        // Only the servers whose config changed restart. The host owns the
+        // notes either way.
+        if (h.reload(loaded.configs.items, &inherited, try renderNotes(alloc, loaded.diagnostics.items))) |_| return h else |err| {
+            debug_trace.logf("mcp", "MCP host not reloaded in place, starting a new one err={s}", .{@errorName(err)});
+        }
     }
-    for (loaded.diagnostics.items, notes) |diagnostic, *note| {
-        note.* = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
-        rendered += 1;
+    const notes = try renderNotes(alloc, loaded.diagnostics.items);
+    errdefer {
+        for (notes) |note| alloc.free(note);
+        alloc.free(notes);
     }
     const h = try mcp_host.Host.create(alloc, io_mod.getIo(), loaded.configs.items, &inherited, .{
         .client_version = build_options.app_version,
@@ -154,6 +156,21 @@ pub fn loadHost(
     }, builtins);
     h.notes = notes;
     return h;
+}
+
+/// Each diagnostic in a sentence, owned by `alloc`.
+fn renderNotes(alloc: Allocator, diagnostics: []const project_config.WorkspaceDiagnostic) ![]const []const u8 {
+    const notes = try alloc.alloc([]const u8, diagnostics.len);
+    var rendered: usize = 0;
+    errdefer {
+        for (notes[0..rendered]) |note| alloc.free(note);
+        alloc.free(notes);
+    }
+    for (diagnostics, notes) |diagnostic, *note| {
+        note.* = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        rendered += 1;
+    }
+    return notes;
 }
 
 fn traceWorkspaceDiagnostics(diagnostics: []const project_config.WorkspaceDiagnostic) void {
@@ -329,17 +346,17 @@ pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(Mcp
 
 /// With `skipped`, see `project_config.parseProfileServers`.
 fn readProfile(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
-        if (err == error.FileNotFound) return .empty;
-        logConfigFailure("open", path, err);
-        return err;
-    };
-    defer file.close(io_mod.getIo());
-
-    const json_text = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| {
+    const json_text = (config_file.read(alloc, path) catch |err| {
         logConfigFailure("read", path, err);
-        return err;
-    };
+        // Named for this file, so a caller that has only the error, such as
+        // `fx ask` at startup, can say what's wrong with ~/.fx/mcp.json.
+        return switch (err) {
+            error.SymLinkLoop => error.McpConfigLinkLoop,
+            error.StreamTooLong => error.McpConfigTooLarge,
+            error.DurablePathUnsafe => error.McpConfigNotPlainFile,
+            else => err,
+        };
+    }) orelse return .empty;
     defer alloc.free(json_text);
 
     return project_config.parseProfileServers(alloc, json_text, skipped) catch |err| {
@@ -356,12 +373,7 @@ fn loadProfileDocumentFromPath(
     alloc: Allocator,
     path: []const u8,
 ) !project_config.ProfileParseResult {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
-        if (err == error.FileNotFound) return .{};
-        return err;
-    };
-    defer file.close(io_mod.getIo());
-    const json_text = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    const json_text = (try config_file.read(alloc, path)) orelse return .{};
     defer alloc.free(json_text);
     return project_config.parseProfileDocument(alloc, json_text);
 }
@@ -858,6 +870,27 @@ test "saving MCP config refuses a symlinked target" {
     const untouched = try readFileForTest(alloc, external_path);
     defer alloc.free(untouched);
     try std.testing.expectEqualStrings(external, untouched);
+}
+
+test "a profile config fx can't read fails with an error named for the file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirPath(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    try tmp.dir.symLink(io_mod.getIo(), "loop.json", "loop.json", .{ .is_directory = false });
+    const loop = try std.Io.Dir.path.join(alloc, &.{ root, "loop.json" });
+    defer alloc.free(loop);
+    try std.testing.expectError(error.McpConfigLinkLoop, loadConfigFromPath(alloc, loop));
+
+    const big = try alloc.alloc(u8, 1024 * 1024 + 1);
+    defer alloc.free(big);
+    @memset(big, ' ');
+    try writeTempFile(&tmp, "big.json", big);
+    const big_path = try std.Io.Dir.path.join(alloc, &.{ root, "big.json" });
+    defer alloc.free(big_path);
+    try std.testing.expectError(error.McpConfigTooLarge, loadConfigFromPath(alloc, big_path));
 }
 
 test "loadConfigFromJson parses canonical local config with command array" {

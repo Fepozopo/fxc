@@ -7,10 +7,13 @@ const host = @import("../hosts/host.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
-const mcp_model_catalog = @import("../mcp/model_catalog.zig");
+const workspace_config = @import("../mcp/workspace_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
+const config_file = @import("../mcp_host/config_file.zig");
+const config_runtime = @import("../config/config_runtime.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const editor_state = @import("../input/editor_state.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const mod_registry = @import("../mods/registry.zig");
@@ -35,6 +38,54 @@ fn typedLoginServer(arena: Allocator, args: []const []const u8) Allocator.Error!
     };
 }
 
+/// What decides the servers fx runs in `workspace_root`, hashed: the
+/// profile's `mcp.json`, the project's `.mcp.json`, and the project servers
+/// the user approved or rejected, read the way `loadNativeConfigs` in
+/// `src/builtins/mcp.zig` reads them. A file fx can't read hashes as its
+/// error, so a lasting problem changes the stamp once, not at every check.
+fn configStamp(alloc: Allocator, home: ?[]const u8, workspace_root: []const u8) u64 {
+    var h: std.hash.Wyhash = .init(0);
+    if (home) |dir| stampFile(alloc, &h, readProfileConfig(alloc, dir));
+    stampFile(alloc, &h, workspace_config.readFile(alloc, workspace_root));
+    if (home) |dir| {
+        if (config_runtime.loadProjectMcpChoicesFromHome(alloc, dir, workspace_root)) |loaded| {
+            var load = loaded;
+            defer load.deinit(alloc);
+            h.update(&.{ 1, @intFromBool(load.choices.enable_all) });
+            for ([_][]const []u8{ load.choices.approved, load.choices.rejected }) |names| {
+                h.update(std.mem.asBytes(&names.len));
+                for (names) |name| stampBytes(&h, name);
+            }
+        } else |err| stampError(&h, err);
+    }
+    return h.final();
+}
+
+fn readProfileConfig(alloc: Allocator, home: []const u8) anyerror!?[]u8 {
+    const path = try profile_paths.mcpConfigPath(alloc, home);
+    defer alloc.free(path);
+    return config_file.read(alloc, path);
+}
+
+/// A config file read into `h`: its bytes, or that it's absent or unreadable.
+fn stampFile(alloc: Allocator, h: *std.hash.Wyhash, read: anyerror!?[]u8) void {
+    const text = read catch |err| return stampError(h, err);
+    const bytes = text orelse return h.update(&.{0});
+    defer alloc.free(bytes);
+    h.update(&.{1});
+    stampBytes(h, bytes);
+}
+
+fn stampBytes(h: *std.hash.Wyhash, bytes: []const u8) void {
+    h.update(std.mem.asBytes(&bytes.len));
+    h.update(bytes);
+}
+
+fn stampError(h: *std.hash.Wyhash, err: anyerror) void {
+    h.update(&.{2});
+    stampBytes(h, @errorName(err));
+}
+
 /// Owns the native profile MCP runtime. All transport work and retirement happen
 /// after releasing this state lock; the lock protects only pointer publication.
 pub const State = struct {
@@ -54,6 +105,9 @@ pub const State = struct {
     host_completion_arena: ?std.heap.ArenaAllocator = null,
     host_completion_at_ms: i64 = 0,
     host_reload_requested: std.atomic.Value(bool) = .init(false),
+    /// The config files as of the last load (`configStamp`), so a change made
+    /// outside this session is noticed the next time it uses MCP.
+    host_config_stamp: ?u64 = null,
     /// The `/mcp` menu; what it shows of the servers,
     /// rebuilt on the UI thread while it's open; and the open server's tools.
     host_menu: mcp_menu.State = .{},
@@ -91,12 +145,6 @@ pub const State = struct {
     /// Set by process-exit teardown before it joins a pending reload, so the
     /// reload discards its candidate runtime without grace or session DELETEs.
     process_exiting: std.atomic.Value(bool) = .init(false),
-    model_catalog_baseline_lock: std.Io.Mutex = .init,
-    /// Server availability as of the previous model-catalog report, used to
-    /// surface mid-session changes (authentication, reload, recovery) to the
-    /// model explicitly. Owned by the `baseline_alloc` passed to
-    /// `snapshotModelCatalog`.
-    model_catalog_baseline: ?[]mcp_model_catalog.BaselineEntry = null,
 
     /// Loads the host at startup with `load`, which reloads use too. The host's
     /// lifecycle is modeled in `tests/tla/mcp_host/HostLifecycle.tla`.
@@ -104,6 +152,7 @@ pub const State = struct {
         self: *State,
         load: mcp_host.LoadFn,
         alloc: Allocator,
+        home: ?[]const u8,
         workspace_root: []const u8,
         registry: tool_dispatch.Registry,
         questions: elicitation.Capabilities,
@@ -115,15 +164,60 @@ pub const State = struct {
             sink.* = .{};
             self.host_sink = sink;
         }
+        // Read before the load, so a change between the two loads again at
+        // the next check instead of going unnoticed.
+        self.host_config_stamp = configStamp(alloc, home, workspace_root);
         self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify(), .slash_commands = true }));
     }
 
-    /// Loads the config again after `/mcp` changed it; calls still using the
-    /// old host finish on it.
-    pub fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
+    pub const RefreshCheck = enum {
+        /// Only a change a `/mcp` command made.
+        requested,
+        /// Also the config files, for a change made outside this session:
+        /// `fx mcp add` in a shell, an edit, or another fx.
+        files,
+    };
+
+    /// On the UI thread: loads the config again when a `/mcp` command changed
+    /// it, or, with `.files`, when the config files changed since the last
+    /// load. True when it loaded. A load that fails keeps the current servers
+    /// and says so once per change, since the stamp it read is kept.
+    pub fn refreshHost(
+        self: *State,
+        alloc: Allocator,
+        home: ?[]const u8,
+        workspace_root: []const u8,
+        registry: tool_dispatch.Registry,
+        check: RefreshCheck,
+    ) bool {
+        if (self.host_load == null) return false;
+        const requested = self.takeHostReload();
+        if (!requested and check == .requested) return false;
+        // Read before the load, as in `loadHost`.
+        const stamp = configStamp(alloc, home, workspace_root);
+        if (!requested) if (self.host_config_stamp) |last| if (last == stamp) return false;
+        self.host_config_stamp = stamp;
+        debug_trace.logf("mcp", "MCP config loaded again reason={s}", .{if (requested) "mcp_command" else "config_files_changed"});
+        self.reloadHost(alloc, workspace_root, registry) catch |err| {
+            debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
+            const sink = self.host_sink orelse return true;
+            sink.push(std.heap.c_allocator.print("The MCP config changed, but fx couldn't load it: {s}. Your current servers are still active.", .{mcp_verbs.describe(err)}) catch return true, true);
+        };
+        return true;
+    }
+
+    /// Loads the config again after it changed. The host takes it in place,
+    /// so only a server whose config changed restarts. A new host comes only
+    /// when there was none, or the last server went; calls still using an old
+    /// one finish on it.
+    fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
         const load = self.host_load orelse return;
         const sink = self.host_sink orelse return;
-        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true }));
+        const lease = self.leaseHost();
+        defer if (lease) |l| l.deinit();
+        const current = if (lease) |l| l.host else null;
+        const next = try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true, .reuse = current });
+        if (next != current) self.replaceHost(next);
         self.startHostServers();
     }
 
@@ -197,8 +291,8 @@ pub const State = struct {
         const lease = self.leaseHost() orelse return;
         defer lease.deinit();
         self.host_started_ms = io_mod.milliTimestamp();
-        for (0..lease.host.runtime.servers().len) |i| lease.host.runtime.prepare(i) catch |err| {
-            debug_trace.logf("mcp", "MCP servers not started in the background at={d} err={s}", .{ i, @errorName(err) });
+        for (lease.host.runtime.servers()) |s| lease.host.runtime.prepare(s.name) catch |err| {
+            debug_trace.logf("mcp", "MCP servers not started in the background server={s} err={s}", .{ s.name, @errorName(err) });
             return;
         };
     }
@@ -314,10 +408,14 @@ pub const State = struct {
         /// The sign-in waiting for the browser, as its server, a 0 byte, and
         /// its address, so the menu can say so. Owned; the next one replaces it.
         sign_in: ?[]u8 = null,
+        /// The server `/mcp add` just added, to sign in to once the host has
+        /// loaded it and it asks for a login (`State.signInAfterAdd`). Owned.
+        sign_in_when_loaded: ?[]u8 = null,
 
         fn deinit(sink: *HostSink) void {
             if (sink.menu_tools) |*done| done.arena.deinit();
             if (sink.sign_in) |waiting| std.heap.c_allocator.free(waiting);
+            if (sink.sign_in_when_loaded) |name| std.heap.c_allocator.free(name);
             for (sink.notices.items) |n| std.heap.c_allocator.free(n.text);
             sink.notices.deinit(std.heap.c_allocator);
             for (sink.typed.items) |name| std.heap.c_allocator.free(name);
@@ -341,10 +439,9 @@ pub const State = struct {
             switch (notice) {
                 .authorize => |n| {
                     sink.waitForSignIn(n.server, n.url);
-                    // The menu shows the address; a typed login prints it.
+                    // The menu shows the address; a typed login links it.
                     if (!sink.isTyped(n.server)) return;
-                    const text = a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
-                    sink.pushLocked(text, false);
+                    sink.pushLocked(signInText(a, aa, n.server, n.url) catch return, false);
                 },
                 .signed_in => |server| {
                     sink.endSignIn(server);
@@ -414,6 +511,19 @@ pub const State = struct {
             sink.sign_in = null;
         }
 
+        /// Puts back the sign-in `State.signInAfterAdd` still waits on,
+        /// unless `/mcp add` named another server meanwhile. Takes `name`.
+        fn keepSignInWhenLoaded(sink: *HostSink, name: []u8) void {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            if (sink.sign_in_when_loaded == null) {
+                sink.sign_in_when_loaded = name;
+                return;
+            }
+            debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=another server was added", .{name});
+            std.heap.c_allocator.free(name);
+        }
+
         /// Takes ownership of `text`.
         fn push(sink: *HostSink, text: []u8, warning: bool) void {
             sink.mutex.lockUncancelable(io_mod.getIo());
@@ -430,6 +540,16 @@ pub const State = struct {
 
         fn safeText(arena: Allocator, raw: []const u8, max: usize) []const u8 {
             return (text_utils.encodeTerminalSafeInline(arena, raw, max) catch return "?").bytes;
+        }
+
+        /// What a typed login says once its address comes, owned by `alloc`:
+        /// a link to it, or, when it can't be a link target, the address
+        /// itself made safe, to copy.
+        fn signInText(alloc: Allocator, arena: Allocator, server: []const u8, url: []const u8) ![]u8 {
+            const name = safeText(arena, server, 160);
+            if (text_utils.isLinkTarget(url))
+                return alloc.print("Sign in to {s} in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;{s}\x1b\\" ++ mcp_menu.sign_in_link_label ++ "\x1b]8;;\x1b\\.", .{ name, url });
+            return alloc.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ name, safeText(arena, url, 16 * 1024) });
         }
     };
 
@@ -587,7 +707,7 @@ pub const State = struct {
                 .surface = .shell,
                 .home = job.home,
                 .workspace_root = job.workspace_root,
-                .hosts = .{ .context = self, .get = getHost, .release = putHost, .changed = configChanged },
+                .hosts = .{ .context = self, .get = getHost, .release = putHost, .changed = configChanged, .sign_in_when_loaded = signInWhenLoaded },
                 .cancel = &self.host_closing,
             }, args);
             const sink = self.host_sink orelse return;
@@ -613,7 +733,68 @@ pub const State = struct {
             const self: *State = @ptrCast(@alignCast(context));
             self.host_reload_requested.store(true, .release);
         }
+
+        fn signInWhenLoaded(context: *anyopaque, name: []const u8) void {
+            const self: *State = @ptrCast(@alignCast(context));
+            const sink = self.host_sink orelse return;
+            const copy = std.heap.c_allocator.dupe(u8, name) catch {
+                debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=out of memory", .{name});
+                return;
+            };
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            if (sink.sign_in_when_loaded) |old| {
+                debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=another server was added", .{old});
+                std.heap.c_allocator.free(old);
+            }
+            sink.sign_in_when_loaded = copy;
+        }
     };
+
+    /// On the UI thread, after each reload check: once the host has loaded
+    /// the server `/mcp add` added and it asks for a login, signs in the way
+    /// a typed `/mcp login` does, so the address and the outcome reach the
+    /// transcript. A server that loads without asking, is held, or is gone
+    /// ends the wait; one still connecting keeps it.
+    pub fn signInAfterAdd(self: *State) void {
+        const sink = self.host_sink orelse return;
+        const name = take: {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            const name = sink.sign_in_when_loaded orelse return;
+            sink.sign_in_when_loaded = null;
+            break :take name;
+        };
+        var keep = false;
+        defer if (keep) sink.keepSignInWhenLoaded(name) else std.heap.c_allocator.free(name);
+        // The tick that loads the change hasn't come yet.
+        if (self.host_reload_requested.load(.acquire)) {
+            keep = true;
+            return;
+        }
+        const lease = self.leaseHost() orelse return debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=no MCP host", .{name});
+        defer lease.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+        defer arena.deinit();
+        const statuses = lease.host.runtime.statusesNow(arena.allocator()) catch return debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=out of memory", .{name});
+        const status = for (statuses) |s| {
+            if (std.mem.eql(u8, s.name, name)) break s;
+        } else return debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=not in the loaded config", .{name});
+        if (!status.needs_login) {
+            keep = status.state == .idle or status.state == .connecting or status.state == .retrying;
+            if (!keep) debug_trace.logf("mcp", "MCP sign-in after add not needed server={s} state={s}", .{ name, @tagName(status.state) });
+            return;
+        }
+        // Its address and outcome go to the transcript, as a typed login's do.
+        sink.markTyped(name);
+        lease.host.runtime.login(name, mcp_verbs.canOpenBrowser()) catch |err| {
+            debug_trace.logf("mcp", "MCP sign-in after add failed server={s} err={s}", .{ name, @errorName(err) });
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            _ = sink.untype(name);
+            sink.mutex.unlock(io_mod.getIo());
+            sink.push(std.heap.c_allocator.print("Couldn't start signing in to {s}. Try /mcp login {s}.", .{ name, name }) catch return, true);
+        };
+    }
 
     pub fn hostMenuActive(self: *const State) bool {
         return self.host_menu.active;
@@ -983,74 +1164,12 @@ pub const State = struct {
         return null;
     }
 
-    pub fn snapshotModelCatalog(
-        self: *State,
-        alloc: Allocator,
-        baseline_alloc: Allocator,
-    ) !mcp_model_catalog.Report {
-        var snapshot = if (self.leaseHost()) |l| leased: {
-            defer l.deinit();
-            break :leased try l.host.catalog.modelSnapshot(alloc);
-        } else return .{ .snapshot = try mcp_model_catalog.Snapshot.empty(alloc) };
-        errdefer snapshot.deinit(alloc);
-        const notice = try self.updateModelCatalogBaseline(alloc, baseline_alloc, snapshot.servers);
-        return .{ .snapshot = snapshot, .change_notice = notice };
-    }
-
-    /// Compares the freshly rendered model catalog against the availability
-    /// the previous report showed the model, returning an owned note when it
-    /// changed. `baseline_alloc` owns the retained baseline and must be the
-    /// same long-lived allocator across calls and `deinit`.
-    fn updateModelCatalogBaseline(
-        self: *State,
-        alloc: Allocator,
-        baseline_alloc: Allocator,
-        current: []const mcp_model_catalog.ServerSummary,
-    ) !?[]u8 {
-        // A discovery pass that is still settling is not a model-visible
-        // change; wait for a stable listing before teaching the model about
-        // availability deltas so session startup never renders a notice.
-        for (current) |server| {
-            if (server.availability == .discovering) return null;
-        }
-        self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
-        defer self.model_catalog_baseline_lock.unlock(io_mod.getIo());
-        const notice = if (self.model_catalog_baseline) |baseline|
-            try mcp_model_catalog.renderChangeNotice(alloc, baseline, current)
-        else
-            null;
-        errdefer if (notice) |text| alloc.free(text);
-        try self.replaceModelCatalogBaselineLocked(baseline_alloc, current);
-        return notice;
-    }
-
-    fn replaceModelCatalogBaselineLocked(
-        self: *State,
-        baseline_alloc: Allocator,
-        current: []const mcp_model_catalog.ServerSummary,
-    ) !void {
-        var next = try baseline_alloc.alloc(mcp_model_catalog.BaselineEntry, current.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (next[0..initialized]) |entry| baseline_alloc.free(entry.name);
-            baseline_alloc.free(next);
-        }
-        for (current, 0..) |server, index| {
-            next[index] = .{
-                .name = try baseline_alloc.dupe(u8, server.name),
-                .availability = server.availability,
-            };
-            initialized += 1;
-        }
-        self.clearModelCatalogBaselineLocked(baseline_alloc);
-        self.model_catalog_baseline = next;
-    }
-
-    fn clearModelCatalogBaselineLocked(self: *State, baseline_alloc: Allocator) void {
-        const baseline = self.model_catalog_baseline orelse return;
-        for (baseline) |entry| baseline_alloc.free(entry.name);
-        baseline_alloc.free(baseline);
-        self.model_catalog_baseline = null;
+    /// The names of the MCP servers the model may reach, for the toolbox
+    /// menu. `alloc` owns the slice and each name.
+    pub fn serverNames(self: *State, alloc: Allocator) ![]const []const u8 {
+        const l = self.leaseHost() orelse return &.{};
+        defer l.deinit();
+        return l.host.catalog.serverNames(alloc);
     }
 
     /// At exit: once `process_exiting` is set, `destroyHost` signals the
@@ -1060,11 +1179,8 @@ pub const State = struct {
         self.destroyHost();
     }
 
-    pub fn deinit(self: *State, alloc: Allocator) void {
+    pub fn deinit(self: *State) void {
         self.destroyHost();
-        self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
-        self.clearModelCatalogBaselineLocked(alloc);
-        self.model_catalog_baseline_lock.unlock(io_mod.getIo());
         self.* = .{};
     }
 };
@@ -1093,71 +1209,16 @@ test "a typed /mcp login names its server wherever --no-browser goes" {
     }
 }
 
-test "model catalog baseline surfaces availability changes once" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    const before = [_]mcp_model_catalog.ServerSummary{
-        .{ .name = @constCast("linear"), .availability = .authentication_required },
-    };
-    const first = try state.updateModelCatalogBaseline(alloc, alloc, &before);
-    try std.testing.expectEqual(@as(?[]u8, null), first);
-
-    const after = [_]mcp_model_catalog.ServerSummary{
-        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
-    };
-    const changed = try state.updateModelCatalogBaseline(alloc, alloc, &after);
-    defer if (changed) |notice| alloc.free(notice);
-    try std.testing.expect(changed != null);
-    try std.testing.expect(std.mem.find(u8, changed.?, "linear: authentication_required -> ready (74 tools)") != null);
-
-    const settled = try state.updateModelCatalogBaseline(alloc, alloc, &after);
-    try std.testing.expectEqual(@as(?[]u8, null), settled);
-}
-
-test "model catalog baseline waits out discovery before recording state" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    const discovering = [_]mcp_model_catalog.ServerSummary{
-        .{ .name = @constCast("linear"), .availability = .discovering },
-    };
-    const during_discovery = try state.updateModelCatalogBaseline(alloc, alloc, &discovering);
-    try std.testing.expectEqual(@as(?[]u8, null), during_discovery);
-    try std.testing.expect(state.model_catalog_baseline == null);
-
-    const ready = [_]mcp_model_catalog.ServerSummary{
-        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
-    };
-    const settled = try state.updateModelCatalogBaseline(alloc, alloc, &ready);
-    try std.testing.expectEqual(@as(?[]u8, null), settled);
-    try std.testing.expect(state.model_catalog_baseline != null);
-
-    const failed = [_]mcp_model_catalog.ServerSummary{
-        .{ .name = @constCast("linear"), .availability = .failed },
-    };
-    const outage = try state.updateModelCatalogBaseline(alloc, alloc, &failed);
-    defer if (outage) |notice| alloc.free(notice);
-    try std.testing.expect(outage != null);
-    try std.testing.expect(std.mem.find(u8, outage.?, "linear: ready -> failed") != null);
-}
-
-test "model catalog baseline reports removals" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    const before = [_]mcp_model_catalog.ServerSummary{
-        .{ .name = @constCast("slack"), .availability = .ready, .tool_count = 3 },
-    };
-    _ = try state.updateModelCatalogBaseline(alloc, alloc, &before);
-
-    const removed = try state.updateModelCatalogBaseline(alloc, alloc, &.{});
-    defer if (removed) |notice| alloc.free(notice);
-    try std.testing.expect(removed != null);
-    try std.testing.expect(std.mem.find(u8, removed.?, "slack: removed") != null);
+test "a typed sign-in prints an address that can't be a link, to copy" {
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    const notify = sink.notify();
+    sink.markTyped("docs");
+    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/a b\x1b[2J" } });
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    const text = sink.notices.items[0].text;
+    try std.testing.expect(std.mem.startsWith(u8, text, "Sign in to docs in your browser. If it didn't open, go to:\n  https://a.example/a b"));
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
 }
 
 test "a typed sign-in reports in the transcript, any other on the status line" {
@@ -1168,6 +1229,11 @@ test "a typed sign-in reports in the transcript, any other on the status line" {
     notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
     notify.notice(notify.context, .{ .signed_in = "docs" });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+    // The address is a link under a few words, not printed out.
+    try std.testing.expectEqualStrings(
+        "Sign in to docs in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;https://a.example/authorize\x1b\\Open the sign-in page\x1b]8;;\x1b\\.",
+        sink.notices.items[0].text,
+    );
     try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
     try std.testing.expect(sink.news == null);
     // Once reported, the next sign-in to it isn't typed.
@@ -1180,4 +1246,120 @@ test "a typed sign-in reports in the transcript, any other on the status line" {
     // Needing a login is the status line's to say.
     notify.notice(notify.context, .{ .needs_login = "docs" });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+}
+
+fn writeTestFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| try tmp.dir.createDirPath(io_mod.getIo(), parent);
+    var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), content);
+}
+
+test "the config stamp follows the MCP config files and project choices, and nothing else" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    const none = configStamp(alloc, home, root);
+    try std.testing.expectEqual(none, configStamp(alloc, home, root));
+    // An empty file isn't a missing one.
+    try writeTestFile(&tmp, "home/.fx/mcp.json", "");
+    const blank = configStamp(alloc, home, root);
+    try std.testing.expect(blank != none);
+    try writeTestFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcp":{"linear":{"url":"https://mcp.linear.app/mcp"}}}
+    );
+    const profile = configStamp(alloc, home, root);
+    try std.testing.expect(profile != blank);
+    try writeTestFile(&tmp, "workspace/.mcp.json",
+        \\{"mcpServers":{"p":{"command":"p-server"}}}
+    );
+    const project = configStamp(alloc, home, root);
+    try std.testing.expect(project != profile);
+
+    // Settings other than the project's MCP choices, such as a model switch,
+    // leave it as it was.
+    const unrelated = try alloc.print("{{\"permission_mode\":\"auto\",\"workspaces\":{{\"{s}\":{{\"max_agent_steps\":10}}}}}}", .{root});
+    defer alloc.free(unrelated);
+    try writeTestFile(&tmp, "home/.fx/settings.json", unrelated);
+    try std.testing.expectEqual(project, configStamp(alloc, home, root));
+
+    const approved = try alloc.print("{{\"workspaces\":{{\"{s}\":{{\"" ++ @import("../mcp/project_config.zig").enabled_servers_key ++ "\":[\"p\"]}}}}}}", .{root});
+    defer alloc.free(approved);
+    try writeTestFile(&tmp, "home/.fx/settings.json", approved);
+    // The approval is read, so the change below is the approval's.
+    var load = try config_runtime.loadProjectMcpChoicesFromHome(alloc, home, root);
+    defer load.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), load.choices.approved.len);
+    try std.testing.expect(configStamp(alloc, home, root) != project);
+}
+
+const TestLoader = struct {
+    var loads: usize = 0;
+    var fail = false;
+
+    fn load(_: Allocator, _: []const u8, _: tool_dispatch.Registry, _: mcp_host.Extras) anyerror!?*mcp_host.Host {
+        loads += 1;
+        if (fail) return error.McpConfigInvalidJson;
+        return null;
+    }
+};
+
+test "the host loads again when its config files change outside the session, once per change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+    TestLoader.loads = 0;
+    TestLoader.fail = false;
+    const registry: tool_dispatch.Registry = .{ .tools = &.{} };
+    var state: State = .{};
+    defer state.deinit();
+
+    try state.loadHost(TestLoader.load, alloc, home, root, registry, .{});
+    try std.testing.expectEqual(@as(usize, 1), TestLoader.loads);
+    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
+
+    // `fx mcp add` in a shell writes the profile; only a check that reads the
+    // files notices.
+    try writeTestFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcp":{"linear":{"url":"https://mcp.linear.app/mcp"}}}
+    );
+    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .requested));
+    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .files));
+    try std.testing.expectEqual(@as(usize, 2), TestLoader.loads);
+    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
+
+    // A `/mcp` command's own change loads even when the files read the same.
+    state.host_reload_requested.store(true, .release);
+    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .requested));
+    try std.testing.expectEqual(@as(usize, 3), TestLoader.loads);
+
+    // A load that fails warns once for the change, not at every check.
+    TestLoader.fail = true;
+    try writeTestFile(&tmp, "workspace/.mcp.json",
+        \\{"mcpServers":{"p":{"command":"p-server"}}}
+    );
+    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .files));
+    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
+    try std.testing.expectEqual(@as(usize, 4), TestLoader.loads);
+    const notices = state.takeHostNotices();
+    defer {
+        for (notices) |n| std.heap.c_allocator.free(n.text);
+        std.heap.c_allocator.free(notices);
+    }
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expect(notices[0].warning);
+    try std.testing.expectEqualStrings("The MCP config changed, but fx couldn't load it: ~/.fx/mcp.json isn't valid JSON. Your current servers are still active.", notices[0].text);
 }

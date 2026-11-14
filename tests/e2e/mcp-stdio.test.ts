@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runFx } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
@@ -21,6 +21,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { traceReportNames, waitForNewTraceReport } from "./trace-report";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -80,6 +81,8 @@ type RootOptions = {
     | "stall_operation"
     | "stall_startup"
     | "tool_failure"
+    | "tool_protocol_error"
+    | "invalid_params"
     | "image_result"
     | "response_missing_jsonrpc"
     | "response_wrong_jsonrpc"
@@ -106,9 +109,12 @@ type RootOptions = {
     | "startup_exit"
     | "startup_exit_after_delay"
     | "startup_garbage"
-    | "exit_after_result";
+    | "exit_after_result"
+    | "typed_arguments";
   startupTimeoutMs?: number;
   protocolErrorMessage?: string;
+  /** The text a `tool_failure` server's error carries, or a `tool_protocol_error` server's message, in place of its plain two lines. */
+  failureText?: string;
   operationTimeoutMs?: number;
   restartLimit?: number;
   recoveredToolName?: string;
@@ -182,6 +188,10 @@ function createRoot(
             FX_MCP_MODE: options.mode ?? "normal",
             FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
             FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
+            // JSON, so the text can hold bytes an environment variable cannot.
+            FX_MCP_FAILURE_TEXT: options.failureText === undefined
+              ? undefined
+              : JSON.stringify(options.failureText),
             FX_MCP_CRASH_MARKER: join(root, "mcp-crashed"),
             FX_MCP_RECOVERY_READY_PATH: join(root, "mcp-recovery-ready"),
             FX_MCP_INVALIDATION_RELEASE_PATH: invalidationReleasePath,
@@ -264,7 +274,7 @@ function fixtureEnv(root: FixtureRoot, activeGateway: ReturnType<typeof startFak
     FX_PERMISSION_MODE: "auto",
     FX_GATEWAY_BASE_URL: activeGateway.baseUrl,
     FX_GATEWAY_CHAT_URL: activeGateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: activeGateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: activeGateway.chatUrl,
     FX_MODEL: MODEL,
     FX_TRACE_LOG: root.traceLogPath,
     FX_TRACE_SCOPES: "mcp",
@@ -273,8 +283,8 @@ function fixtureEnv(root: FixtureRoot, activeGateway: ReturnType<typeof startFak
 
 function startToolGateway(finalText: string) {
   return startFakeGateway([
-    fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-    fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
     fakeGatewayFinalText(finalText),
   ], {
     models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -358,10 +368,10 @@ describe("modern MCP stdio compatibility", () => {
       const stderrPath = join(root.root, "stderr.log");
       const expectedArguments = '{"text":"mcp-live-human-active"}';
       const activeGateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("call_mcp", TOOL_NAME, {
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: {
           text: "mcp-live-human-active",
-        }),
+        } }),
         fakeGatewayFinalText("MCP approval denied without transport."),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -504,8 +514,8 @@ describe("modern MCP stdio compatibility", () => {
     writeFileSync(projectPath, JSON.stringify(project));
     gateway = startFakeGateway([
       fakeGatewayFinalText("WORKSPACE_MCP_SKIPPED"),
-      fakeGatewayToolCall("workspace_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("workspace_call", TOOL_NAME, { text: "workspace" }),
+      fakeGatewayToolCall("workspace_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("workspace_call", "toolbox", { run: TOOL_NAME, arguments: { text: "workspace" } }),
       fakeGatewayFinalText("WORKSPACE_MCP_READY"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -615,8 +625,8 @@ describe("modern MCP stdio compatibility", () => {
       writeFileSync(profilePath, JSON.stringify(profile));
       let first = "";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
         (body: string) => {
           first = toolResultText(body, "call_mcp");
           return fakeGatewayFinalText("OVERSIZED_REPLY_DONE");
@@ -643,8 +653,8 @@ describe("modern MCP stdio compatibility", () => {
       let stored = "";
       let read = "";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
         (body: string) => {
           stored = toolResultText(body, "call_mcp");
           const handle = /<tool_result_handle>([^<]+)<\/tool_result_handle>/.exec(stored)?.[1] ?? "missing";
@@ -675,8 +685,8 @@ describe("modern MCP stdio compatibility", () => {
       const root = bigResultRoot("big-result-unsaved");
       let cut = "";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
         (body: string) => {
           cut = toolResultText(body, "call_mcp");
           return fakeGatewayFinalText("BIG_RESULT_CUT");
@@ -1000,8 +1010,8 @@ describe("modern MCP stdio compatibility", () => {
   test("fresh and resumed native sessions reconstruct MCP from the current profile", async () => {
     const root = createRoot("resume-current-profile", MODERN_FIXTURE);
     const initialGateway = startFakeGateway([
-      fakeGatewayToolCall("fresh_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("fresh_call", TOOL_NAME, { text: "fresh" }),
+      fakeGatewayToolCall("fresh_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("fresh_call", "toolbox", { run: TOOL_NAME, arguments: { text: "fresh" } }),
       fakeGatewayFinalText("FRESH_PROFILE_MCP_READY"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1029,8 +1039,8 @@ describe("modern MCP stdio compatibility", () => {
 
     const resumedTool = "mcp_fixture_sum";
     const resumedGateway = startFakeGateway([
-      fakeGatewayToolCall("resume_select", "mcp_select_tool", { name: resumedTool }),
-      fakeGatewayToolCall("resume_call", resumedTool, { text: "resumed" }),
+      fakeGatewayToolCall("resume_select", "toolbox", { open: resumedTool }),
+      fakeGatewayToolCall("resume_call", "toolbox", { run: resumedTool, arguments: { text: "resumed" } }),
       fakeGatewayFinalText("RESUMED_PROFILE_MCP_READY"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1055,6 +1065,124 @@ describe("modern MCP stdio compatibility", () => {
     expect(calls[0]?.message.params?.name).toBe("echo");
     expect(calls[1]?.message.params?.name).toBe("sum");
     expect(new Set(wire.map((entry) => entry.pid)).size).toBe(2);
+    await expectFixtureProcessesExited(wire);
+  }, 45_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI runs a later turn's direct call to an MCP tool an earlier turn loaded",
+    async () => {
+      // The shell can ask, so it says so in every request's capabilities.
+      const root = createRoot("tui-later-turn-direct-call", MODERN_FIXTURE, {
+        expectedElicitation: "both",
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("first_call", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+        fakeGatewayFinalText("FIRST_TURN_DONE"),
+        fakeGatewayToolCall("later_call", "toolbox", { run: TOOL_NAME, arguments: { text: "later" } }),
+        fakeGatewayFinalText("LATER_TURN_DONE"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Load the fixture echo tool and call it.");
+      await tui.waitForText("FIRST_TURN_DONE", 20_000);
+      await tui.waitForComposer(10_000);
+      expect(toolResultText(activeGateway.requests[2]!.body, "first_call")).toContain(`${MODERN_RESULT}:first`);
+      await tui.sendText("Call the echo tool again.");
+      await tui.waitForText("LATER_TURN_DONE", 20_000);
+      await tui.waitForComposer(10_000);
+
+      expect(activeGateway.requests).toHaveLength(5);
+      // The later turn starts without the tool: the model calls it directly.
+      const laterTools = (JSON.parse(activeGateway.requests[3]!.body) as {
+        tools?: Array<{ name: string }>;
+      }).tools?.map((tool) => tool.name) ?? [];
+      expect(laterTools).not.toContain(TOOL_NAME);
+      const laterResult = toolResultText(activeGateway.requests[4]!.body, "later_call");
+      expect(laterResult).toContain(`${MODERN_RESULT}:later`);
+      expect(laterResult).not.toContain("not selected");
+      const calls = readWire(root.wireLogPath).filter(
+        (entry) => entry.message.method === "tools/call",
+      );
+      expect(calls.map((entry) => entry.message.params?.arguments)).toEqual([
+        { text: "first" },
+        { text: "later" },
+      ]);
+
+      // Each turn's tool group names its MCP call as MCP work, never as a
+      // command.
+      const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain("● Used an MCP tool");
+      expect(scrollback).not.toMatch(/\b\d+ commands?\b|\b[Rr]an (a )?commands?\b/);
+      expect(scrollback).not.toContain("not selected");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    60_000,
+  );
+
+  test("a resumed fx ask runs a direct call to an MCP tool an earlier turn loaded", async () => {
+    const root = createRoot("ask-later-turn-direct-call", MODERN_FIXTURE);
+    const firstGateway = startToolGateway("FIRST_ASK_DONE");
+    gateway = firstGateway;
+    const first = await runFx(
+      ["ask", "--json", "--auto", "Load the fixture echo tool and call it."],
+      { cwd: root.workspace, env: fixtureEnv(root, firstGateway), timeoutMs: 20_000 },
+    );
+    expect(first.code).toBe(0);
+    const sessionId = JSON.parse(first.stdout).session_id;
+    expect(sessionId).toBeTruthy();
+    firstGateway.stop();
+    gateway = null;
+
+    const missingTool = "mcp_fixture_missing";
+    const laterGateway = startFakeGateway([
+      fakeGatewayToolCall("missing_call", missingTool, { text: "nothing" }),
+      fakeGatewayToolCall("later_call", "toolbox", { run: TOOL_NAME, arguments: { text: "later" } }),
+      fakeGatewayFinalText("LATER_ASK_DONE"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = laterGateway;
+    const later = await runFx(
+      ["ask", "--json", "--auto", "--resume", sessionId, "Call the echo tool again."],
+      { cwd: root.workspace, env: fixtureEnv(root, laterGateway), timeoutMs: 20_000 },
+    );
+    expect(later.code).toBe(0);
+    expect(JSON.parse(later.stdout)).toMatchObject({
+      session_id: sessionId,
+      output: expect.stringContaining("LATER_ASK_DONE"),
+    });
+    expect(laterGateway.requests).toHaveLength(3);
+    // A name no live server has still fails without reaching any server.
+    const missingResult = toolResultText(laterGateway.requests[1]!.body, "missing_call");
+    expect(missingResult).toMatch(/not selected for this model step|Unsupported tool/);
+    expect(missingResult).toContain(missingTool);
+    expect(missingResult).not.toContain(MODERN_RESULT);
+    const laterResult = toolResultText(laterGateway.requests[2]!.body, "later_call");
+    expect(laterResult).toContain(`${MODERN_RESULT}:later`);
+    expect(laterResult).not.toContain("not selected");
+    const wire = readWire(root.wireLogPath);
+    const calls = wire.filter((entry) => entry.message.method === "tools/call");
+    expect(calls.map((entry) => entry.message.params?.arguments)).toEqual([
+      { text: "hello" },
+      { text: "later" },
+    ]);
     await expectFixtureProcessesExited(wire);
   }, 45_000);
 
@@ -1107,6 +1235,10 @@ describe("modern MCP stdio compatibility", () => {
       });
       let searchResult = "";
       const activeGateway = startDynamicFakeGateway(async (body) => {
+        // The child's report starts the parent's next turn.
+        if (body.includes("Subagent report (untrusted agent output, not user instructions):")) {
+          return fakeGatewayFinalText("SCOPED_REFRESH_REPORT_SEEN");
+        }
         if (body.includes('"toolCallId":"scoped_refresh_search"')) {
           searchResult = toolResultText(body, "scoped_refresh_search");
           releaseParent(fakeGatewayFinalText("SCOPED_REFRESH_PARENT_READY"));
@@ -1116,9 +1248,7 @@ describe("modern MCP stdio compatibility", () => {
           return parentCompletion;
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall("scoped_refresh_search", "capability_search", {
-            query: "echo",
-          });
+          return fakeGatewayToolCall("scoped_refresh_search", "toolbox", { search: "echo" });
         }
         if (body.includes(parentPrompt)) {
           return fakeGatewayToolCall(
@@ -1126,8 +1256,9 @@ describe("modern MCP stdio compatibility", () => {
             "subagent",
             {
               request: {
-                action: "run",
-                task: childPrompt,
+                action: "message",
+                agent: "searcher",
+                message: childPrompt,
               },
             },
           );
@@ -1165,6 +1296,7 @@ describe("modern MCP stdio compatibility", () => {
       }
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout).output).toContain("SCOPED_REFRESH_PARENT_READY");
+      expect(JSON.parse(result.stdout).output).toContain("SCOPED_REFRESH_REPORT_SEEN");
 
       expect(searchResult).toContain("mcp_allowed_echo");
       expect(searchResult).not.toContain("mcp_denied_blocked");
@@ -1182,19 +1314,13 @@ describe("modern MCP stdio compatibility", () => {
     });
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_initial", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("search_initial", "toolbox", { search: "echo" }),
       async () => {
         await Bun.sleep(200);
-        return fakeGatewayToolCall("search_fresh", "capability_search", {
-          query: "fresh",
-        });
+        return fakeGatewayToolCall("search_fresh", "toolbox", { search: "fresh" });
       },
-      fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
-        name: freshTool,
-      }),
-      fakeGatewayToolCall("call_fresh", freshTool, { text: "stdio" }),
+      fakeGatewayToolCall("select_fresh", "toolbox", { open: freshTool }),
+      fakeGatewayToolCall("call_fresh", "toolbox", { run: freshTool, arguments: { text: "stdio" } }),
       fakeGatewayFinalText("Live stdio cache refresh complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1234,20 +1360,14 @@ describe("modern MCP stdio compatibility", () => {
     });
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_initial", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("search_initial", "toolbox", { search: "echo" }),
       async () => {
         writeFileSync(root.invalidationReleasePath, "ready");
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "capability_search", {
-          query: "fresh",
-        });
+        return fakeGatewayToolCall("search_fresh", "toolbox", { search: "fresh" });
       },
-      fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
-        name: freshTool,
-      }),
-      fakeGatewayToolCall("call_fresh", freshTool, { text: "legacy-stdio" }),
+      fakeGatewayToolCall("select_fresh", "toolbox", { open: freshTool }),
+      fakeGatewayToolCall("call_fresh", "toolbox", { run: freshTool, arguments: { text: "legacy-stdio" } }),
       fakeGatewayFinalText("Legacy stdio live refresh complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1372,8 +1492,8 @@ describe("modern MCP stdio compatibility", () => {
     test(`MCP image results ${supportsImages ? "reach the model as images" : "remain explicit for a text-only model"}`, async () => {
       const root = createRoot("image-output", MODERN_FIXTURE, { mode: "image_result" });
       gateway = startFakeGateway([
-        fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
+        fakeGatewayToolCall("image_select", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("image_call", "toolbox", { run: TOOL_NAME, arguments: { text: "screenshot" } }),
         fakeGatewayFinalText("Image result observed."),
       ], { models: [{ id: MODEL, type: "language", tags: supportsImages ? ["tool-use", "vision", "file-input"] : ["tool-use"] }] });
       const result = await runFx(["ask", "--json", "--auto", "--no-save", "Get an image from the fixture"], {
@@ -1411,8 +1531,8 @@ describe("modern MCP stdio compatibility", () => {
     const original = solidPng(3420, 2224);
     const root = createRoot("wide-image-output", MODERN_FIXTURE, { mode: "image_result", image: original });
     gateway = startFakeGateway([
-      fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
+      fakeGatewayToolCall("image_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("image_call", "toolbox", { run: TOOL_NAME, arguments: { text: "screenshot" } }),
       fakeGatewayFinalText("Wide image result observed."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }] });
     const result = await runFx(["ask", "--json", "--auto", "--no-save", "Get an image from the fixture"], {
@@ -1445,8 +1565,8 @@ describe("modern MCP stdio compatibility", () => {
     const root = createRoot("saved-image", MODERN_FIXTURE, { mode: "image_result" });
     const models = [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }];
     gateway = startFakeGateway([
-      fakeGatewayToolCall("saved_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("saved_image", TOOL_NAME, { text: "screenshot" }),
+      fakeGatewayToolCall("saved_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("saved_image", "toolbox", { run: TOOL_NAME, arguments: { text: "screenshot" } }),
       fakeGatewayFinalText("Screenshot saved."),
     ], { models });
     const first = await runFx(["ask", "--json", "--auto", "Get a screenshot"], {
@@ -1492,10 +1612,10 @@ describe("modern MCP stdio compatibility", () => {
       mode: "tool_failure",
     });
     gateway = startFakeGateway([
-      fakeGatewayToolCall("retry_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("retry_call_1", TOOL_NAME, { text: "one" }),
-      fakeGatewayToolCall("retry_call_2", TOOL_NAME, { text: "two" }),
-      fakeGatewayToolCall("retry_call_3", TOOL_NAME, { text: "three" }),
+      fakeGatewayToolCall("retry_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("retry_call_1", "toolbox", { run: TOOL_NAME, arguments: { text: "one" } }),
+      fakeGatewayToolCall("retry_call_2", "toolbox", { run: TOOL_NAME, arguments: { text: "two" } }),
+      fakeGatewayToolCall("retry_call_3", "toolbox", { run: TOOL_NAME, arguments: { text: "three" } }),
       fakeGatewayFinalText("Bounded MCP retries complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1518,6 +1638,135 @@ describe("modern MCP stdio compatibility", () => {
     expect(gateway.requests.at(-1)?.body).not.toContain(
       "Repeated MCP tool call blocked: two equivalent attempts failed",
     );
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  for (const retriedLimit of [40, "forty"]) {
+    test(`a 2026 server that refuses a call's arguments with -32602 still answers the next call (${JSON.stringify(retriedLimit)})`, async () => {
+      const root = createRoot("typed-arguments-refused", MODERN_FIXTURE, { mode: "typed_arguments" });
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("typed_select", "toolbox", { open: TOOL_NAME }),
+        // Text that is not a number stays text, so the server refuses it.
+        fakeGatewayToolCall("refused_call", "toolbox", { run: TOOL_NAME, arguments: { limit: "forty" } }),
+        fakeGatewayToolCall("retried_call", "toolbox", { run: TOOL_NAME, arguments: { limit: retriedLimit } }),
+        fakeGatewayFinalText("Refused MCP arguments complete."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+      );
+
+      const wire = readWire(root.wireLogPath);
+      expect(result.code).toBe(0);
+      expect(toolResultText(gateway.requests[2]!.body, "refused_call")).toContain("-32602");
+      const retried = toolResultText(gateway.requests[3]!.body, "retried_call");
+      expect(retried).toContain(retriedLimit === 40 ? "TYPED_ARGUMENTS_OK" : "-32602");
+      expect(retried).not.toContain("unavailable");
+      // The refusal is about the arguments, so fx keeps the 2026 session.
+      expect(wire.filter((entry) => entry.message.method === "initialize")).toHaveLength(0);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(2);
+      expect(new Set(wire.map((entry) => entry.pid)).size).toBe(1);
+      await expectFixtureProcessesExited(wire);
+    }, 30_000);
+  }
+
+  test("typed MCP arguments the model wrote as text reach the server as their schema's types", async () => {
+    const root = createRoot("typed-arguments-repaired", MODERN_FIXTURE, { mode: "typed_arguments" });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("typed_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("typed_call", "toolbox", {
+        run: TOOL_NAME,
+        arguments: {
+          text: "40",
+          limit: "40",
+          count: "7",
+          verbose: "true",
+          queries: "[\"sum:requests{*}\"]",
+          filter: "{\"env\":\"prod\"}",
+          either: "40",
+        },
+      }),
+      fakeGatewayFinalText("Typed MCP arguments complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Typed MCP arguments complete.");
+    const wire = readWire(root.wireLogPath);
+    // Only the string fields keep the model's text.
+    expect(wire.filter((entry) => entry.message.method === "tools/call").map((entry) => entry.message.params?.arguments))
+      .toEqual([{
+        text: "40",
+        limit: 40,
+        count: 7,
+        verbose: true,
+        queries: ["sum:requests{*}"],
+        filter: { env: "prod" },
+        either: "40",
+      }]);
+    const typedResult = toolResultText(gateway.requests[2]!.body, "typed_call");
+    expect(typedResult).toContain("TYPED_ARGUMENTS_OK");
+    expect(typedResult).not.toContain("-32602");
+    // One trace line per changed field, with no argument values in it.
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    const repaired = trace.split("\n").filter((line) => line.includes("MCP argument sent as its schema's type"));
+    expect(repaired.map((line) => line.match(/field=(\S+) type=(\S+)/)?.slice(1))).toEqual([
+      ["limit", "number"],
+      ["count", "integer"],
+      ["verbose", "boolean"],
+      ["queries", "array"],
+      ["filter", "object"],
+    ]);
+    for (const line of repaired) {
+      expect(line).toContain("server=fixture tool=echo");
+      expect(line).not.toContain("requests");
+      expect(line).not.toContain("prod");
+    }
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("MCP arguments that aren't their schema's type reach the server as the model wrote them", async () => {
+    const root = createRoot("typed-arguments-kept", MODERN_FIXTURE, { mode: "typed_arguments" });
+    const sent = {
+      text: "true",
+      limit: "forty",
+      count: "4.5",
+      verbose: "True",
+      queries: "[\"unclosed\"",
+      filter: "[1]",
+      either: "40",
+    };
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("kept_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("kept_call", "toolbox", { run: TOOL_NAME, arguments: sent }),
+      fakeGatewayFinalText("Kept MCP arguments complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Query the typed MCP tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+
+    expect(result.code).toBe(0);
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call").map((entry) => entry.message.params?.arguments))
+      .toEqual([sent]);
+    // The server's own error reaches the model.
+    const keptResult = toolResultText(gateway.requests[2]!.body, "kept_call");
+    expect(keptResult).toContain("-32602");
+    expect(keptResult).toContain("validating /properties/limit");
+    expect(readFileSync(root.traceLogPath, "utf8")).not.toContain("MCP argument sent as its schema's type");
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
@@ -1649,12 +1898,7 @@ describe("modern MCP stdio compatibility", () => {
       recordLaunchAttempts: true,
     });
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("search_failed", "capability_search", {
-        kind: "mcp",
-        server: "fixture",
-        query: "fixture tools",
-        limit: 5,
-      }),
+      fakeGatewayToolCall("search_failed", "toolbox", { search: "fixture tools", server: "fixture" }),
       fakeGatewayFinalText("STARTUP_FAILURE_REPORTED"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1698,8 +1942,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     writeFileSync(profilePath, JSON.stringify(profile));
     let sawFirstExit = true;
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("first_call", TOOL_NAME, { text: "first" }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("first_call", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
       async () => {
         // Call again only after the first server has exited.
         const firstExited = () => {
@@ -1720,7 +1964,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
           }
           await Bun.sleep(20);
         }
-        return fakeGatewayToolCall("second_call", TOOL_NAME, { text: "second" });
+        return fakeGatewayToolCall("second_call", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } });
       },
       fakeGatewayFinalText("RESTART_FAILURE_REPORTED"),
     ], {
@@ -1769,9 +2013,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         mode: malformed.mode,
       });
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_malformed", "capability_search", {
-          query: "fixture",
-        }),
+        fakeGatewayToolCall("search_malformed", "toolbox", { search: "fixture" }),
         fakeGatewayFinalText("Malformed stdio fixture isolated."),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1934,9 +2176,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startFakeGateway([
         discovery === "select"
-          ? fakeGatewayToolCall("target_select", "mcp_select_tool", { name: TOOL_NAME })
-          : fakeGatewayToolCall("target_search", "capability_search", { server: "fixture", query: "echo" }),
-        fakeGatewayToolCall("target_call", TOOL_NAME, { text: "hello" }),
+          ? fakeGatewayToolCall("target_select", "toolbox", { open: TOOL_NAME })
+          : fakeGatewayToolCall("target_search", "toolbox", { search: "echo", server: "fixture" }),
+        fakeGatewayToolCall("target_call", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
         fakeGatewayFinalText("Targeted server works."),
       ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
       const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the fixture server"], {
@@ -2013,8 +2255,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       draft7Pattern: "^\\S+$",
     });
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "\u00A0" }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "\u00A0" } }),
       fakeGatewayFinalText("Legacy Draft 7 invalid complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -2098,6 +2340,38 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
+  test("fx ask tells the model that a stdio call outlived its operation timeout", async () => {
+    const root = createRoot("ask-operation-timeout", MODERN_FIXTURE, {
+      mode: "stall_operation",
+      operationTimeoutMs: 1_500,
+    });
+    const activeGateway = startToolGateway("Operation timeout complete.");
+    gateway = activeGateway;
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the stalled MCP fixture."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, activeGateway),
+        timeoutMs: 20_000,
+      },
+    );
+
+    // fx stops waiting, cancels the call on the server, and tells the model
+    // why and how to wait longer, rather than that the call was cancelled.
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Operation timeout complete.");
+    expect(activeGateway.requests).toHaveLength(3);
+    const toolResult = toolResultText(activeGateway.requests[2]?.body ?? "", "call_mcp");
+    expect(toolResult).toStartWith("fx stopped waiting for MCP server 'fixture': it did not answer within its operation timeout.");
+    expect(toolResult).toContain("Raise operation_timeout_ms for this server in its MCP config if it needs longer.");
+    expect(toolResult).not.toContain("Cancelled");
+    const wire = readWire(root.wireLogPath);
+    const call = wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+    const cancelled = wire.find((entry) => entry.message.method === "notifications/cancelled");
+    expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
   test.skipIf(!tmuxAvailable())(
     "the TUI calls the modern stdio fixture through the shared runtime",
     async () => {
@@ -2169,13 +2443,15 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the failing MCP fixture once.");
+      // The failed call's reason shows on the line below its row.
       await tui.waitForText(
-        `Failed ${TOOL_NAME}: Invalid input: labels require at least one item retry rejected`,
+        "✗ Invalid input: labels require at least one item retry rejected",
         20_000,
       );
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain(`└ Failed ${TOOL_NAME}\n  ✗ Invalid input: labels require at least one item retry rejected`);
       expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",
@@ -2191,6 +2467,57 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       await expectFixtureProcessesExited(wire);
     },
     30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI and the trace name the rejected arguments when an MCP server refuses a call's parameters",
+    async () => {
+      // A 2025 server, as Datadog's is. A 2026 server's -32602 on a call keeps its
+      // session ("a 2026 server that refuses a call's arguments with -32602 still
+      // answers the next call" in this file).
+      const root = createRoot("tui-invalid-params", LEGACY_FIXTURE, {
+        mode: "invalid_params",
+        legacyVersion: "2025-06-18",
+      });
+      const activeGateway = startToolGateway("Rejected arguments complete.");
+      gateway = activeGateway;
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 32,
+        stderrPath,
+        // /trace writes its report to TMPDIR.
+        env: { ...fixtureEnv(root, activeGateway), TMPDIR: root.root },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the MCP fixture with a typed argument.");
+      const cause = "arguments rejected: limit is a string, the schema wants a number";
+      // The row names the failed call, and the reason line under it names the
+      // cause.
+      await tui.waitForText(cause, 20_000);
+      await tui.waitForText("Rejected arguments complete.", 20_000);
+      expect(await tui.captureFullScrollback()).toContain(`Failed ${TOOL_NAME}`);
+      // The model still gets the server's own words, which say how to fix the call.
+      expect(activeGateway.requests.at(-1)?.body).toContain("validating /properties/limit");
+
+      await tui.sendText("/trace");
+      const report = await waitForNewTraceReport(root.root);
+      expect(traceReportNames(root.root)).toHaveLength(1);
+      const problemCalls = report.problems("tool_call").map((problem) => problem.call as Record<string, unknown>);
+      expect(problemCalls.filter((call) => call.cause === cause)).toHaveLength(1);
+      expect(report.all("tool_call").filter((call) => call.cause === cause)).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(wire);
+    },
+    45_000,
   );
 
   test.skipIf(!tmuxAvailable())(
@@ -3327,7 +3654,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       mode: "stall_startup", startupTimeoutMs: 5_000, restartLimit: 0,
     });
     gateway = startFakeGateway([
-      fakeGatewayToolCall("cancel_startup", "capability_search", { server: "fixture", query: "echo" }),
+      fakeGatewayToolCall("cancel_startup", "toolbox", { search: "echo", server: "fixture" }),
       fakeGatewayFinalText("Unexpected continuation."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const proc = Bun.spawn([join(REPO_ROOT, "zig-out", "bin", "fx"), "ask", "--json", "--auto", "--no-save", "Find the fixture tool"], {
@@ -3390,7 +3717,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
-      await tui.waitForText("■ Cancelled", 5_000);
+      await tui.waitForText("▪ Cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
       while (Date.now() < cancel_deadline) {
         if (
@@ -3527,9 +3854,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       restartLimit: 1,
     });
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("crashing_mcp", TOOL_NAME, { text: "first" }),
-      fakeGatewayToolCall("recovered_mcp", TOOL_NAME, { text: "second" }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("crashing_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+      fakeGatewayToolCall("recovered_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } }),
       fakeGatewayFinalText("Restarted MCP complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -3637,8 +3964,8 @@ describe("MCP stdio servers", () => {
   test("capability_search finds the tool under its fx name and the model calls it", async () => {
     const root = createRoot("v2-search", MODERN_FIXTURE);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search", "capability_search", { query: "echo", server: "fixture" }),
-      fakeGatewayToolCall("call", TOOL_NAME, { text: "hello" }),
+      fakeGatewayToolCall("search", "toolbox", { search: "echo", server: "fixture" }),
+      fakeGatewayToolCall("call", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
       fakeGatewayFinalText("V2_SEARCH_DONE"),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const result = await ask(root, "Find the echo tool and use it.");
@@ -3752,7 +4079,7 @@ describe("MCP stdio servers", () => {
   test("a search for a server that isn't configured says so", async () => {
     const root = createRoot("v2-not-found", MODERN_FIXTURE);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search", "capability_search", { query: "echo", server: "nope" }),
+      fakeGatewayToolCall("search", "toolbox", { search: "echo", server: "nope" }),
       fakeGatewayFinalText("V2_NOT_FOUND_SEEN"),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const result = await ask(root, "Find a tool on nope.");
@@ -3761,4 +4088,521 @@ describe("MCP stdio servers", () => {
     // Nothing needed the configured server, so it never started.
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
+});
+
+// `fx mcp call` lets a command fx's shell tool runs call the session's MCP
+// tools, so a big result can go to a file and only what the command prints
+// reaches the model (`src/core/mcp_host/mcp_call_bridge.zig`).
+describe("fx mcp call", () => {
+  const bridgeRoot = (label: string, settings: Record<string, unknown> = {}, options: RootOptions = {}) => {
+    const root = createRoot(label, MODERN_FIXTURE, options);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.environment.FX_MCP_RESULT_PAD_BYTES = String(1536 * 1024);
+    profile.mcp.fixture.environment.FX_MCP_RESULT_TEXT = "BRIDGE_TAIL";
+    writeFileSync(profilePath, JSON.stringify(profile));
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify(settings));
+    return root;
+  };
+  const command = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}' > out.txt; echo "exit=$?"; wc -c < out.txt | tr -d ' '; tail -c 18 out.txt`;
+  const toolCalls = (root: FixtureRoot) =>
+    existsSync(root.wireLogPath)
+      ? readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call")
+      : [];
+
+  test("a command saves a big MCP result to a file, and only what it prints reaches the model", async () => {
+    const root = bridgeRoot("bridge-file");
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_DONE");
+    expect(seen).toContain("exit=0");
+    expect(seen).toContain("BRIDGE_TAIL:hello");
+    expect(seen.length).toBeLessThan(4096);
+    const saved = readFileSync(join(root.workspace, "out.txt"), "utf8");
+    expect(saved.length).toBeGreaterThan(1536 * 1024);
+    expect(saved.trimEnd().endsWith("BRIDGE_TAIL:hello")).toBe(true);
+    // Its stderr line tells the model what the file holds.
+    expect(seen).toContain(`fx mcp call: wrote ${Buffer.byteLength(saved)} bytes of text`);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a command's call waits for the user's approval, then saves the result",
+    async () => {
+      // The TUI can show forms, so it declares elicitation to every server.
+      const root = bridgeRoot("bridge-tui-approval", {}, { expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      let seen = "";
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+        (body: string) => {
+          seen = toolResultText(body, "run_call");
+          return fakeGatewayFinalText("BRIDGE_TUI_DONE");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "ask" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Save the list to a file.");
+      // The shell command asks first, as any command does in ask mode.
+      await tui.waitForText("Would you like to run the following command?", 20_000);
+      await tui.sendKeys("1");
+      // Then its `fx mcp call` asks while the command waits, and nothing
+      // reaches the server before the answer.
+      const approval = await tui.waitForText("Allow this MCP tool call?", 20_000);
+      expect(approval).toContain(TOOL_NAME);
+      expect(toolCalls(root)).toHaveLength(0);
+      await tui.sendKeys("1");
+
+      await tui.waitForText("BRIDGE_TUI_DONE", 20_000);
+      expect(seen).toContain("exit=0");
+      expect(seen).toContain("BRIDGE_TAIL:hello");
+      expect(seen.length).toBeLessThan(4096);
+      expect(readFileSync(join(root.workspace, "out.txt"), "utf8").length).toBeGreaterThan(1536 * 1024);
+      expect(toolCalls(root)).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test("a call the permission rules deny runs nothing, and the command learns why", async () => {
+    const root = bridgeRoot("bridge-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_DENIED");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("did not run");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 60_000);
+
+  // Runs one shell command through the built binary and returns what the
+  // model saw of it.
+  const runBridgeCommand = async (root: FixtureRoot, shellCommand: string) => {
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: shellCommand }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_OUTCOME_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 80_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_OUTCOME_DONE");
+    return seen;
+  };
+  const callTo = (outFile: string, text = "hello") =>
+    `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"${text}"}' > ${outFile} 2> err.txt; echo "exit=$?"; cat err.txt; echo "out=$(wc -c < ${outFile} | tr -d ' ')"`;
+
+  test("a tool that returns an error exits 6 with the tool's message and no data", async () => {
+    const root = bridgeRoot("bridge-tool-error", {}, { mode: "tool_failure" });
+    const seen = await runBridgeCommand(root, callTo("out.txt"));
+    expect(seen).toContain("exit=6");
+    expect(seen).toContain("returned an error");
+    expect(seen).toContain("Invalid input: labels require at least one item");
+    expect(seen).toContain("out=0");
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a tool error's text with control bytes shows as visible escapes, and its plain lines stay as they are", async () => {
+    // The text is the server's own: a window title, a bell, a clear screen,
+    // a C1 control sequence introducer, DEL, a carriage return that would
+    // overwrite the line, and plain lines around them. (fx drops a text with
+    // NUL in it before the command sees it, so NUL has no case here.)
+    const failureText = "Invalid input: labels require at least one item\nretry rejected\n" +
+      "\u001b]0;owned\u0007\u001b[2J\u009b31m\u007f\rgood\r\nlast";
+    const root = bridgeRoot("bridge-tool-error-bytes", {}, { mode: "tool_failure", failureText });
+    const seen = shellOutput(await runBridgeCommand(root, callTo("out.txt")));
+    expect(seen).toContain("exit=6");
+    expect(seen).toContain(
+      `fx mcp call: ${TOOL_NAME} returned an error:\n` +
+        "Invalid input: labels require at least one item\nretry rejected\n" +
+        "\\x1b]0;owned\\x07\\x1b[2J\\u{009b}31m\\x7f\\x0dgood\nlast\nout=0",
+    );
+    for (const raw of ["\u001b", "\u0007", "\u009b", "\u007f", "\r"]) expect(seen).not.toContain(raw);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a protocol error's message with control bytes shows as visible escapes, and the call exits 1", async () => {
+    // The message is the server's own, in a JSON-RPC error that answers
+    // tools/call: a window title, a bell, a clear screen, a C1 control
+    // sequence introducer, DEL, a carriage return that would overwrite the
+    // line, and plain text around them.
+    const failureText = "bad\u001b]0;owned\u0007\u001b[2J\u009b31m\u007f\rafter\r\nlast line";
+    const root = bridgeRoot("bridge-protocol-error-bytes", {}, { mode: "tool_protocol_error", failureText });
+    const seen = shellOutput(await runBridgeCommand(root, callTo("out.txt")));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain(
+      "fx mcp call: MCP protocol error -32000: " +
+        "bad\\x1b]0;owned\\x07\\x1b[2J\\u{009b}31m\\x7f\\x0dafter\nlast line\nout=0",
+    );
+    for (const raw of ["\u001b", "\u0007", "\u009b", "\u007f", "\r"]) expect(seen).not.toContain(raw);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a call whose server crashes exits 1, and the command learns why", async () => {
+    const root = bridgeRoot("bridge-crash", {}, { mode: "crash_always", restartLimit: 0 });
+    const seen = await runBridgeCommand(root, callTo("out.txt"));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain("fx mcp call: ");
+    expect(seen).toContain("out=0");
+  }, 90_000);
+
+  test("arguments that are not one JSON object exit 2, and nothing is sent", async () => {
+    const root = bridgeRoot("bridge-usage");
+    const seen = await runBridgeCommand(
+      root,
+      `"${FX_BIN}" mcp call ${TOOL_NAME} '[1]'; echo "array=$?"; "${FX_BIN}" mcp call ${TOOL_NAME} 'not json'; echo "text=$?"; "${FX_BIN}" mcp call; echo "none=$?"`,
+    );
+    expect(seen).toContain("array=2");
+    expect(seen).toContain("text=2");
+    expect(seen).toContain("none=2");
+    expect(seen).toContain("must be one JSON object");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  test("a ninth call while eight are running exits 4, and it never reaches the server", async () => {
+    const root = bridgeRoot("bridge-busy", {}, { mode: "stall_operation", operationTimeoutMs: 15_000 });
+    const holders = Array.from({ length: 8 }, (_, index) =>
+      `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hold${index}"}' > /dev/null 2>&1 &`).join(" ");
+    const seen = await runBridgeCommand(
+      root,
+      `${holders} sleep 3; ${callTo("out.txt", "ninth")}; kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; true`,
+    );
+    expect(seen).toContain("exit=4");
+    expect(seen).toContain("out=0");
+    const texts = toolCalls(root).map((entry) => (entry.message.params?.arguments as { text?: string } | undefined)?.text);
+    expect(texts).not.toContain("ninth");
+    expect(texts.length).toBeLessThanOrEqual(8);
+  }, 120_000);
+
+  // A socket that answers like an fx bridge, so the client's own refusals
+  // can be driven without a session.
+  const withFakeBridge = async (reply: string | null, run: (env: Record<string, string>) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "fxmc-"));
+    const socketPath = join(dir, "s");
+    const server = Bun.listen({
+      unix: socketPath,
+      socket: {
+        data(socket) {
+          if (reply !== null) socket.write(reply);
+          socket.end();
+        },
+      },
+    });
+    try {
+      await run({ FX_MCP_CALL_SOCKET: socketPath, FX_MCP_CALL_TOKEN: "ab".repeat(32) });
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const runClient = async (env: Record<string, string | undefined>) => {
+    const child = Bun.spawn([FX_BIN, "mcp", "call", TOOL_NAME, '{"text":"hello"}'], {
+      env: { ...process.env, FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined, FX_SOUND: "0", ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    return { stdout, stderr, code };
+  };
+
+  test("outside a shell call, or against another fx version, a call exits 3", async () => {
+    const outside = await runClient({});
+    expect(outside.code).toBe(3);
+    expect(outside.stderr).toContain("no running fx shell call to reach");
+    expect(outside.stdout).toBe("");
+
+    await withFakeBridge('{"v":999,"status":"ok","bytes":0}\n', async (env) => {
+      const other = await runClient(env);
+      expect(other.code).toBe(3);
+      expect(other.stderr).toContain("another fx version");
+      expect(other.stdout).toBe("");
+    });
+  }, 30_000);
+
+  test("a bridge that closes without replying exits 1 and writes no data", async () => {
+    await withFakeBridge(null, async (env) => {
+      const lost = await runClient(env);
+      expect(lost.code).toBe(1);
+      expect(lost.stderr).toContain("the connection to fx was lost");
+      expect(lost.stdout).toBe("");
+    });
+  }, 30_000);
+
+  // A subagent's command reaches the bridge through its own shell call, with
+  // the subagent's access, under the same permission rules as its parent.
+  const runSubagentCommand = async (root: FixtureRoot, mode: "--full-access" | "--auto") => {
+    let seen = "";
+    let childRanCommand = false;
+    const activeGateway = startDynamicFakeGateway(async (body) => {
+      // The parent's turn after the subagent's receipt, and the turn its
+      // report starts.
+      if (body.includes('"toolCallId":"create_bridge_child"')) return fakeGatewayFinalText("BRIDGE_PARENT_DONE");
+      if (body.includes('"toolCallId":"child_call"')) {
+        seen = toolResultText(body, "child_call");
+        // The command ran in the subagent's turn, not the parent's.
+        childRanCommand = body.includes("BRIDGE_CHILD_TASK") && !body.includes("BRIDGE_PARENT_TASK");
+        return fakeGatewayFinalText("BRIDGE_CHILD_DONE");
+      }
+      if (body.includes("BRIDGE_CHILD_TASK")) {
+        return fakeGatewayToolCall("child_call", "shell", { action: "run", command });
+      }
+      if (body.includes("BRIDGE_PARENT_TASK")) {
+        return fakeGatewayToolCall("create_bridge_child", "subagent", {
+          request: { action: "message", agent: "bridge", message: "BRIDGE_CHILD_TASK" },
+        });
+      }
+      return fakeGatewayFinalText("unexpected bridge subagent request");
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", mode, "BRIDGE_PARENT_TASK"], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, activeGateway),
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_PARENT_DONE");
+    expect(childRanCommand).toBe(true);
+    return seen;
+  };
+
+  test("a subagent's command saves a big result to a file through its own shell call", async () => {
+    const root = bridgeRoot("bridge-subagent");
+    const seen = await runSubagentCommand(root, "--full-access");
+    expect(seen).toContain("exit=0");
+    expect(seen).toContain("BRIDGE_TAIL:hello");
+    expect(seen).toContain("fx mcp call: wrote");
+    expect(seen.length).toBeLessThan(4096);
+    const saved = readFileSync(join(root.workspace, "out.txt"), "utf8");
+    expect(saved.length).toBeGreaterThan(1536 * 1024);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a subagent's call meets the same deny rule as its parent's", async () => {
+    const root = bridgeRoot("bridge-subagent-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    const seen = await runSubagentCommand(root, "--auto");
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("did not run");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  // What the command printed, from the shell tool's result.
+  const shellOutput = (result: string): string => JSON.parse(result).output_delta;
+
+  // A shell loop that follows each page's cursor, as a script paging through
+  // a long list would.
+  const pageLoop = [
+    `cursor=0; n=0; : > all.txt`,
+    `while [ -n "$cursor" ]; do`,
+    `  "${FX_BIN}" mcp call ${TOOL_NAME} "{\\"text\\":\\"$cursor\\"}" > page.json 2>/dev/null || { echo "exit=$?"; break; }`,
+    `  n=$((n+1)); grep -o '"item-[0-9]*"' page.json >> all.txt`,
+    `  cursor=$(grep -o '"nextCursor":"[0-9]*"' page.json | grep -o '[0-9][0-9]*')`,
+    `done`,
+    `echo "calls=$n items=$(wc -l < all.txt | tr -d ' ')"`,
+  ].join("\n");
+
+  test("a shell loop pages through a tool's results, one call per page", async () => {
+    const root = bridgeRoot("bridge-pages", {}, { mode: "paged" });
+    const seen = await runBridgeCommand(root, pageLoop);
+    expect(seen).toContain("calls=3 items=9");
+    expect(seen).not.toContain("exit=");
+    expect(readFileSync(join(root.workspace, "all.txt"), "utf8").trim().split("\n")).toEqual(
+      Array.from({ length: 9 }, (_, index) => `"item-${index}"`),
+    );
+    // Each page is its own call, with the cursor the last page gave.
+    expect(toolCalls(root).map((entry) => entry.message.params?.arguments?.text)).toEqual(["0", "1", "2"]);
+  }, 90_000);
+
+  test("a structured result that is only one result string saves as that text", async () => {
+    const root = bridgeRoot("bridge-wrapped", {}, { mode: "wrapped_text" });
+    const seen = await runBridgeCommand(root, `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"docs"}' > docs.md; echo "exit=$?"`);
+    expect(seen).toContain("exit=0");
+    const saved = readFileSync(join(root.workspace, "docs.md"), "utf8");
+    expect(saved).toBe("# Page: Overview\n\nwrapped docs\n");
+    expect(seen).toContain(`fx mcp call: wrote ${Buffer.byteLength(saved)} bytes of text`);
+  }, 90_000);
+
+  test("list, search, and help describe the agent's tools to a command, and call none", async () => {
+    const root = bridgeRoot("bridge-lookups");
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
+      `"${FX_BIN}" mcp call search echo text; echo "search=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
+      `"${FX_BIN}" mcp call help mcp_fixture_nope; echo "missing=$?"`,
+      `"${FX_BIN}" mcp call list nope; echo "server=$?"`,
+    ].join("\n")));
+    const line = `${TOOL_NAME}\tEcho text through the modern MCP fixture`;
+    expect(seen).toContain(`${line}\nlist=0`);
+    expect(seen).toContain(`${line}\nsearch=0`);
+    // The description is the one the model gets, the server's instructions
+    // included, then each argument.
+    expect(seen).toContain(`${TOOL_NAME}\nEcho text through the modern MCP fixture\n\nServer instructions: Use the modern echo tool.\n`);
+    expect(seen).toContain("\nArguments, as one JSON object:\n  text: string\nhelp=0");
+    expect(seen).toContain("No MCP tool named mcp_fixture_nope is available to this agent.");
+    expect(seen).toContain("missing=1");
+    expect(seen).toContain("No MCP server by that name is available to this agent.");
+    expect(seen).toContain("server=1");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  test("a tool name with control bytes shows as visible escapes in a command's messages", async () => {
+    const root = bridgeRoot("bridge-odd-name");
+    // The name is a word the model wrote, so it can hold an escape sequence.
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `name=$(printf 'mcp_fixture_\\033]0;x\\007nope')`,
+      `"${FX_BIN}" mcp call "$name" '{}' 2>&1; echo "call=$?"`,
+      `"${FX_BIN}" mcp call help "$name" 2>&1; echo "help=$?"`,
+    ].join("\n")));
+    const shown = "mcp_fixture_\\x1b]0;x\\x07nope";
+    expect(seen).toContain(`fx mcp call: ${shown} did not run. No MCP tool named ${shown} is available to this agent.`);
+    expect(seen).toContain("call=5");
+    expect(seen).toContain(`No MCP tool named ${shown} is available to this agent. Find tool names with fx mcp call search.`);
+    expect(seen).toContain("help=1");
+    expect(seen).not.toContain("\x1b");
+    expect(seen).not.toContain("\x07");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  test("list, search, and help hide a tool the permission rules deny", async () => {
+    const root = bridgeRoot("bridge-lookups-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
+    ].join("\n")));
+    expect(seen).not.toContain(`${TOOL_NAME}\t`);
+    expect(seen).toContain("list=0");
+    expect(seen).toContain(`No MCP tool named ${TOOL_NAME} is available to this agent.`);
+    expect(seen).toContain("help=1");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, each call a command makes shows as its own MCP row beside the command",
+    async () => {
+      const root = bridgeRoot("bridge-tui-rows", {}, { mode: "paged", expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      let seen = "";
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command: pageLoop }),
+        (body: string) => {
+          seen = toolResultText(body, "run_call");
+          return fakeGatewayFinalText("BRIDGE_ROWS_DONE");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Page through the list.");
+      await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
+      const scrollback = await tui.captureFullScrollback();
+      // The rows a direct call of the tool gets, in the command's group.
+      expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
+      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
+      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
+      expect(scrollback).not.toContain("Running MCP");
+      expect(seen).toContain("calls=3 items=9");
+      // The model sees the command's output, not the rows.
+      expect(seen).not.toContain("Ran MCP");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a call that runs when the user cancels shows as running, then as cancelled",
+    async () => {
+      const root = bridgeRoot("bridge-tui-cancel", {}, { mode: "stall_operation", operationTimeoutMs: 30_000, expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+        fakeGatewayFinalText("BRIDGE_AFTER_CANCEL"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Save the list to a file.");
+      await tui.waitForText(`Running MCP ${TOOL_NAME}`, 20_000);
+      expect(toolCalls(root)).toHaveLength(1);
+      await tui.sendInterruptEscapePair(10_000);
+      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+      await tui.waitForStableComposer(10_000);
+      expect(await tui.captureFullScrollback()).not.toContain("Running MCP");
+
+      // The session goes on.
+      await tui.sendText("Go on.");
+      await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
 });

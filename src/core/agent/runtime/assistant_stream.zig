@@ -67,6 +67,9 @@ pub const StreamChunkContext = struct {
     saw_visible_text: bool = false,
     saw_tool_start: bool = false,
     saw_provider_tool_start: bool = false,
+    /// A started tool may run at the provider and does more than read, so a
+    /// failed attempt cannot run it again without checking.
+    saw_unrepeatable_provider_tool_start: bool = false,
     saw_visible_text_after_tool_start: bool = false,
     last_byte_was_newline: bool = false,
     trailing_newline_count: u8 = 0,
@@ -140,7 +143,7 @@ pub const StreamChunkContext = struct {
         if (self.raw_text.items.len > 0) {
             try flushAssistantStream(self);
             try self.hooks.push_text(self.hooks.ctx, .{
-                .assistant_restarted = "\n\n[Response interrupted. Restarting.]\n\n",
+                .assistant_restarted = "\n\n↻ Restarted the answer\n\n",
             });
             debug_trace.logf("agent", "restarting response preview_bytes={d} superseded_preview_bytes={d}", .{
                 self.raw_text.items.len,
@@ -160,6 +163,7 @@ pub const StreamChunkContext = struct {
         self.response_language_next_probe_bytes = 5;
         self.saw_tool_start = false;
         self.saw_provider_tool_start = false;
+        self.saw_unrepeatable_provider_tool_start = false;
         self.saw_visible_text_after_tool_start = false;
         self.first_model_output_at_ms = null;
         self.streamed_output_bytes = 0;
@@ -290,6 +294,21 @@ pub fn onStreamToolInputChunk(ctx: *anyopaque, chunk: []const u8) void {
     }
 }
 
+/// A streamed tool call's arguments so far, by its id: a subagent call's row
+/// names its subagent as soon as they hold the name.
+pub fn onStreamToolInputProgress(ctx: *anyopaque, tool_id: []const u8, arguments: []const u8) void {
+    const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    stream_ctx.provisional_statuses.observeArguments(
+        stream_ctx.hooks,
+        stream_ctx.alloc,
+        stream_ctx.turn_id,
+        tool_id,
+        arguments,
+    ) catch |err| {
+        debug_trace.logf("ui_activity", "streamed tool row not named call_id={s} err={s}", .{ tool_id, @errorName(err) });
+    };
+}
+
 pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_telemetry.TokenProgressUpdate) !void {
     switch (update) {
         .unchanged => {},
@@ -353,6 +372,9 @@ pub fn recordStreamToolStart(ctx: *anyopaque, tool_name: []const u8) void {
         tool_name,
     )) {
         stream_ctx.saw_provider_tool_start = true;
+        if (!runtime_tool_presentation.providerToolOnlyReads(stream_ctx.hooks.tool_registry, tool_name)) {
+            stream_ctx.saw_unrepeatable_provider_tool_start = true;
+        }
     }
 }
 
@@ -575,7 +597,7 @@ pub fn finishLengthLimitedToolCallCompletion(
     completion: types.ModelCompletion,
     streamed_content_len: usize,
 ) ![]const u8 {
-    const blocker = "Provider response hit the length limit, so I did not execute the returned tool calls. Latest partial response is preserved above; retry with a narrower prompt or inspect stored tool output before continuing.";
+    const blocker = "The reply ran out of output tokens before its tool calls were complete, so I did not run them. Send your message again to retry, or ask for a smaller step.";
 
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";
@@ -1167,7 +1189,7 @@ test "source-only consumers preserve bytes without Markdown work across restart"
     try std.testing.expectEqualStrings("Replacement.", stream_ctx.accepted_source());
     try std.testing.expectEqualStrings(source, stream_ctx.interrupted_source.items);
     try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
-    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "Response interrupted") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "Restarted the answer") != null);
 }
 
 test "recovery starts a fresh response while retaining interrupted evidence" {
@@ -1182,7 +1204,7 @@ test "recovery starts a fresh response while retaining interrupted evidence" {
     try stream_ctx.beginRecoveryAttempt();
     try std.testing.expectEqualStrings("", stream_ctx.accepted_source());
     try std.testing.expectEqualStrings("software", stream_ctx.interruption_source_or(""));
-    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[capture.text_spans.items.len - 1], "Response interrupted") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[capture.text_spans.items.len - 1], "Restarted the answer") != null);
     try streamAssistantChunk(&stream_ctx, "2. A complete replacement.");
     try flushAssistantStream(&stream_ctx);
     try std.testing.expectEqualStrings("2. A complete replacement.", stream_ctx.accepted_source());

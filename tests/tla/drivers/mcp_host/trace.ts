@@ -47,12 +47,14 @@ export function traceObs(records: TraceRecord[], constants: Record<string, Value
 }
 
 const substitutions: Record<string, string[]> = {
-  HostLifecycle: ["Servers", "Project", "Reachable", "NeedsAuth", "MaxHosts", "MaxLeases"],
+  HostLifecycle: ["Servers", "Project", "Reachable", "NeedsAuth", "MaxReloads", "MaxLeases"],
   Credentials: ["Names", "Faults", "InitKinds", "InitEntries", "InitV1"],
   SignIn: ["MaxLogins", "MaxHosts", "MaxLeases", "Bridge"],
   ElicitationRouting: ["Versions", "MaxQ", "Slots", "Guard"],
   UrlRetry: ["Urls", "Slots", "MaxCalls", "Guard"],
   MixedBuilds: ["RevokeOnReplay"],
+  StoreLockBudget: ["Budget", "Slack", "Tolerance"],
+  RefreshLease: ["RefreshMax", "Budget", "Slack", "Tolerance"],
 };
 
 function wrapperCfg(module: string, invariant: string): string {

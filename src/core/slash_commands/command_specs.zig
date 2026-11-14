@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const display_width = @import("../shared/display_width.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
 
@@ -31,12 +32,17 @@ pub const TopLevelKind = enum {
     upgrade,
     replay,
     workspace,
+    config,
+    completion,
 };
 
 pub const SlashKind = enum {
     quit,
     clear_screen,
     new_session,
+    launch_instance,
+    close_instance,
+    show_agents,
     reset_session,
     resume_session,
     rename_session,
@@ -49,6 +55,7 @@ pub const SlashKind = enum {
     image,
     images,
     model,
+    effort,
     permissions,
     allowlist,
     stats,
@@ -61,7 +68,6 @@ pub const SlashKind = enum {
     trace,
     compact,
     settings,
-    alias,
     credits,
     paste,
     fast,
@@ -73,9 +79,56 @@ pub const SlashKind = enum {
     version,
 };
 
+/// The release that drops every old spelling fx still reads with a warning,
+/// such as `fx setup`, `--sessions-v2`, and `/allowlist user`. The CLI shape
+/// check fails once fx's version reaches it, so they come out on time.
+pub const old_spelling_removal = "0.0.18";
+/// What every warning about an old spelling says.
+pub const deprecated_until = "is deprecated and stops working in fx " ++ old_spelling_removal;
+
 pub const OptionDoc = struct {
     flag: []const u8,
     description: []const u8,
+    /// Set for a removed spelling: help omits it, and the parser rejects it
+    /// with this hint, such as "use --resume <id>".
+    replacement: ?[]const u8 = null,
+    /// Help omits it, but the parser still reads it: a deprecated spelling
+    /// that keeps working with a warning, such as `--sessions-v2`.
+    hidden: bool = false,
+    /// The fixed values the flag takes, which `fx completion` offers. A value
+    /// written in the flag itself, such as `--period <today|7d|month>`, needs no
+    /// list here. Leave it empty for free-form values.
+    values: []const []const u8 = &.{},
+};
+
+/// A word that may follow a command, such as `set` in `fx config set`. Help
+/// lists these under "Commands:", and `fx completion` offers them.
+pub const SubcommandDoc = struct {
+    /// The word, then its arguments as help shows them: `set <key> <value>`.
+    /// A `<key>` right after the word means the next argument is a setting
+    /// key, which completion offers.
+    usage: []const u8,
+    description: []const u8,
+    /// Words that may follow this one, such as `install` after `slack`.
+    subcommands: []const SubcommandDoc = &.{},
+    /// The flags this word takes. Completion offers these, not the
+    /// command's, after the word.
+    options: []const OptionDoc = &.{},
+    /// The `<key>` is one `fx config set` changes, so completion offers only
+    /// those keys.
+    settable_key: bool = false,
+
+    /// The word itself: `set` in `set <key> <value>`.
+    pub fn name(self: SubcommandDoc) []const u8 {
+        const end = std.mem.findScalar(u8, self.usage, ' ') orelse self.usage.len;
+        return self.usage[0..end];
+    }
+
+    /// Whether the argument after the word is a setting key.
+    pub fn takesSettingKey(self: SubcommandDoc) bool {
+        const rest = self.usage[self.name().len..];
+        return std.mem.startsWith(u8, rest, " <key>");
+    }
 };
 
 pub const TopLevelSpec = struct {
@@ -85,8 +138,16 @@ pub const TopLevelSpec = struct {
     usage: []const u8,
     summary: []const u8,
     options: []const OptionDoc = &.{},
+    /// The words that may follow the command, listed under "Commands:".
+    subcommands: []const SubcommandDoc = &.{},
     details: []const []const u8 = &.{},
     hidden_from_top_level_help: bool = false,
+    /// Set on a deprecated command: the spelling that replaces it. Running the
+    /// command prints a warning that names it.
+    replaced_by: ?[]const u8 = null,
+    /// The name help shows after `fx `, when it isn't `token`: a command
+    /// reached only through an alias, such as `--resume`.
+    help_title: ?[]const u8 = null,
 };
 
 pub const TopLevelHelpEntry = struct {
@@ -166,6 +227,10 @@ pub const SlashSpec = struct {
     presentation_category: ?SlashPresentationCategory = null,
     show_in_welcome: bool = false,
     has_args: bool = false,
+    /// The command does nothing useful without an argument, so choosing it
+    /// from the slash menu with Enter types it and waits for the argument
+    /// instead of running it bare.
+    requires_args: bool = false,
     accepts_payload: bool = false,
     requires_prompt_credential: bool = false,
 };
@@ -309,6 +374,7 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
 
     try writeSectionHeading(&out.writer, style, "Usage:");
     try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx [flags]", width, style, .syntax);
+    try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx [flags] \"<prompt>\"", width, style, .syntax);
     try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx <command> [...flags] [...args]", width, style, .syntax);
 
     try writeSectionHeading(&out.writer, style, "Commands:");
@@ -349,7 +415,7 @@ pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, k
     defer out.deinit();
 
     try out.writer.writeAll("fx ");
-    try out.writer.writeAll(spec.token);
+    try out.writer.writeAll(spec.help_title orelse spec.token);
     try out.writer.writeAll("\n\n");
     try out.writer.writeAll(spec.summary);
     try out.writer.writeAll("\n\nUsage:\n");
@@ -357,12 +423,20 @@ pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, k
     try out.writer.writeAll(spec.usage);
     try out.writer.writeByte('\n');
 
+    if (spec.subcommands.len > 0) {
+        try out.writer.writeAll("\nCommands:\n");
+        try writeSubcommandRows(&out.writer, spec.subcommands, "", subcommandUsageWidth(spec.subcommands, 0));
+    }
+
     if (spec.options.len > 0) {
         var flag_width: usize = 0;
-        for (spec.options) |opt| flag_width = @max(flag_width, opt.flag.len);
+        for (spec.options) |opt| {
+            if (opt.replacement == null and !opt.hidden) flag_width = @max(flag_width, opt.flag.len);
+        }
 
         try out.writer.writeAll("\nOptions:\n");
         for (spec.options) |opt| {
+            if (opt.replacement != null or opt.hidden) continue;
             try out.writer.writeAll("  ");
             try out.writer.writeAll(opt.flag);
             try writePadding(&out.writer, flag_width - opt.flag.len + 2);
@@ -382,6 +456,36 @@ pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, k
     return try out.toOwnedSlice();
 }
 
+/// The widest `prefix usage` among the rows `writeSubcommandRows` prints.
+fn subcommandUsageWidth(subcommands: []const SubcommandDoc, prefix_len: usize) usize {
+    var width: usize = 0;
+    for (subcommands) |sub| {
+        if (sub.description.len > 0) width = @max(width, prefix_len + sub.usage.len);
+        width = @max(width, subcommandUsageWidth(sub.subcommands, prefix_len + sub.name().len + 1));
+    }
+    return width;
+}
+
+/// One row per word that has a description, then its own words prefixed
+/// with it, so `trust` lists `trust approve NAME`.
+fn writeSubcommandRows(writer: *std.Io.Writer, subcommands: []const SubcommandDoc, prefix: []const u8, width: usize) std.Io.Writer.Error!void {
+    for (subcommands) |sub| {
+        if (sub.description.len > 0) {
+            try writer.writeAll("  ");
+            try writer.writeAll(prefix);
+            try writer.writeAll(sub.usage);
+            try writePadding(writer, width - prefix.len - sub.usage.len + 2);
+            try writer.writeAll(sub.description);
+            try writer.writeByte('\n');
+        }
+        if (sub.subcommands.len > 0) {
+            var buffer: [128]u8 = undefined;
+            const nested = std.mem.print(&buffer, "{s}{s} ", .{ prefix, sub.name() }) catch prefix;
+            try writeSubcommandRows(writer, sub.subcommands, nested, width);
+        }
+    }
+}
+
 pub fn topLevelKindFromToken(registry: TopLevelRegistry, token: []const u8) ?TopLevelKind {
     for (registry.specs) |spec| {
         if (matchesCommandToken(token, spec.token, spec.aliases)) return spec.kind;
@@ -398,11 +502,7 @@ pub fn renderSlashWelcome(alloc: Allocator, registry: SlashRegistry) ![]u8 {
 }
 
 pub fn helpCatalogCount(registry: SlashRegistry, query: []const u8) usize {
-    var count: usize = 0;
-    for (std.meta.tags(SlashPresentationCategory)) |category| {
-        count += helpCatalogCategoryCount(registry, query, category);
-    }
-    return count;
+    return helpCatalogCountForCategory(registry, null, query);
 }
 
 pub fn helpCatalogCountForCategory(
@@ -410,31 +510,15 @@ pub fn helpCatalogCountForCategory(
     category: ?SlashPresentationCategory,
     query: []const u8,
 ) usize {
-    return if (category) |value|
-        helpCatalogCategoryCount(registry, query, value)
-    else
-        helpCatalogCount(registry, query);
+    return helpCatalogFilter(registry, category, query).count();
 }
 
 pub fn helpCatalogCategoryCount(registry: SlashRegistry, query: []const u8, category: SlashPresentationCategory) usize {
-    var count: usize = 0;
-    for (registry.commands) |spec| {
-        if (spec.presentation_category != category or !helpCatalogSpecMatches(spec, query)) continue;
-        count += 1;
-    }
-    return count;
+    return helpCatalogCountForCategory(registry, category, query);
 }
 
 pub fn helpCatalogSpecAt(registry: SlashRegistry, query: []const u8, display_index: usize) ?*const SlashSpec {
-    var current: usize = 0;
-    for (std.meta.tags(SlashPresentationCategory)) |category| {
-        for (registry.commands) |*spec| {
-            if (spec.presentation_category != category or !helpCatalogSpecMatches(spec.*, query)) continue;
-            if (current == display_index) return spec;
-            current += 1;
-        }
-    }
-    return null;
+    return helpCatalogSpecAtForCategory(registry, null, query, display_index);
 }
 
 pub fn helpCatalogSpecAtForCategory(
@@ -443,44 +527,57 @@ pub fn helpCatalogSpecAtForCategory(
     query: []const u8,
     display_index: usize,
 ) ?*const SlashSpec {
-    const value = category orelse return helpCatalogSpecAt(registry, query, display_index);
-    var current: usize = 0;
-    for (registry.commands) |*spec| {
-        if (spec.presentation_category != value or !helpCatalogSpecMatches(spec.*, query)) continue;
-        if (current == display_index) return spec;
-        current += 1;
-    }
-    return null;
+    const position = helpCatalogFilter(registry, category, query).at(display_index) orelse return null;
+    return &registry.commands[position % registry.commands.len];
 }
 
-fn helpCatalogSpecMatches(spec: SlashSpec, query: []const u8) bool {
-    if (spec.help_entry == null or spec.completion_description == null or spec.presentation_category == null) return false;
+const help_categories = std.meta.tags(SlashPresentationCategory);
 
-    var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n");
-    while (tokens.next()) |token| {
-        if (containsIgnoreCase(spec.command, token) or
-            containsIgnoreCase(spec.help_entry.?, token) or
-            containsIgnoreCase(spec.completion_description.?, token) or
-            containsIgnoreCase(spec.presentation_category.?.label(), token))
-        {
-            continue;
+/// The `/help` menu in its order, category and then registry order, kept by
+/// `fuzzy_match.Filter`. Base position `c * commands.len + i` holds command
+/// `i` only when it is in the `c`th category, and only that category's
+/// commands when the menu shows one.
+const HelpCatalogMatches = struct {
+    commands: []const SlashSpec,
+    category: ?SlashPresentationCategory,
+    query: []const u8,
+
+    pub fn matchAt(self: HelpCatalogMatches, position: usize) ?fuzzy_match.Match {
+        const spec = self.commands[position % self.commands.len];
+        const category = help_categories[position / self.commands.len];
+        if (spec.presentation_category != category) return null;
+        if (self.category) |shown| {
+            if (shown != category) return null;
         }
-        for (spec.aliases) |alias| {
-            if (containsIgnoreCase(alias, token)) break;
-        } else return false;
+        return helpCatalogSpecMatch(spec, self.query);
     }
-    return true;
+};
+
+fn helpCatalogFilter(registry: SlashRegistry, category: ?SlashPresentationCategory, query: []const u8) fuzzy_match.Filter(HelpCatalogMatches) {
+    return .init(.{ .commands = registry.commands, .category = category, .query = query }, registry.commands.len * help_categories.len);
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
-    }
-    return false;
+/// The `/help` menu matches a command by its name and every alias, and by
+/// the words of its help entry, description, and category.
+fn helpCatalogSpecMatch(spec: SlashSpec, query: []const u8) ?fuzzy_match.Match {
+    const help_entry = spec.help_entry orelse return null;
+    const description = spec.completion_description orelse return null;
+    const category = spec.presentation_category orelse return null;
+
+    var fields: [help_field_limit]fuzzy_match.Field = undefined;
+    fields[0] = .{ .text = spec.command };
+    const alias_count = @min(spec.aliases.len, help_field_limit - 4);
+    for (spec.aliases[0..alias_count], fields[1..][0..alias_count]) |alias, *field| field.* = .{ .text = alias };
+    const text_start = 1 + alias_count;
+    fields[text_start] = .{ .text = help_entry, .kind = .text };
+    fields[text_start + 1] = .{ .text = description, .kind = .text };
+    fields[text_start + 2] = .{ .text = category.label(), .kind = .text };
+    return fuzzy_match.match(query, fields[0 .. text_start + 3]);
 }
+
+/// Commands keep their aliases short; a mod's command past this many has
+/// its extra aliases ignored when matching.
+const help_field_limit = 16;
 
 pub fn topLevelUsage(registry: TopLevelRegistry, kind: TopLevelKind) []const u8 {
     return topLevelSpec(registry, kind).usage;
@@ -504,64 +601,58 @@ pub fn firstSlashCompletion(registry: SlashRegistry, prefix: []const u8) ?[]cons
     return null;
 }
 
-const slash_completion_match_rank_count: usize = 3;
-
-const SlashCompletionCommandMatch = struct {
-    command: []const u8,
-    rank: usize,
-};
-
 const SlashCompletionMatch = struct {
     spec: *const SlashSpec,
     command: []const u8,
 };
 
-fn completionCommandMatchRank(command: []const u8, prefix: []const u8) ?usize {
-    if (std.mem.eql(u8, command, prefix)) return 0;
-    if (std.mem.startsWith(u8, command, prefix)) return 1;
-    if (prefix.len <= 1 or command.len <= 1) return null;
-    if (std.mem.find(u8, command[1..], prefix[1..]) != null) return 2;
-    return null;
+/// A ranked listing orders by field only below `ranked_field_limit`, so the
+/// `/` menu matches a command and at most that many less one of the aliases
+/// shown in completion.
+const completion_field_limit = fuzzy_match.ranked_field_limit;
+
+/// The names the `/` menu matches a command by: the command, then the
+/// aliases it shows in completion. The matched one is the one shown.
+fn completionFields(spec: SlashSpec, buf: *[completion_field_limit]fuzzy_match.Field) []const fuzzy_match.Field {
+    buf[0] = .{ .text = spec.command };
+    if (!spec.show_aliases_in_completion) return buf[0..1];
+    const alias_count = @min(spec.aliases.len, completion_field_limit - 1);
+    for (spec.aliases[0..alias_count], buf[1..][0..alias_count]) |alias, *field| field.* = .{ .text = alias };
+    return buf[0 .. 1 + alias_count];
 }
 
-fn bestCompletionCommandMatch(spec: SlashSpec, prefix: []const u8) ?SlashCompletionCommandMatch {
-    var best: ?SlashCompletionCommandMatch = if (completionCommandMatchRank(spec.command, prefix)) |rank|
-        .{ .command = spec.command, .rank = rank }
-    else
-        null;
+/// The `/` menu's commands in registry order, for `fuzzy_match.Ranking`.
+/// The prefix keeps its `/`, which matches every command's leading `/` and
+/// is ignored between words.
+const SlashCommandMatches = struct {
+    commands: []const SlashSpec,
+    prefix: []const u8,
 
-    if (spec.show_aliases_in_completion) {
-        for (spec.aliases) |alias| {
-            const rank = completionCommandMatchRank(alias, prefix) orelse continue;
-            if (best == null or rank < best.?.rank) {
-                best = .{ .command = alias, .rank = rank };
-            }
-        }
+    pub fn matchAt(self: SlashCommandMatches, position: usize) ?fuzzy_match.Match {
+        const spec = self.commands[position];
+        if (spec.help_entry == null) return null;
+        var buf: [completion_field_limit]fuzzy_match.Field = undefined;
+        return fuzzy_match.match(self.prefix, completionFields(spec, &buf));
     }
-    return best;
+};
+
+fn slashCommandRanking(registry: SlashRegistry, prefix: []const u8) fuzzy_match.Ranking(SlashCommandMatches) {
+    return .{ .context = .{ .commands = registry.commands, .prefix = prefix }, .len = registry.commands.len };
 }
 
+/// The command or alias the `/` menu shows for `spec`, or null when it
+/// does not match.
 pub fn matchedCompletionCommand(spec: SlashSpec, prefix: []const u8) ?[]const u8 {
-    return (bestCompletionCommandMatch(spec, prefix) orelse return null).command;
+    var buf: [completion_field_limit]fuzzy_match.Field = undefined;
+    const fields = completionFields(spec, &buf);
+    const found = fuzzy_match.match(prefix, fields) orelse return null;
+    return fields[found.field].text;
 }
 
 fn nthSlashCommandCompletionMatch(registry: SlashRegistry, prefix: []const u8, n: usize) ?SlashCompletionMatch {
-    var idx: usize = 0;
-    for (0..slash_completion_match_rank_count) |rank| {
-        for (registry.commands) |*spec| {
-            if (spec.help_entry == null) continue;
-            const match = bestCompletionCommandMatch(spec.*, prefix) orelse continue;
-            if (match.rank != rank) continue;
-            if (idx == n) {
-                return .{
-                    .spec = spec,
-                    .command = match.command,
-                };
-            }
-            idx += 1;
-        }
-    }
-    return null;
+    const position = slashCommandRanking(registry, prefix).at(n) orelse return null;
+    const spec = &registry.commands[position];
+    return .{ .spec = spec, .command = matchedCompletionCommand(spec.*, prefix) orelse return null };
 }
 
 pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]const u8 {
@@ -576,11 +667,7 @@ pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]cons
 
 pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        var count: usize = 0;
-        for (registry.arguments) |entry| {
-            if (runtimeArgMatches(registry, entry.full, query)) count += 1;
-        }
-        return count;
+        return runtimeArgFilter(query).count();
     }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return allowlistArgCompletionCount(query);
@@ -598,17 +685,12 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
         return workspaceArgCompletionCount(query);
     }
     if (prefix.len == 0 or prefix[0] != '/') return 0;
-    var count: usize = 0;
-    for (registry.commands) |spec| {
-        if (spec.help_entry == null) continue;
-        if (matchedCompletionCommand(spec, prefix) != null) count += 1;
-    }
-    return count;
+    return slashCommandRanking(registry, prefix).count();
 }
 
 pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        return (nthRuntimeArg(registry, query, n) orelse return null).full;
+        return (nthRuntimeArg(query, n) orelse return null).full;
     }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgCompletion(query, n);
@@ -634,6 +716,7 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
 /// the prefix is not an arg-completion command.
 pub fn argCompletionAnchor(prefix: []const u8) usize {
     if (mcpVerbsOn() and argCompletionPrefix(prefix, "/mcp") != null) return "/mcp ".len;
+    if (argCompletionPrefix(prefix, "/launch") != null) return "/launch ".len;
     if (statuslineArgCompletionPrefix(prefix) != null) return "/statusline ".len;
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
@@ -648,8 +731,8 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
 /// full command string is returned unchanged.
 pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        const entry = nthRuntimeArg(registry, query, n) orelse return null;
-        return entry.full[runtimeArgCommand(registry).len + 1 ..];
+        const entry = nthRuntimeArg(query, n) orelse return null;
+        return entry.full[runtimeArgCommand(query.group).len + 1 ..];
     }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgLabel(query, n);
@@ -669,9 +752,15 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     return nthSlashCompletion(registry, prefix, n);
 }
 
+/// Whether completion `n`, selected, draws its description selected too.
+pub fn nthSlashCompletionSelectsDescription(registry: SlashRegistry, prefix: []const u8, n: usize) bool {
+    const query = runtimeArgQuery(registry, prefix) orelse return false;
+    return (nthRuntimeArg(query, n) orelse return false).select_description;
+}
+
 pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        return (nthRuntimeArg(registry, query, n) orelse return null).description;
+        return (nthRuntimeArg(query, n) orelse return null).description;
     }
     if (allowlistArgCompletionPrefix(prefix) != null) return null;
     if (statuslineArgCompletionPrefix(prefix) != null) return null;
@@ -707,14 +796,14 @@ fn allowlistCompletionHasArgs(command: []const u8) bool {
         "/allowlist remove",
         "/allowlist reset",
         "/allowlist view",
-        "/allowlist local",
-        "/allowlist user",
-        "/allowlist local add",
-        "/allowlist local remove",
-        "/allowlist local reset",
-        "/allowlist user add",
-        "/allowlist user remove",
-        "/allowlist user reset",
+        "/allowlist workspace",
+        "/allowlist global",
+        "/allowlist workspace add",
+        "/allowlist workspace remove",
+        "/allowlist workspace reset",
+        "/allowlist global add",
+        "/allowlist global remove",
+        "/allowlist global reset",
         "/allowlist add command",
         "/allowlist add tool",
         "/allowlist add url",
@@ -723,22 +812,22 @@ fn allowlistCompletionHasArgs(command: []const u8) bool {
         "/allowlist remove tool",
         "/allowlist remove url",
         "/allowlist remove web-fetch-domain",
-        "/allowlist local add command",
-        "/allowlist local add tool",
-        "/allowlist local add url",
-        "/allowlist local add web-fetch-domain",
-        "/allowlist local remove command",
-        "/allowlist local remove tool",
-        "/allowlist local remove url",
-        "/allowlist local remove web-fetch-domain",
-        "/allowlist user add command",
-        "/allowlist user add tool",
-        "/allowlist user add url",
-        "/allowlist user add web-fetch-domain",
-        "/allowlist user remove command",
-        "/allowlist user remove tool",
-        "/allowlist user remove url",
-        "/allowlist user remove web-fetch-domain",
+        "/allowlist workspace add command",
+        "/allowlist workspace add tool",
+        "/allowlist workspace add url",
+        "/allowlist workspace add web-fetch-domain",
+        "/allowlist workspace remove command",
+        "/allowlist workspace remove tool",
+        "/allowlist workspace remove url",
+        "/allowlist workspace remove web-fetch-domain",
+        "/allowlist global add command",
+        "/allowlist global add tool",
+        "/allowlist global add url",
+        "/allowlist global add web-fetch-domain",
+        "/allowlist global remove command",
+        "/allowlist global remove tool",
+        "/allowlist global remove url",
+        "/allowlist global remove web-fetch-domain",
     };
     for (completions_with_more_args) |completion| {
         if (std.mem.eql(u8, command, completion)) return true;
@@ -779,14 +868,14 @@ const allowlist_action_completions = [_][]const u8{
     "/allowlist add",
     "/allowlist remove",
     "/allowlist reset",
-    "/allowlist local",
-    "/allowlist user",
+    "/allowlist workspace",
+    "/allowlist global",
 };
 
 const allowlist_view_completions = [_][]const u8{
     "/allowlist view effective",
-    "/allowlist view local",
-    "/allowlist view user",
+    "/allowlist view workspace",
+    "/allowlist view global",
 };
 
 const allowlist_scoped_action_suffixes = [_][]const u8{
@@ -854,55 +943,74 @@ fn scopedAllowlistCompletions(
     return result;
 }
 
-const allowlist_local_action_completions = scopedAllowlistCompletions("local", allowlist_scoped_action_suffixes);
-const allowlist_user_action_completions = scopedAllowlistCompletions("user", allowlist_scoped_action_suffixes);
-const allowlist_local_add_kind_completions = scopedAllowlistCompletions("local", allowlist_add_kind_completions);
-const allowlist_user_add_kind_completions = scopedAllowlistCompletions("user", allowlist_add_kind_completions);
-const allowlist_local_remove_kind_completions = scopedAllowlistCompletions("local", allowlist_remove_kind_completions);
-const allowlist_user_remove_kind_completions = scopedAllowlistCompletions("user", allowlist_remove_kind_completions);
-const allowlist_local_reset_scope_completions = scopedAllowlistCompletions("local", allowlist_reset_scope_completions);
-const allowlist_user_reset_scope_completions = scopedAllowlistCompletions("user", allowlist_reset_scope_completions);
-const allowlist_local_add_tool_completions = scopedAllowlistCompletions("local", allowlist_add_tool_completions);
-const allowlist_user_add_tool_completions = scopedAllowlistCompletions("user", allowlist_add_tool_completions);
-const allowlist_local_remove_tool_completions = scopedAllowlistCompletions("local", allowlist_remove_tool_completions);
-const allowlist_user_remove_tool_completions = scopedAllowlistCompletions("user", allowlist_remove_tool_completions);
+const allowlist_workspace_action_completions = scopedAllowlistCompletions("workspace", allowlist_scoped_action_suffixes);
+const allowlist_global_action_completions = scopedAllowlistCompletions("global", allowlist_scoped_action_suffixes);
+const allowlist_workspace_add_kind_completions = scopedAllowlistCompletions("workspace", allowlist_add_kind_completions);
+const allowlist_global_add_kind_completions = scopedAllowlistCompletions("global", allowlist_add_kind_completions);
+const allowlist_workspace_remove_kind_completions = scopedAllowlistCompletions("workspace", allowlist_remove_kind_completions);
+const allowlist_global_remove_kind_completions = scopedAllowlistCompletions("global", allowlist_remove_kind_completions);
+const allowlist_workspace_reset_scope_completions = scopedAllowlistCompletions("workspace", allowlist_reset_scope_completions);
+const allowlist_global_reset_scope_completions = scopedAllowlistCompletions("global", allowlist_reset_scope_completions);
+const allowlist_workspace_add_tool_completions = scopedAllowlistCompletions("workspace", allowlist_add_tool_completions);
+const allowlist_global_add_tool_completions = scopedAllowlistCompletions("global", allowlist_add_tool_completions);
+const allowlist_workspace_remove_tool_completions = scopedAllowlistCompletions("workspace", allowlist_remove_tool_completions);
+const allowlist_global_remove_tool_completions = scopedAllowlistCompletions("global", allowlist_remove_tool_completions);
 
 /// `/mcp` completes the MCP verbs and server names.
 fn mcpVerbsOn() bool {
     return true;
 }
 
-fn runtimeArgCommand(registry: SlashRegistry) []const u8 {
-    const first = registry.arguments[0].full;
+/// The command a non-empty group of the app's completions is for.
+fn runtimeArgCommand(group: []const mod_registry.ArgumentCompletion) []const u8 {
+    const first = group[0].full;
     return first[0 .. std.mem.findScalar(u8, first, ' ') orelse first.len];
 }
 
-/// What follows the command the app's completions are for, untrimmed at
-/// the end so a finished word moves on to the next one.
-fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?[]const u8 {
-    if (registry.arguments.len == 0) return null;
-    const command = runtimeArgCommand(registry);
-    if (!std.mem.startsWith(u8, prefix, command) or prefix.len == command.len) return null;
-    if (prefix[command.len] != ' ') return null;
-    return std.mem.trimStart(u8, prefix[command.len..], " ");
-}
+/// The app's completions for the command `prefix` starts with, and what
+/// follows that command, untrimmed at the end so a finished word moves on
+/// to the next one.
+const RuntimeArgQuery = struct {
+    group: []const mod_registry.ArgumentCompletion,
+    text: []const u8,
+};
 
-/// A verb matches before its first space, and `VERB NAME` after it.
-fn runtimeArgMatches(registry: SlashRegistry, full: []const u8, query: []const u8) bool {
-    const rest = full[runtimeArgCommand(registry).len + 1 ..];
-    const naming = std.mem.findScalar(u8, query, ' ') != null;
-    if (naming != (std.mem.findScalar(u8, rest, ' ') != null)) return false;
-    return std.ascii.startsWithIgnoreCase(rest, query);
-}
-
-fn nthRuntimeArg(registry: SlashRegistry, query: []const u8, n: usize) ?mod_registry.ArgumentCompletion {
-    var idx: usize = 0;
-    for (registry.arguments) |entry| {
-        if (!runtimeArgMatches(registry, entry.full, query)) continue;
-        if (idx == n) return entry;
-        idx += 1;
+fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?RuntimeArgQuery {
+    for (registry.argument_groups) |group| {
+        if (group.len == 0) continue;
+        const command = runtimeArgCommand(group);
+        if (!std.mem.startsWith(u8, prefix, command) or prefix.len == command.len) continue;
+        if (prefix[command.len] != ' ') continue;
+        return .{ .group = group, .text = std.mem.trimStart(u8, prefix[command.len..], " ") };
     }
     return null;
+}
+
+/// Before the first space a verb matches by prefix. After it the verb must
+/// be complete, and the name matches as every menu matches. The list keeps
+/// its order (`fuzzy_match.Filter`).
+const RuntimeArgMatches = struct {
+    group: []const mod_registry.ArgumentCompletion,
+    query: []const u8,
+
+    pub fn matchAt(self: RuntimeArgMatches, position: usize) ?fuzzy_match.Match {
+        const rest = self.group[position].full[runtimeArgCommand(self.group).len + 1 ..];
+        const query_space = std.mem.findScalar(u8, self.query, ' ');
+        const rest_space = std.mem.findScalar(u8, rest, ' ');
+        if ((query_space == null) != (rest_space == null)) return null;
+        const verb_end = rest_space orelse
+            return if (std.ascii.startsWithIgnoreCase(rest, self.query)) .{ .tier = .prefix, .field = 0 } else null;
+        if (!std.ascii.eqlIgnoreCase(rest[0..verb_end], self.query[0..query_space.?])) return null;
+        return fuzzy_match.match(self.query[query_space.? + 1 ..], &.{.{ .text = rest[verb_end + 1 ..] }});
+    }
+};
+
+fn runtimeArgFilter(query: RuntimeArgQuery) fuzzy_match.Filter(RuntimeArgMatches) {
+    return .init(.{ .group = query.group, .query = query.text }, query.group.len);
+}
+
+fn nthRuntimeArg(query: RuntimeArgQuery, n: usize) ?mod_registry.ArgumentCompletion {
+    return query.group[runtimeArgFilter(query).at(n) orelse return null];
 }
 
 fn argCompletionPrefix(prefix: []const u8, command: []const u8) ?[]const u8 {
@@ -1048,11 +1156,11 @@ fn allowlistArgCompletionState(query: []const u8) AllowlistArgCompletionState {
                 .query = split.rest,
             };
         }
-        if (std.ascii.eqlIgnoreCase(split.word, "local")) {
-            return scopedAllowlistArgCompletionState(.local, split.rest);
+        if (std.ascii.eqlIgnoreCase(split.word, "workspace")) {
+            return scopedAllowlistArgCompletionState(.workspace, split.rest);
         }
-        if (std.ascii.eqlIgnoreCase(split.word, "user")) {
-            return scopedAllowlistArgCompletionState(.user, split.rest);
+        if (std.ascii.eqlIgnoreCase(split.word, "global")) {
+            return scopedAllowlistArgCompletionState(.global, split.rest);
         }
         if (std.ascii.eqlIgnoreCase(split.word, "add")) {
             if (allowlistToolArgQuery(split.rest)) |tool_query| {
@@ -1100,8 +1208,8 @@ fn allowlistArgCompletionState(query: []const u8) AllowlistArgCompletionState {
 }
 
 const AllowlistCompletionScope = enum {
-    local,
-    user,
+    workspace,
+    global,
 };
 
 fn scopedAllowlistArgCompletionState(
@@ -1112,14 +1220,14 @@ fn scopedAllowlistArgCompletionState(
     const split = splitAllowlistArgQuery(query);
     if (!split.has_rest) {
         return switch (scope) {
-            .local => .{
-                .completions = &allowlist_local_action_completions,
-                .label_offset = "/allowlist local ".len,
+            .workspace => .{
+                .completions = &allowlist_workspace_action_completions,
+                .label_offset = "/allowlist workspace ".len,
                 .query = split.word,
             },
-            .user => .{
-                .completions = &allowlist_user_action_completions,
-                .label_offset = "/allowlist user ".len,
+            .global => .{
+                .completions = &allowlist_global_action_completions,
+                .label_offset = "/allowlist global ".len,
                 .query = split.word,
             },
         };
@@ -1128,27 +1236,27 @@ fn scopedAllowlistArgCompletionState(
     if (std.ascii.eqlIgnoreCase(split.word, "add")) {
         if (allowlistToolArgQuery(split.rest)) |tool_query| {
             return switch (scope) {
-                .local => .{
-                    .completions = &allowlist_local_add_tool_completions,
-                    .label_offset = "/allowlist local add tool ".len,
+                .workspace => .{
+                    .completions = &allowlist_workspace_add_tool_completions,
+                    .label_offset = "/allowlist workspace add tool ".len,
                     .query = tool_query,
                 },
-                .user => .{
-                    .completions = &allowlist_user_add_tool_completions,
-                    .label_offset = "/allowlist user add tool ".len,
+                .global => .{
+                    .completions = &allowlist_global_add_tool_completions,
+                    .label_offset = "/allowlist global add tool ".len,
                     .query = tool_query,
                 },
             };
         }
         return switch (scope) {
-            .local => .{
-                .completions = &allowlist_local_add_kind_completions,
-                .label_offset = "/allowlist local add ".len,
+            .workspace => .{
+                .completions = &allowlist_workspace_add_kind_completions,
+                .label_offset = "/allowlist workspace add ".len,
                 .query = split.rest,
             },
-            .user => .{
-                .completions = &allowlist_user_add_kind_completions,
-                .label_offset = "/allowlist user add ".len,
+            .global => .{
+                .completions = &allowlist_global_add_kind_completions,
+                .label_offset = "/allowlist global add ".len,
                 .query = split.rest,
             },
         };
@@ -1156,41 +1264,41 @@ fn scopedAllowlistArgCompletionState(
     if (std.ascii.eqlIgnoreCase(split.word, "remove")) {
         if (allowlistToolArgQuery(split.rest)) |tool_query| {
             return switch (scope) {
-                .local => .{
-                    .completions = &allowlist_local_remove_tool_completions,
-                    .label_offset = "/allowlist local remove tool ".len,
+                .workspace => .{
+                    .completions = &allowlist_workspace_remove_tool_completions,
+                    .label_offset = "/allowlist workspace remove tool ".len,
                     .query = tool_query,
                 },
-                .user => .{
-                    .completions = &allowlist_user_remove_tool_completions,
-                    .label_offset = "/allowlist user remove tool ".len,
+                .global => .{
+                    .completions = &allowlist_global_remove_tool_completions,
+                    .label_offset = "/allowlist global remove tool ".len,
                     .query = tool_query,
                 },
             };
         }
         return switch (scope) {
-            .local => .{
-                .completions = &allowlist_local_remove_kind_completions,
-                .label_offset = "/allowlist local remove ".len,
+            .workspace => .{
+                .completions = &allowlist_workspace_remove_kind_completions,
+                .label_offset = "/allowlist workspace remove ".len,
                 .query = split.rest,
             },
-            .user => .{
-                .completions = &allowlist_user_remove_kind_completions,
-                .label_offset = "/allowlist user remove ".len,
+            .global => .{
+                .completions = &allowlist_global_remove_kind_completions,
+                .label_offset = "/allowlist global remove ".len,
                 .query = split.rest,
             },
         };
     }
     if (std.ascii.eqlIgnoreCase(split.word, "reset")) {
         return switch (scope) {
-            .local => .{
-                .completions = &allowlist_local_reset_scope_completions,
-                .label_offset = "/allowlist local reset ".len,
+            .workspace => .{
+                .completions = &allowlist_workspace_reset_scope_completions,
+                .label_offset = "/allowlist workspace reset ".len,
                 .query = split.rest,
             },
-            .user => .{
-                .completions = &allowlist_user_reset_scope_completions,
-                .label_offset = "/allowlist user reset ".len,
+            .global => .{
+                .completions = &allowlist_global_reset_scope_completions,
+                .label_offset = "/allowlist global reset ".len,
                 .query = split.rest,
             },
         };
@@ -1207,11 +1315,11 @@ fn allowlistArgCompletionAnchor(prefix: []const u8) ?usize {
     const split = splitAllowlistArgQuery(query);
     if (!split.has_rest) return "/allowlist ".len;
     if (std.ascii.eqlIgnoreCase(split.word, "view")) return "/allowlist view ".len;
-    if (std.ascii.eqlIgnoreCase(split.word, "local")) {
-        return scopedAllowlistArgCompletionAnchor(.local, split.rest);
+    if (std.ascii.eqlIgnoreCase(split.word, "workspace")) {
+        return scopedAllowlistArgCompletionAnchor(.workspace, split.rest);
     }
-    if (std.ascii.eqlIgnoreCase(split.word, "user")) {
-        return scopedAllowlistArgCompletionAnchor(.user, split.rest);
+    if (std.ascii.eqlIgnoreCase(split.word, "global")) {
+        return scopedAllowlistArgCompletionAnchor(.global, split.rest);
     }
     if (std.ascii.eqlIgnoreCase(split.word, "add")) {
         if (allowlistToolArgQuery(split.rest) != null) return "/allowlist add tool ".len;
@@ -1231,8 +1339,8 @@ fn scopedAllowlistArgCompletionAnchor(
 ) usize {
     const split = splitAllowlistArgQuery(query);
     const base = switch (scope) {
-        .local => "/allowlist local ",
-        .user => "/allowlist user ",
+        .workspace => "/allowlist workspace ",
+        .global => "/allowlist global ",
     };
     if (!split.has_rest) return base.len;
     if (std.ascii.eqlIgnoreCase(split.word, "add")) {
@@ -1295,6 +1403,17 @@ fn renderSlashEntries(alloc: Allocator, registry: SlashRegistry, welcome_only: b
     }
 
     return try out.toOwnedSlice();
+}
+
+/// The warning a deprecated command prints before it runs, or null for a
+/// current command. Caller owns the returned text.
+pub fn deprecationWarning(alloc: Allocator, registry: TopLevelRegistry, kind: TopLevelKind) !?[]u8 {
+    for (registry.specs) |spec| {
+        if (spec.kind != kind) continue;
+        const replacement = spec.replaced_by orelse return null;
+        return try alloc.print("fx {s} " ++ deprecated_until ++ "; use {s}\n", .{ spec.token, replacement });
+    }
+    return null;
 }
 
 fn topLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) TopLevelSpec {
@@ -1613,10 +1732,13 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
     try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
     try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
+    try std.testing.expect(std.mem.find(u8, text, "upgrade|update") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") != null);
+    // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
+    try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") == null);
+    try std.testing.expect(std.mem.find(u8, text, "login [vercel|codex|grok] [--api-key]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
     try std.testing.expect(std.mem.find(u8, text, "Show Vercel AI Gateway credits") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign in to Vercel or a selected provider") == null);
@@ -1628,7 +1750,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "-r") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, -r, --continue") == null);
     try std.testing.expect(std.mem.find(u8, text, "--resume [last|<id>]") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--resume-last") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--resume-last") == null);
     try std.testing.expect(std.mem.find(u8, text, "-v, --version") != null);
     try std.testing.expect(std.mem.find(u8, text, "Must appear before the command. Accepted names:") == null);
     try std.testing.expect(std.mem.find(u8, text, "skill_description_bytes, skill_catalog_bytes") == null);
@@ -1689,13 +1811,40 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the remembered workspace session"));
-    try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
-    try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
-    try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
+    try std.testing.expect(lineContainsBoth(wide, "-r, --resume [last|<id>]", "Pick a saved session, or resume the latest or an exact ID"));
     try std.testing.expect(std.mem.find(u8, wide, "Print the fx version and exit\n\nExamples:") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "List available models\n\n  setup") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "List available models\n\n  teams") != null);
     try std.testing.expect(std.mem.find(u8, wide, "Show Vercel AI Gateway credits\n\n  usage") != null);
     try expectAllLinesFit(narrow, 60);
+}
+
+test "command help lists subcommands under Commands, nested words with their parent" {
+    const specs = [_]TopLevelSpec{.{
+        .kind = .mcp,
+        .token = "mcp",
+        .usage = "mcp <command> ...",
+        .summary = "Manage MCP servers",
+        .subcommands = &.{
+            .{ .usage = "list", .description = "List servers" },
+            .{ .usage = "trust", .description = "", .subcommands = &.{
+                .{ .usage = "approve NAME", .description = "Approve a server" },
+                .{ .usage = "reset", .description = "Forget approvals" },
+            } },
+        },
+    }};
+    const registry: TopLevelRegistry = .{ .specs = &specs, .description = "", .interactive_hint = "" };
+    const text = try renderTopLevelCommandHelp(std.testing.allocator, registry, .mcp);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text,
+        \\Commands:
+        \\  list                List servers
+        \\  trust approve NAME  Approve a server
+        \\  trust reset         Forget approvals
+        \\
+    ) != null);
+    try std.testing.expectEqualStrings("set", (SubcommandDoc{ .usage = "set <key> <value>", .description = "" }).name());
+    try std.testing.expect((SubcommandDoc{ .usage = "get <key>", .description = "" }).takesSettingKey());
+    try std.testing.expect(!(SubcommandDoc{ .usage = "add PATH", .description = "" }).takesSettingKey());
 }
 
 test "top-level help hides developer recording surfaces" {
@@ -1735,7 +1884,7 @@ test "per-command help preserves long resume usage without debug recording" {
     const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .@"resume");
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c") != null);
     try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--record") == null);
 }
@@ -1745,9 +1894,12 @@ test "ACP help documents accepted options" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.find(u8, text, "fx acp\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--log-file <path>]") != null);
     try std.testing.expect(std.mem.find(u8, text, "--model <id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--effort <level>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
+    // ACP sessions don't apply gateway provider routing.
+    try std.testing.expect(std.mem.find(u8, text, "--provider-order") == null);
 }
 
 test "hidden top-level commands do not reserve help usage width" {
@@ -1823,7 +1975,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 40), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -1938,6 +2090,14 @@ test "top-level specs keep unique tokens and aliases" {
     }
 }
 
+test "a deprecated command warns with its replacement and a current one does not" {
+    const alloc = std.testing.allocator;
+    const warning = (try deprecationWarning(alloc, testTopLevelRegistry(), .setup)).?;
+    defer alloc.free(warning);
+    try std.testing.expectEqualStrings("fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n", warning);
+    try std.testing.expect((try deprecationWarning(alloc, testTopLevelRegistry(), .login)) == null);
+}
+
 test "top-level help index covers visible commands once" {
     const registry = testTopLevelRegistry();
     for (registry.specs) |spec| {
@@ -1984,8 +2144,8 @@ test "slash completions include allowlist staged arguments" {
     try std.testing.expectEqualStrings("/allowlist add", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 1).?);
     try std.testing.expectEqualStrings("/allowlist remove", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 2).?);
     try std.testing.expectEqualStrings("/allowlist reset", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 3).?);
-    try std.testing.expectEqualStrings("/allowlist local", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 4).?);
-    try std.testing.expectEqualStrings("/allowlist user", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 5).?);
+    try std.testing.expectEqualStrings("/allowlist workspace", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 4).?);
+    try std.testing.expectEqualStrings("/allowlist global", nthSlashCompletion(testSlashRegistry(), "/allowlist ", 5).?);
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/allowlist a"));
     try std.testing.expectEqualStrings("/allowlist add", nthSlashCompletion(testSlashRegistry(), "/allowlist a", 0).?);
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/allowlist v"));
@@ -2028,19 +2188,19 @@ test "slash completions include allowlist staged arguments" {
 
     try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/allowlist view "));
     try std.testing.expectEqualStrings("/allowlist view effective", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 0).?);
-    try std.testing.expectEqualStrings("/allowlist view local", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 1).?);
-    try std.testing.expectEqualStrings("/allowlist view user", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 2).?);
+    try std.testing.expectEqualStrings("/allowlist view workspace", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist view global", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 2).?);
 
-    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/allowlist user "));
-    try std.testing.expectEqualStrings("/allowlist user add", nthSlashCompletion(testSlashRegistry(), "/allowlist user ", 0).?);
-    try std.testing.expectEqualStrings("/allowlist user remove", nthSlashCompletion(testSlashRegistry(), "/allowlist user ", 1).?);
-    try std.testing.expectEqualStrings("/allowlist user reset", nthSlashCompletion(testSlashRegistry(), "/allowlist user ", 2).?);
-    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/allowlist user add "));
-    try std.testing.expectEqualStrings("/allowlist user add command", nthSlashCompletion(testSlashRegistry(), "/allowlist user add ", 0).?);
-    try std.testing.expectEqual(@as(usize, allowlist_user_add_tool_completions.len), slashCompletionCount(testSlashRegistry(), "/allowlist user add tool "));
-    try std.testing.expectEqualStrings("/allowlist user add tool read_file", nthSlashCompletion(testSlashRegistry(), "/allowlist user add tool ", 0).?);
-    try std.testing.expectEqual(@as(usize, 5), slashCompletionCount(testSlashRegistry(), "/allowlist local reset "));
-    try std.testing.expectEqualStrings("/allowlist local reset all", nthSlashCompletion(testSlashRegistry(), "/allowlist local reset ", 4).?);
+    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/allowlist global "));
+    try std.testing.expectEqualStrings("/allowlist global add", nthSlashCompletion(testSlashRegistry(), "/allowlist global ", 0).?);
+    try std.testing.expectEqualStrings("/allowlist global remove", nthSlashCompletion(testSlashRegistry(), "/allowlist global ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist global reset", nthSlashCompletion(testSlashRegistry(), "/allowlist global ", 2).?);
+    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/allowlist global add "));
+    try std.testing.expectEqualStrings("/allowlist global add command", nthSlashCompletion(testSlashRegistry(), "/allowlist global add ", 0).?);
+    try std.testing.expectEqual(@as(usize, allowlist_global_add_tool_completions.len), slashCompletionCount(testSlashRegistry(), "/allowlist global add tool "));
+    try std.testing.expectEqualStrings("/allowlist global add tool read_file", nthSlashCompletion(testSlashRegistry(), "/allowlist global add tool ", 0).?);
+    try std.testing.expectEqual(@as(usize, 5), slashCompletionCount(testSlashRegistry(), "/allowlist workspace reset "));
+    try std.testing.expectEqualStrings("/allowlist workspace reset all", nthSlashCompletion(testSlashRegistry(), "/allowlist workspace reset ", 4).?);
 }
 
 test "slash completions include web_fetch allowlist domain forms" {
@@ -2063,11 +2223,11 @@ test "allowlist staged completions with more arguments append space on tab" {
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist reset"));
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist add command"));
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist remove url"));
-    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist user"));
-    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist user add"));
-    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist local remove tool"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist global"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist global add"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist workspace remove tool"));
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist view"));
-    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist view user"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist view global"));
     try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist reset all"));
 }
 
@@ -2139,9 +2299,8 @@ test "slash completion descriptions follow completion matches" {
     try std.testing.expectEqualStrings("start a fresh conversation while keeping managed processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
     try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
     try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
-    try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
+    try std.testing.expectEqualStrings("copy a private diagnostic trace as JSONL", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
     try std.testing.expectEqualStrings("summarize context into a fresh window", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
-    try std.testing.expectEqualStrings("show alias availability", nthSlashCompletionDescription(testSlashRegistry(), "/ali", 0).?);
     try std.testing.expectEqualStrings("toggle Fast mode when supported", nthSlashCompletionDescription(testSlashRegistry(), "/fa", 0).?);
 }
 
@@ -2194,12 +2353,19 @@ test "top-level help lines fit representative terminal widths" {
     }
 }
 
+pub const slack_options = [_]OptionDoc{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }};
+
 pub const slack_install_spec: TopLevelSpec = .{
     .kind = .slack,
     .token = "slack",
     .usage = "slack <install|status|refresh> [--json]",
     .summary = "Install and manage the workspace Slack bot locally",
-    .options = &.{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }},
+    .subcommands = &.{
+        .{ .usage = "install", .description = "Authorize the bot through fx.sh and save its credentials", .options = &slack_options },
+        .{ .usage = "status", .description = "Show the local installation", .options = &slack_options },
+        .{ .usage = "refresh", .description = "Renew the bot's tokens without the browser", .options = &slack_options },
+    },
+    .options = &slack_options,
     .details = &.{
         "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
         "status shows local installation metadata; refresh renews tokens without browser authorization.",
@@ -2208,3 +2374,25 @@ pub const slack_install_spec: TopLevelSpec = .{
         "Refresh runs only when requested; no background service is installed.",
     },
 };
+
+test "app argument completions route each command to its own group" {
+    const mcp = [_]mod_registry.ArgumentCompletion{ .{ .full = "/mcp list" }, .{ .full = "/mcp show" } };
+    const launch = [_]mod_registry.ArgumentCompletion{
+        .{ .full = "/launch main", .description = "gpt-5", .select_description = true },
+        .{ .full = "/launch scout", .description = "haiku 4-5", .select_description = true },
+    };
+    var registry: SlashRegistry = .{};
+    registry.argument_groups = .{ &mcp, &launch };
+
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/launch "));
+    try std.testing.expectEqualStrings("main", nthSlashCompletionLabel(registry, "/launch ", 0).?);
+    try std.testing.expectEqualStrings("gpt-5", nthSlashCompletionDescription(registry, "/launch ", 0).?);
+    try std.testing.expect(nthSlashCompletionSelectsDescription(registry, "/launch ", 0));
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/launch sc"));
+    try std.testing.expectEqualStrings("/launch scout", nthSlashCompletion(registry, "/launch sc", 0).?);
+
+    try std.testing.expectEqualStrings("/mcp show", nthSlashCompletion(registry, "/mcp sh", 0).?);
+    try std.testing.expect(!nthSlashCompletionSelectsDescription(registry, "/mcp ", 0));
+    // A command without a group, or without its space, completes nothing from the app.
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(registry, "/launchx "));
+}

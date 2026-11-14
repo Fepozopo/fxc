@@ -1,8 +1,348 @@
 # fx
 
-## 0.0.14
+## 0.0.17
 
 <!-- release:start -->
+
+**Subagents now work alongside you: switch between agents and run several fx instances in one window. Vercel Token Pass is now first-class in fx. Tool definitions 48.0% smaller, and 82.0% of later input from the prompt cache, up from 61.3%.**
+
+### New Features
+
+- Subagents work alongside the main agent and report back when they finish.
+- Switch to any subagent to watch it, message it, or answer its prompts.
+- A parent agent hears when its subagent's command has printed nothing for 2 minutes.
+- Open the agent list with Down or Ctrl+X to see, search, switch, and close agents.
+- Each subagent has its own model, effort, Fast mode, and permission mode, and subagents can nest two levels deep.
+- The main agent sees its subagents each turn and reuses idle ones for related work.
+- Agent profiles in `~/.fx/agents` or `.fx/agents` set an agent's tools, MCP servers, model, and prompt.
+- `fx --profile <name>` starts a session in an agent profile.
+- `fx --instances <n>` and `/launch` run several fx instances in one window.
+- `fx sessions --live` lists open sessions and their subagents.
+- `fx session <id>/<agent>` reads a subagent's conversation, and `--tail <n>` shows only the last turns.
+- Vercel Token Pass models come first in the model picker.
+- `/credits` and `fx credits` show your Token Pass credit and its reset date.
+- Token Pass sessions use Token Pass models for titles, images, and auto mode review.
+- Login offers Token Pass to teams that don't have it yet.
+- The `toolbox` tool replaces `skill`, `capability_search`, and `mcp_select_tool`, so every request sends the same tools.
+- `fx mcp call TOOL` runs an MCP tool from a shell command.
+- Custom connections can set effort levels, request fields, headers, timeouts, and a title model.
+- Cache warming keeps Claude's prompt cache warm while you pause, and `"cache_warming": false` turns it off.
+- Reopening a session after a crash or a closed window sends the interrupted request again.
+- Plain `fx` shows `Interrupted turn · /resume to continue` when a turn was left unfinished.
+- `fx config` lists, reads, and changes settings.
+- `fx ask --config key=value` overrides a setting for one request.
+- `fx completion bash`, `zsh`, and `fish` print a shell completion script.
+- `fx "<prompt>"` starts a session with that prompt, and `-r` is short for `--resume`.
+- `FX_HOME` moves the profile folder from `~/.fx`.
+- Ctrl+T cycles the reasoning effort.
+
+### Improvements
+
+- Toolbox raised prompt cache reads from 61.3% to 82.0% of later input in live tests across 9 model families.
+- Built-in tool definitions are 48.0% smaller than in 0.0.16, and a new session's first request is 32.4% smaller.
+- libfx's native addons are 10.1% to 12.9% smaller than in 0.0.16.
+- The Linux arm64 and x86_64 binaries are 36.6% and 31.1% smaller than in 0.0.16.
+- libfx requests now use AI Gateway's prompt cache.
+- A shell result for a command with no output is about 70 characters instead of about 340.
+- Skill descriptions in the toolbox menu stop at 200 characters, down from 1,024.
+- Earlier turns go back to the model unchanged, so the prompt cache keeps covering them.
+- An attached file's folder rules arrive as a note, so the prompt cache keeps matching.
+- Conversations with many images drop the oldest in blocks, so the prompt cache stays valid longer.
+- Amazon Nova models now use the prompt cache.
+- Long sessions stay responsive, with the last turn of a 2,400-tool-call session taking 3 s instead of 11 s.
+- Full detail in Ctrl+O shows each model call with its model, time, tokens, and call ID.
+- `/trace` writes JSON Lines instead of a Markdown report.
+- `/trace` includes subagents and keeps failed calls whole.
+- Questions from the model render as Markdown.
+- `fx doctor` now tests your credential and connects to each approved MCP server.
+- Requests keep retrying through network drops, gateway errors, and rate limits until they succeed or you press Esc.
+- Steering moves a running shell command to the background, so your message reaches the model within about a second.
+- Cancelling a turn also stops the commands that steering moved to the background.
+- A command still running in the background shows `Still running` instead of `Ran`.
+- A waiting shell command uses under 1% of a core instead of about 3%.
+- More gateway errors are retried, including 520, 524, and 529.
+- The status line shows why a request is retrying and when it tries again.
+- fx resends a request within about a second when the Mac changes networks, instead of after 45 seconds.
+- fx finds a dead connection within about 5 seconds after the network returns, instead of waiting up to 10 minutes.
+- On a dead network, `fx ask` and `fx acp` start in about 2 seconds instead of 20 to 30.
+- A brief Mac sleep no longer restarts a healthy answer.
+- Errors show in plain words instead of error names.
+- A rejected or filtered request waits for you to send it again with Enter instead of ending the turn.
+- Running out of credits offers to retry, switch models, or cancel.
+- An expired sign-in opens the sign-in and then sends the request again.
+- A restarted answer replaces the broken one instead of following it.
+- A reply cut off before any text is sent again once instead of ending the turn.
+- fx asks the model to continue once when it stops without a reply.
+- After a tool call it can't read, fx tells the model and asks it again at once, with tools available.
+- A compaction the provider refuses as too long is sent again as a smaller request.
+- A command that fails again after an edit goes back to the model instead of ending the turn.
+- Shell results tell the model when a command has printed nothing for 2 minutes.
+- `edit_file` errors show the lines the model most likely meant.
+- MCP arguments sent as text go to the server as the type its schema names.
+- Tool arguments a model writes as JSON text, such as question options and toolbox runs, are read like objects.
+- libfx sends host tools the argument types their schemas name.
+- Menus and pickers match letters in order, so `/mdl` finds `/model`.
+- The model picker labels Fast models and Fast mode apart and lists newer GPT versions first.
+- Ordered lists in replies align their numbers.
+- Tool group headers say what the group did, such as `Edited a file, ran commands`, instead of a tool-call count.
+- Skill discovery warnings no longer show at startup.
+- MCP config changes made outside a session load at the next prompt.
+- `fx mcp add` signs in to a new server that needs it, and `--no-login` skips that.
+- Mistyped commands, flags, and settings suggest the closest match.
+- Every command accepts flags as `--flag=value`.
+- `fx pr`, `fx issue`, and `fx acp` take the same run flags as `fx ask`.
+- fx turns off color when `NO_COLOR` is set or `TERM=dumb`.
+- The resume command prints on its own line at exit.
+- `fx sessions` and `fx sessions --live` print aligned tables.
+- fx retries a sign-out that the provider did not confirm.
+- A new libfx session skips 3 empty storage reads on its first prompt.
+- libfx starts preparing a prompt's run while the queue confirms the prompt.
+
+### Bug Fixes
+
+- Closing the window during a request no longer cancels it, so `fx -c` sends it again.
+- `fx ask` and ACP no longer wait 15 seconds for a stuck session title.
+- Esc and Ctrl-C stop a request at once during a stuck DNS lookup.
+- Cancelling a turn ends a running tty command.
+- A cancelled provider switch ends at once.
+- fx uses a login another fx just refreshed instead of asking you to sign in again.
+- Several fx processes that get a 401 together refresh a shared fx, Codex, or Grok login once.
+- A cancel no longer cuts off a sign-in refresh, so other fx processes stay signed in.
+- A new Vercel sign-in starts on the team you used before.
+- A request waiting for a sign-in resends with the team you picked.
+- Claude Fable 5.1 and later no longer reject a continued session with "Invalid signature in thinking block".
+- Starting many HTTP MCP servers no longer crashes fx.
+- MCP logins save while other fx processes use the Keychain.
+- MCP logout says when a login couldn't be removed or revoked.
+- A named pipe in place of `~/.fx/mcp.json` no longer hangs fx.
+- fx says when it can't write its output and stops quietly when piped into `head`.
+- Startup-file wrappers such as Socket Firewall's `npm` work in fx.
+- Large shell snapshots restore in full with macOS's bash 3.2.
+- A startup file that defines `builtin` no longer breaks fx's shell.
+- A backslash before a newline continues the line, as in the shell.
+- A daemon started by a command keeps running after the command ends.
+- Ctrl+Backspace deletes a word, and repeated Cmd+Backspace deletes across lines.
+- `/rename`, `/image`, and `/shell` picked from the slash menu wait for their argument.
+- Wide edit rows keep their `+N / -M` counts.
+- Resizing or resuming a session no longer drops turns from the screen, and long tool-heavy turns leave no blank rows in scrollback.
+- Theme switches and bracketed paste keep working after a terminal reset or Ctrl+Z.
+- Ctrl+G updates fx without moving or repeating the conversation.
+- A damaged session says it is unreadable and points to `fx doctor`.
+- New session IDs never start with a dash.
+- fx says why a terminal recording could not start.
+- libfx no longer sends the same Codex request twice.
+- `/credits` shows the AI Gateway amount used.
+- Skills load from a linked `FX_HOME`, with multi-line descriptions and nested keys.
+- fx keeps running when herdr doesn't answer.
+- A relative `HOME` no longer crashes `fx mcp`.
+- MCP calls wait up to 5 minutes, up from 60 seconds.
+- Common tool-call mistakes from models no longer fail the call.
+- A blank custom answer no longer submits a question.
+- Quitting while the transcript loads no longer crashes fx.
+- Deeply nested provider events no longer crash fx.
+- Fixed a data race in parallel `grep_files` searches.
+
+### Security
+
+- Control codes in model replies, prompts, and MCP tool errors show as text instead of acting on the terminal.
+- `fx logout codex` revokes the login at OpenAI.
+- Shell commands no longer inherit `web_fetch` connections.
+- `fx doctor` fix lines can't run commands from a project's `.mcp.json`.
+- When other users can write to `~/.fx`, fx removes their access and still loads your settings.
+- Control characters in error messages show as visible escapes.
+
+### Breaking Changes
+
+- Auto mode now holds an action only for prompt injection or harm to your machine.
+- The subagent tool's one-off `run` action is gone.
+- `fx doctor` exits 1 when a check fails.
+- Usage errors exit with status 2 instead of 1.
+- `statusLine` is now `status_line`, and `notifications` is now `sound`.
+- `fx setup`, `/setup`, `fx mcp --profile`, and `/allowlist user` and `local` warn now and stop working in fx 0.0.18.
+- Old resume spellings, such as `fx resume` and `--resume-id`, are removed.
+- `fx ask --verbose` and `FLASH_SYNC_UPDATES` are removed; use `FX_SYNC_UPDATES`.
+- Esc during a retry ends the turn, and the separate Esc-to-pause is gone.
+- `fx ask --json` and ACP report recovery as `state`, `attempt`, `need`, and `message`.
+
+<!-- release:end -->
+
+## 0.0.16
+
+**fx uses 41% fewer tokens. The CLI is 2.8% smaller. libfx npm downloads are about 60% smaller. Edit files up to 4× larger, now up to 16 MiB.**
+
+### Improvements
+
+- Long agent turns use less CPU. A paired local benchmark with 1,000 tool steps used 50–59% less CPU than the previous implementation.
+- `fx update` now works as an alias for `fx upgrade`, including `--channel` and `--json`.
+- Tool results keep their original timestamps when a turn is rebuilt or resumed.
+- The macOS arm64 CLI binary is 2.8% smaller (5.97 MiB vs 6.15 MiB), saving 180,576 bytes.
+- Installing libfx downloads about 60% less than 0.0.15, including the matching native platform package. On Apple Silicon, the download drops from 19.08 MB to 7.35 MB, a 61.5% reduction.
+- Across macOS and Linux builds, total libfx npm downloads are 59.8–61.5% smaller. Unpacked package contents shrink from 43.55 MB to roughly 18–19.5 MB.
+- libfx installs the native addon for your platform instead of carrying every platform’s binary. By default, Node.js loads the WebAssembly backend only when native execution is unavailable.
+- Across ten model families, caching scenarios used 41% fewer uncached input tokens than 0.0.15. Requests that broke the cached prompt prefix fell from 80 to 10, an 87.5% reduction.
+- Uncached input tokens fell 79% on Claude Sonnet 5.5, 78% on Claude Haiku 5.5, and 76% on GPT-6.1 in that comparison. Results varied by model, with MiniMax using 3% more.
+- Prompt caching on supported models now reuses shared instructions across workspaces and worktrees.
+- Changing branches or permissions, reading new folder rules, and resuming a conversation keep the earlier conversation available for prompt caching.
+- Named skills send their full instructions with the turn that invokes them instead of adding them to every later request.
+- Browser apps can bundle only the WebAssembly module they use instead of both the agent and terminal modules.
+- The libfx WebAssembly core is 12.8% smaller than in 0.0.15 (2.15 MiB vs 2.47 MiB), and the terminal is 20.2% smaller (3.39 MiB vs 4.24 MiB). These are uncompressed binary sizes.
+- `edit_file` and `write_file` handle files up to 16 MiB, up from 4 MiB.
+- File edits save their diffs instead of full copies of the file before and after every change. The diff remains available in Ctrl+O after resume, with an omitted-row notice if it exceeds the saved-text limit.
+- `/model` finds models from abbreviated or slightly mistyped provider and model names.
+- Saved sessions retain token usage from each model reply, including replies received before an interrupted turn, and continue counting after resume.
+- Subagent token usage is saved in each subagent’s own session and remains separate from its parent’s total.
+- `fx ask --json` includes cached-read and cache-write token counts when the provider reports them.
+- Global `~/.fx/AGENTS.md` can link to an instruction file elsewhere inside your home directory.
+- Slack sign-in requests the permissions needed to search private channels and direct messages you can access.
+
+### Bug Fixes
+
+- When repeated response failures stop a turn, fx keeps its prompt, partial reply, and completed tool calls. The next prompt can continue from that work, including after resuming the session.
+- Retrying a cancelled libfx prompt with the same turn ID returns the ended turn instead of running the prompt and its tools again.
+- Opening an edit in Ctrl+O no longer crashes when the file contains terminal escape sequences.
+- Editing files containing invalid UTF-8 no longer prevents the session from saving or stops the turn. Invalid bytes appear as readable escapes in previews and saved diffs.
+- Fixed `fx balance` startup when reading a saved credential from the system key store.
+- Stopping a terminal also stops commands running in nested shells and separate job-control groups instead of leaving them running.
+- MCP server failures retain their final error output, including when the server exits immediately.
+- `/usage` in the browser terminal fetches usage through the host instead of showing zero because WebAssembly cannot make native network requests.
+- Qwen no longer fails after its first tool call with `System message must be at the beginning`.
+
+### Security
+
+- File diffs display terminal control sequences as text instead of letting them alter the terminal. This also applies when opening older saved conversations.
+- Commands with escaped or separated stderr-redirection descriptors require review instead of being mistaken for routine commands that can skip review.
+- `fx login codex` rejects account identifiers that cannot be used in HTTP headers before saving credentials or reporting success.
+- File, tool, and skill text is escaped so it remains separate from fx’s own context and permission updates.
+
+### Breaking Changes
+
+- libfx now requires Node.js `^20.19.0 || >=22.12.0`, including when loaded with `require()`.
+- libfx 0.0.15 cannot reopen saved turns containing the new context updates. Upgrade every worker sharing their session store before starting new turns.
+
+## 0.0.15
+
+**fx now uses 70% less memory in long conversations. The model catalog updates without restarting fx. A leaner session store with 18% faster resumes and `/fork` to branch from an earlier prompt.**
+
+### Improvements
+
+- In a local synthetic benchmark with 96 MiB of saved images, fx used 69.5% less peak memory (116.5 MiB vs 381.8 MiB) and completed turns 3.3× faster (288 ms vs 939 ms) than 0.0.14.
+- Text sessions resume about 18% faster in local comparisons with 0.0.14.
+- WebAssembly also handles longer image conversations: a separate local benchmark completed 140 turns where the earlier implementation ran out of memory at turn 102.
+- Durable libfx sessions no longer reread unchanged log entries. In a 40-turn benchmark, starting the next turn took 7 serial storage calls instead of 11, a 36% reduction.
+- Durable libfx sessions save prompt, steering, and tool images once instead of copying them into every checkpoint. The conversation keeps its newest 4,096 images, up to 512 MiB, and replaces older images with notes.
+- fx saves pasted, dropped, and attached images once per session and tells the model where to find the saved copy. Resuming or forking a conversation loads image bytes only when needed.
+- fx loads prompt history faster by skipping entries from other workspaces.
+- `/model` refreshes its catalog in the background, so newly released models appear without restarting fx. Cached models remain available if a refresh fails.
+- For libfx engines that save their state, a turn's `result` resolves only after the final state is saved. If saving fails, the result rejects instead of reporting success.
+- Session timestamps, transcript times, usage resets, and sign-in expiry dates now use your local time zone.
+- When the agent reads saved output, the transcript names the command or tool that produced it. Searches show the query too.
+- ACP clients show command output rather than JSON in completed shell tool calls, including after reopening a saved session.
+- Missing or changed command-output files no longer prevent `fx session recover` from recovering an older conversation. It leaves the original untouched and reports which content is unavailable.
+- `fx doctor` lists older sessions it cannot convert and explains what recovery can keep. `fx sessions convert` reports skipped sessions and files left in their original folders.
+- `/status` opens a scrollable panel with the current session ID, whether it is saved, and the active configuration.
+- `/permissions` shows configured rules, temporary approvals, and remembered session rules in a scrollable panel, including the IDs used to revoke them.
+- The resume picker searches all saved conversations in scope, not just loaded pages, and shows `Load more` only when more matches exist.
+- libfx agents and the MCP adapter can use more than 64 tools.
+- fx can ask up to 20 questions in one batch, up from 4.
+- Vercel and MCP sign-in screens show clickable links instead of long authorization addresses.
+- Changing MCP configuration restarts only the affected servers. Other servers keep their connections, tool lists, running calls, and sign-ins.
+- `/mcp` groups servers that need attention and shows each server's status, connection, and tools. Startup notices wait for servers to settle.
+- MCP tools show progress while they run, both in the terminal and in `fx ask`.
+- Tool group summaries and the status line count MCP calls separately from shell commands.
+- The agent can distinguish command runs with identical output when reading their saved results, including after resuming a session.
+- Large MCP text results remain available through `read_tool_result` in saved sessions instead of failing when one item exceeds 1 MiB.
+- Slack renews its MCP login without requiring another sign-in every 12 hours.
+
+### New Features
+
+- `/fork` starts a separate session before an earlier prompt and puts that prompt back in the composer to edit or resend. The original conversation stays unchanged.
+- `/effort` lets you choose reasoning effort without changing models. Open its menu or set a supported level directly with `/effort <level>`.
+- When an MCP tool requires a browser action, fx asks before opening its links and waits for completion, with Retry and Cancel available.
+
+### Bug Fixes
+
+- When a request is too large, fx can retry with fewer older images, including after resuming an interrupted turn. Native libfx also leaves out older images to fit its request limit instead of failing with `HostStreamBackpressure`.
+- Models listed as supporting vision, including Grok 4.7, now receive attached images and images returned by tools even when the catalog does not list document input support.
+- Durable libfx sessions restore images from completed tool calls after a crash, not just the text.
+- Cancelling a durable prompt during an image write no longer waits for the write to finish or queues the cancelled prompt.
+- Images in prompts recalled from input history remain available after fx exits, even if the temporary capture has been deleted.
+- libfx restores a reply saved just before a crash without asking the model to generate it again.
+- Reopening a libfx turn no longer fails after the turn yielded and continued past a checkpoint.
+- Resuming a compacted conversation no longer sends the model tool steps that its summary already covers.
+- Reopening an interrupted session keeps the unfinished prompt and completed tool work. Tool results that the model saw in full are restored in full, rather than replaced with short previews.
+- Converting an old session keeps its original folder if a file cannot be copied, including oversized command output, and tells you which files were left behind.
+- A first prompt rejected because of an API-key sign-in error stays saved, so you can fix the key and resume it.
+- The resume picker orders older and converted sessions together by recency.
+- Fixed a crash that could occur on a later turn in an interactive session.
+- Updating fx before its first prompt no longer fails while trying to resume an unsaved session.
+- Codex, Grok, and custom Chat Completions streams time out after 10 minutes without a response event, so fx can attempt to recover the turn.
+- fx can recover an empty reply cut short by a provider's default output limit by retrying once. If the reply still cannot produce text, fx reports the limit instead of saying `Done.`.
+- A connection can use a working address even when another address is unreachable and background tasks occupy the worker pool.
+- Fixed a macOS connection error or crash that could occur after another request finished.
+- Custom Chat Completions turns no longer abort when the model requests an unknown tool or supplies malformed arguments. fx returns a tool error so the model can continue.
+- libfx host tool calls no longer fail when their JSON input contains line breaks.
+- ACP tool calls no longer remain pending when an unsupported tool is requested or a turn fails, pauses, or is cancelled.
+- Pasted text no longer disappears when extra input arrives immediately afterward. fx keeps the paste and ignores that extra input instead of submitting it.
+- File-approval answers no longer get lost while background transcript or status updates repaint the screen.
+- Starting a new conversation clears the previous session's context-usage count, even when session saving is unavailable.
+- If an interrupted reply's restart exceeds the context limit, fx compacts the conversation and retries instead of ending the turn.
+- Follow-up instructions submitted while a Stop hook runs stay in the current turn instead of being left for a later turn.
+- Images from earlier turns no longer block a new text message when the selected model cannot use them. fx keeps the saved images and leaves them out of that request.
+- Terminal output keeps Unicode characters and following text aligned when output arrives in chunks, including after malformed text.
+- Fixed a crash when a terminal application requests the cursor position after changing scroll margins.
+- Forked sessions are recognized as saved before you send another prompt, and fx shows their resume command on exit.
+- zsh commands containing unquoted `==` or words beginning with `=` no longer fail with command-not-found errors.
+- Shell commands keep using your saved startup environment when a zsh function replaces a default alias.
+- Errors from restoring the shell environment no longer appear in command output when fx falls back to loading startup files.
+- Force-stopping a command no longer lets its shell start the next command while child processes are being killed.
+- Unresponsive MCP servers no longer freeze calls to healthy servers. Tool searches and subagents can use available servers while others are still starting.
+- MCP tools no longer fail as unselected when the agent calls a tool from an earlier turn, including after resuming a session.
+- Repeated calls to HTTP MCP servers that leave response streams open no longer crash fx. Flooding servers no longer consume unbounded memory or delay other servers' timeouts.
+- HTTP MCP tool calls reconnect after an idle connection drops instead of failing until fx restarts. Reconnection retries only requests that failed before they were fully sent.
+- MCP login renewal reconnects when the sign-in server drops an idle connection.
+- MCP sign-ins continue when a browser leaves a connection idle or you choose Log in again.
+- MCP logins refreshed in one terminal are picked up by others. Temporary refresh failures keep the saved login and report that the server is retrying.
+- Invalid MCP entries or unusable tokens no longer crash startup or prevent other servers from loading.
+- Oversized MCP replies explain the size limit instead of reporting that the server disappeared. HTTP replies over the limit are not downloaded repeatedly.
+- MCP tool lists retain their last valid contents when a refresh fails and update before the next call after a server announces changes.
+- ACP clients keep the server and tool names on MCP calls after reopening a session.
+- Unreadable MCP login stores are left untouched, and failures to save a login are reported.
+
+### Security
+
+- fx refuses to save conversations into session-storage paths that are symlinks or not directories. Old-session conversion rejects named pipes in place of session files and does not follow linked terminal-state folders.
+- Recovering an older session with unreadable saved permission rules keeps the conversation, drops those rules, and warns you.
+- fx and libfx check saved images against their recorded digests before using them. Changed bytes are refused instead of being sent as the original image.
+- Repeated Git config includes no longer hang file suggestions or cause runaway memory use during file searches.
+- Shell comments, quoted command separators, and zsh extended globs no longer let commands bypass auto mode's security review.
+- In auto mode, `git fetch` receives security review when its options or repository address can start another program.
+- Reloading your shell startup files no longer reuses a remembered command approval.
+- Command approval screens recognize destructive commands after quoted environment values or command substitutions.
+- MCP logins saved for a repository stay separate from your profile and other repositories, even when servers have the same name and address.
+- Logging out of an MCP server also clears a newer login saved by another terminal. Other running terminals no longer renew and restore a login after you log out.
+- Local MCP servers inherit only basic shell variables, not your full environment. Configure any additional variables the server needs explicitly.
+- Remote MCP sign-in rejects token, registration, and revocation URLs that name localhost, private IPs, or cloud metadata addresses.
+- Only Slack's official MCP endpoint can use fx's built-in Slack sign-in.
+- MCP configuration commands refuse to edit linked files.
+- Approving all project MCP servers approves only the servers shown at that time, not servers added later.
+- Answers to MCP questions apply only to the question that was displayed, not a replacement question.
+- MCP server names cannot inject terminal controls, and invalid characters in tokens or headers are refused instead of being sent.
+
+### Breaking Changes
+
+- All saved sessions now use the new session store, and older sessions convert automatically when you open them. The `--sessions-v2` flag has been removed, and `FX_SESSIONS_V2` no longer changes storage.
+- `fx session migrate` and `fx ask --continue-recovery` have been removed. `fx ask --json` no longer returns the `durable` field.
+- libfx engines using Codex or Grok require an explicit model from that provider. Durable agents can set the model on each session instead.
+- libfx rejects empty prompts and invalid image inputs before they are queued or saved, including malformed Base64, mismatched image types, more than 8 images, or more than 6 MiB of image data.
+- Earlier libfx versions cannot open sessions written with the new image references. Existing sessions from earlier versions still open and continue.
+- Sign in again to authenticated HTTP MCP servers after updating. Existing logins are left untouched but are not imported.
+- `fx mcp auth` is now `fx mcp login NAME`; use `fx mcp approve NAME` or `fx mcp reject NAME` instead of `trust`. The same changes apply to `/mcp`.
+- `fx mcp list` replaces `fx mcp path`. The `reload` command is gone; configuration changes reload automatically.
+- MCP resources and prompts are no longer supported, and the `resource` and `prompt` commands have been removed.
+- Legacy SSE MCP connections are no longer supported. Use a stdio or Streamable HTTP connection instead.
+- `FX_MCP_ENGINE` has been removed. The `required` and nondefault `restart_limit` settings are ignored and reported in configuration notes.
+
+## 0.0.14
 
 **libfx is now durable out of the box. Same API on local, Vercel and DIY. Use your ChatGPT or Grok subscription, or a custom provider, to power cloud agents with libfx. fx moves to Zig 0.17.**
 
@@ -106,8 +446,6 @@
 
 - `fx usage --json` now returns provider reports instead of the previous local usage totals.
 - ACP usage updates report context use and no longer include costs.
-
-<!-- release:end -->
 
 ## 0.0.13
 

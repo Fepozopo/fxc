@@ -58,8 +58,24 @@ pub const Host = struct {
     now_fn: *const fn (ctx: ?*anyopaque) i64,
     /// The I/O implementation for files, locks and the worker.
     io_fn: *const fn (ctx: ?*anyopaque) Io,
-    /// The user's home directory; the cache lives in `<home>/.fx`.
+    /// The folder that holds fx's folder: the user's home directory, or the
+    /// parent of `$FX_HOME`. The cache lives in `<home>/<fx_dir_name>`.
     home: []const u8,
+    /// The name of fx's folder inside `home`.
+    fx_dir_name: []const u8 = ".fx",
+    /// After the provider refuses a sign-in, a newer token for the same
+    /// sign-in that another fx process saved since, or null. Allocated with
+    /// `alloc`. Runs where the fetch runs, never under the dashboard's lock.
+    /// Null when the host cannot renew sign-ins.
+    renew_fn: ?*const fn (ctx: ?*anyopaque, alloc: Allocator, renewal: Renewal) ?[]u8 = null,
+};
+
+/// The sign-in a refused fetch sent, for `Host.renew_fn`. Borrowed.
+pub const Renewal = struct {
+    scope: Scope,
+    rejected: []const u8,
+    team: ?[]const u8,
+    account_id: ?[]const u8,
 };
 
 /// The sign-in `/usage` reads with. The bearer is borrowed only for the call
@@ -244,6 +260,13 @@ pub const Dashboard = struct {
     /// atomic on wasm32; readers only compare it, so wrapping is harmless.
     generation: std.atomic.Value(usize) = .init(0),
     worker: ?std.Thread = null,
+    /// Runs each fetch inside `tick` and `waitForFetch` instead of on a worker
+    /// thread: always in single-threaded builds (wasm), and in tests of that
+    /// path.
+    inline_fetches: bool = builtin.single_threaded,
+    /// A fetch `inline_fetches` started, waiting for `tick` or `waitForFetch`
+    /// to run it outside the lock.
+    queued_job: ?Job = null,
     cancel: std.atomic.Value(bool) = .init(false),
 
     /// Comptime-callable, so an owner can hold a default dashboard.
@@ -261,6 +284,8 @@ pub const Dashboard = struct {
         self.joinWorker();
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
+        if (self.queued_job) |*job| job.deinit(self.gpa);
+        self.queued_job = null;
         if (self.session) |*s| s.deinit(self.gpa);
         self.session = null;
         if (self.entry) |*e| e.deinit();
@@ -305,10 +330,16 @@ pub const Dashboard = struct {
 
     /// Call from the event loop; starts the 15-minute refresh when due, and a
     /// new sign-in's first fetch once the previous sign-in's has finished.
+    /// With `inline_fetches`, it also runs the fetch `open`, `refresh` or this
+    /// call started, so call it only where the host's fetch may pulse the
+    /// event loop.
     pub fn tick(self: *Dashboard) void {
-        self.mutex.lockUncancelable(self.io());
-        defer self.mutex.unlock(self.io());
-        if (self.maybeStartLocked(if (self.fetch_owed) .open else .timer)) self.bump();
+        {
+            self.mutex.lockUncancelable(self.io());
+            defer self.mutex.unlock(self.io());
+            if (self.maybeStartLocked(if (self.fetch_owed) .open else .timer)) self.bump();
+        }
+        self.runQueuedFetch();
     }
 
     /// The host's clock, which snapshots are taken by.
@@ -366,7 +397,22 @@ pub const Dashboard = struct {
 
     /// Waits for the fetch in flight, if any. For `fx usage` and tests.
     pub fn waitForFetch(self: *Dashboard) void {
+        self.runQueuedFetch();
         self.joinWorker();
+    }
+
+    /// Runs a fetch `inline_fetches` queued, without the lock: while a request
+    /// waits, the host's fetch may pulse the event loop, which calls back into
+    /// the dashboard to redraw.
+    fn runQueuedFetch(self: *Dashboard) void {
+        const job = blk: {
+            self.mutex.lockUncancelable(self.io());
+            defer self.mutex.unlock(self.io());
+            const queued = self.queued_job orelse return;
+            self.queued_job = null;
+            break :blk queued;
+        };
+        runJob(self, job);
     }
 
     fn bump(self: *Dashboard) void {
@@ -501,7 +547,7 @@ pub const Dashboard = struct {
     fn openFxDir(self: *Dashboard) ?Io.Dir {
         var home = self.openHome() orelse return null;
         defer home.close(self.io());
-        return home.openDir(self.io(), ".fx", .{}) catch null;
+        return home.openDir(self.io(), self.host.fx_dir_name, .{}) catch null;
     }
 
     /// `~/.fx`, created private when missing: `fx usage` with only an API
@@ -509,17 +555,14 @@ pub const Dashboard = struct {
     fn openOrCreateFxDir(self: *Dashboard) ?Io.Dir {
         var home = self.openHome() orelse return null;
         defer home.close(self.io());
-        home.createDir(self.io(), ".fx", .fromMode(0o700)) catch |err| switch (err) {
+        home.createDir(self.io(), self.host.fx_dir_name, .fromMode(0o700)) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return null,
         };
-        return home.openDir(self.io(), ".fx", .{}) catch null;
+        return home.openDir(self.io(), self.host.fx_dir_name, .{}) catch null;
     }
 
     fn maybeStartLocked(self: *Dashboard, trigger: policy.Trigger) bool {
-        // Fetches run on a worker thread; single-threaded builds (wasm) show
-        // only what is cached.
-        if (comptime builtin.single_threaded) return false;
         const s = self.session orelse return false;
         const now = self.host.now_fn(self.host.ctx);
         if (!policy.due(trigger, self.is_open, self.fetch_state, now)) return false;
@@ -527,17 +570,25 @@ pub const Dashboard = struct {
         self.reloadEntryLocked();
         const finished_day: ?i64 = if (self.entry) |e| (if (e.entry.finished) |f| f.day else null) else null;
         const job = Job.init(self.gpa, s, policy.plan(s.scope, finished_day, now), now) catch return false;
-        // The previous worker has finished (in_flight is false); reap it.
-        if (self.worker) |t| {
-            t.join();
-            self.worker = null;
+        if (builtin.single_threaded or self.inline_fetches) {
+            // `open` and `refresh` only queue it, because a key read during
+            // a model turn can call them; `tick` or `waitForFetch` runs it
+            // once the lock is free.
+            self.cancel.store(false, .release);
+            self.queued_job = job;
+        } else {
+            // The previous worker has finished (in_flight is false); reap it.
+            if (self.worker) |t| {
+                t.join();
+                self.worker = null;
+            }
+            self.cancel.store(false, .release);
+            self.worker = std.Thread.spawn(.{}, runJob, .{ self, job }) catch {
+                var j = job;
+                j.deinit(self.gpa);
+                return false;
+            };
         }
-        self.cancel.store(false, .release);
-        self.worker = std.Thread.spawn(.{}, runJob, .{ self, job }) catch {
-            var j = job;
-            j.deinit(self.gpa);
-            return false;
-        };
         self.fetch_state.in_flight = true;
         self.fetch_state.last_start_ms = now;
         self.fetch_owed = false;
@@ -558,6 +609,7 @@ pub const Dashboard = struct {
                     self.failure = null;
                     if (self.entry) |*e| e.deinit();
                     self.entry = owned;
+                    self.adoptRenewedBearerLocked(job);
                 } else {
                     // The sign-in changed mid-fetch: the answer is cached
                     // for its own identity but not shown.
@@ -578,6 +630,18 @@ pub const Dashboard = struct {
         }
         self.bump();
     }
+
+    /// Later fetches send the token a refused fetch renewed to, unless the
+    /// session took a fresher one from fx while the fetch ran.
+    fn adoptRenewedBearerLocked(self: *Dashboard, job: *const Job) void {
+        const rejected = job.rejected orelse return;
+        const s = if (self.session) |*session| session else return;
+        if (!std.mem.eql(u8, s.bearer, rejected)) return;
+        const bearer = self.gpa.dupe(u8, job.bearer) catch return;
+        std.crypto.secureZero(u8, s.bearer);
+        self.gpa.free(s.bearer);
+        s.bearer = bearer;
+    }
 };
 
 const Outcome = union(enum) {
@@ -594,6 +658,8 @@ const Job = struct {
     account_id: ?[]u8,
     plan: policy.Plan,
     started_ms: i64,
+    /// The token the provider refused, once `bearer` holds its renewal.
+    rejected: ?[]u8 = null,
 
     fn init(gpa: Allocator, s: Session, plan: policy.Plan, now: i64) !Job {
         const bearer = try gpa.dupe(u8, s.bearer);
@@ -614,15 +680,41 @@ const Job = struct {
     fn deinit(self: *Job, gpa: Allocator) void {
         std.crypto.secureZero(u8, self.bearer);
         gpa.free(self.bearer);
+        if (self.rejected) |r| {
+            std.crypto.secureZero(u8, r);
+            gpa.free(r);
+        }
         if (self.team) |t| gpa.free(t);
         if (self.account_id) |a| gpa.free(a);
+    }
+
+    /// Swaps in a newer token for the refused one: once, when the host has
+    /// one. Returns whether the fetch can run again.
+    fn renew(self: *Job, dashboard: *Dashboard) bool {
+        if (self.rejected != null) return false;
+        const renew_fn = dashboard.host.renew_fn orelse return false;
+        if (dashboard.cancel.load(.acquire)) return false;
+        const fresh = renew_fn(dashboard.host.ctx, dashboard.gpa, .{
+            .scope = self.scope,
+            .rejected = self.bearer,
+            .team = self.team,
+            .account_id = self.account_id,
+        }) orelse return false;
+        self.rejected = self.bearer;
+        self.bearer = fresh;
+        return true;
     }
 };
 
 fn runJob(dashboard: *Dashboard, job_value: Job) void {
     var job = job_value;
     defer job.deinit(dashboard.gpa);
-    const outcome = fetchAll(dashboard, &job);
+    var outcome = fetchAll(dashboard, &job);
+    // Another fx process may have renewed the sign-in since fx read it, and
+    // the provider then refuses the old token: one more fetch with the new one.
+    if (outcome == .failed and outcome.failed == .refused and job.renew(dashboard)) {
+        outcome = fetchAll(dashboard, &job);
+    }
     dashboard.finishJob(&job, outcome);
 }
 
@@ -888,6 +980,17 @@ const FakeGateway = struct {
     count: usize = 0,
     /// While set, every request waits, so a test can keep a fetch in flight.
     held: std.atomic.Value(bool) = .init(false),
+    /// When set, every request first redraws and ticks this dashboard, as the
+    /// WebAssembly terminal's pulse does while a request waits.
+    reenter: ?*Dashboard = null,
+    reentries: usize = 0,
+    /// A token the provider refuses with 401, as after another fx process
+    /// renewed the sign-in.
+    refused_bearer: ?[]const u8 = null,
+    refusals: usize = 0,
+    /// What `renew_fn` offers for the refused token; null offers nothing.
+    renewed_bearer: ?[]const u8 = null,
+    renewals: usize = 0,
 
     const today_body = "{\"results\":[{\"model\":\"anthropic/claude-opus-5.5\",\"request_count\":10,\"input_tokens\":5,\"total_cost\":2.5}]}";
     const window_body = "{\"results\":[{\"model\":\"anthropic/claude-opus-5.5\",\"request_count\":90,\"total_cost\":40},{\"model\":\"openai/gpt-5.6-luna\",\"request_count\":7,\"total_cost\":0.5}]}";
@@ -908,7 +1011,16 @@ const FakeGateway = struct {
     const grok_settings_body = "{\"subscription_tier_display\":\"SuperGrok\",\"on_demand_enabled\":true}";
 
     fn host(self: *FakeGateway, home: []const u8) Host {
-        return .{ .ctx = self, .fetch_fn = fetch, .now_fn = now, .io_fn = testIo, .home = home };
+        return .{ .ctx = self, .fetch_fn = fetch, .now_fn = now, .io_fn = testIo, .home = home, .renew_fn = renew };
+    }
+
+    fn renew(ctx: ?*anyopaque, alloc: Allocator, renewal: Renewal) ?[]u8 {
+        const self: *FakeGateway = @ptrCast(@alignCast(ctx.?));
+        self.renewals += 1;
+        const refused = self.refused_bearer orelse return null;
+        std.debug.assert(std.mem.eql(u8, renewal.rejected, refused));
+        const renewed = self.renewed_bearer orelse return null;
+        return alloc.dupe(u8, renewed) catch null;
     }
 
     fn now(ctx: ?*anyopaque) i64 {
@@ -922,6 +1034,12 @@ const FakeGateway = struct {
 
     fn fetch(ctx: ?*anyopaque, alloc: Allocator, request: Request, _: *std.atomic.Value(bool)) FetchError!Response {
         const self: *FakeGateway = @ptrCast(@alignCast(ctx.?));
+        if (self.reenter) |dashboard| {
+            var redraw = try dashboard.snapshot(alloc);
+            redraw.deinit();
+            dashboard.tick();
+            self.reentries += 1;
+        }
         while (self.held.load(.acquire)) std.atomic.spinLoopHint();
         self.mutex.lockUncancelable(testing.io);
         defer self.mutex.unlock(testing.io);
@@ -931,6 +1049,10 @@ const FakeGateway = struct {
         self.path_lens[i] = request.path.len;
         self.teams[i] = request.team != null;
         self.accounts[i] = request.account_id != null;
+        if (self.refused_bearer) |refused| if (std.mem.eql(u8, request.bearer, refused)) {
+            self.refusals += 1;
+            return .{ .status = 401, .body = try alloc.dupe(u8, "{}") };
+        };
         if (std.mem.eql(u8, request.path, codex.profile_path))
             return .{ .status = self.profile_status, .body = try alloc.dupe(u8, profile_body) };
         if (std.mem.startsWith(u8, request.path, codex.breakdown_path))
@@ -1003,6 +1125,59 @@ test "opening shows the cache at once and fills it from AI Gateway in the backgr
     other.waitForFetch();
     // It already has today's finished days: only today and the budget.
     try testing.expectEqual(@as(usize, 2), other_gateway.count);
+}
+
+test "without a worker thread, tick runs the fetch open started, outside the lock" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    dashboard.inline_fetches = true;
+    defer dashboard.deinit();
+    gateway.reenter = &dashboard;
+
+    dashboard.open(api_key);
+    // Opening only queues the fetch.
+    try testing.expectEqual(@as(usize, 0), gateway.count);
+    {
+        var queued = try dashboard.snapshot(testing.allocator);
+        defer queued.deinit();
+        try testing.expect(queued.status == .fetching);
+    }
+
+    dashboard.tick();
+    // Today and the finished week and month, each redrawing and ticking the
+    // dashboard while it waited, without starting another fetch.
+    try testing.expectEqual(@as(usize, 3), gateway.count);
+    try testing.expectEqual(@as(usize, 3), gateway.reentries);
+    var snap = try dashboard.snapshot(testing.allocator);
+    defer snap.deinit();
+    try testing.expect(snap.status == .ready);
+    try testing.expectApproxEqAbs(@as(f64, 2.5), snap.of(.today).totals.total_cost, 1e-9);
+
+    // `r` queues the next fetch, and `fx usage` runs one by waiting for it.
+    try testing.expect(dashboard.refresh());
+    try testing.expectEqual(@as(usize, 3), gateway.count);
+    dashboard.waitForFetch();
+    try testing.expectEqual(@as(usize, 4), gateway.count);
+}
+
+test "a fetch queued without a worker thread is freed if it never runs" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    dashboard.inline_fetches = true;
+
+    dashboard.open(member);
+    dashboard.deinit();
+    try testing.expectEqual(@as(usize, 0), gateway.count);
+    // A second deinit finds nothing left to free.
+    dashboard.deinit();
 }
 
 test "a dashboard reads what another fx process stored since" {
@@ -1295,6 +1470,52 @@ test "a refused refresh keeps the cached numbers and says why" {
     defer today.deinit();
     try testing.expectEqual(Status{ .failed = .refused }, today.status);
     try testing.expectApproxEqAbs(@as(f64, 2.5), today.of(.today).totals.total_cost, 1e-9);
+}
+
+test "a sign-in another fx renewed is refused once, then fetched with the new token from then on" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{ .refused_bearer = member.bearer, .renewed_bearer = "vca_renewed" };
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+
+    dashboard.open(member);
+    dashboard.waitForFetch();
+    var first = try dashboard.snapshot(testing.allocator);
+    defer first.deinit();
+    try testing.expect(first.status == .ready);
+    try testing.expectApproxEqAbs(@as(f64, 2.5), first.of(.today).totals.total_cost, 1e-9);
+    // One refused request, then the whole fetch again with the new token.
+    try testing.expectEqual(@as(usize, 1), gateway.refusals);
+    try testing.expectEqual(@as(usize, 1), gateway.renewals);
+    try testing.expectEqual(@as(usize, 5), gateway.count);
+
+    // Later fetches send the new token at once.
+    gateway.now_ms += policy.floor_ms;
+    try testing.expect(dashboard.refresh());
+    dashboard.waitForFetch();
+    try testing.expectEqual(@as(usize, 1), gateway.refusals);
+    try testing.expectEqual(@as(usize, 1), gateway.renewals);
+}
+
+test "a refused sign-in with no newer token stays refused after one request" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{ .refused_bearer = member.bearer };
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+
+    dashboard.open(member);
+    dashboard.waitForFetch();
+    var snap = try dashboard.snapshot(testing.allocator);
+    defer snap.deinit();
+    try testing.expectEqual(Status{ .failed = .refused }, snap.status);
+    try testing.expectEqual(@as(usize, 1), gateway.count);
+    try testing.expectEqual(@as(usize, 1), gateway.renewals);
 }
 
 test "another sign-in never shows the previous one's numbers" {

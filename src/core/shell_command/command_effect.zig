@@ -55,12 +55,6 @@ fn isStageSeparator(token: command_lex.ArgvToken) bool {
     return std.mem.eql(u8, token.raw, "&&");
 }
 
-/// Every shell reads a word that starts with an unquoted `#` as the start of
-/// a comment, so the rest of the command never reaches the program.
-fn startsComment(raw: []const u8) bool {
-    return raw.len > 0 and raw[0] == '#';
-}
-
 fn isUnsupportedAutoOperator(token: command_lex.ArgvToken) bool {
     return isUnsupportedAutoControlOperator(token) or
         (!token.quoted and command_lex.redirection_kind(token.value) != null);
@@ -80,15 +74,20 @@ fn isUnsupportedAutoControlOperator(token: command_lex.ArgvToken) bool {
 }
 
 /// `tokens` without a trailing unquoted `2>&1`, the one redirection a
-/// review-free stage may end with.
+/// review-free stage may end with. The shell reads `2` as a file descriptor
+/// only when it is written bare and touches `>&`: `\2>&1` and `2 >&1` pass
+/// `2` to the command and redirect standard output instead.
 fn withoutStderrToStdout(tokens: []const command_lex.ArgvToken) []const command_lex.ArgvToken {
-    if (tokens.len >= 3 and
-        !tokens[tokens.len - 3].quoted and
-        !tokens[tokens.len - 2].quoted and
-        !tokens[tokens.len - 1].quoted and
-        std.mem.eql(u8, tokens[tokens.len - 3].value, "2") and
-        std.mem.eql(u8, tokens[tokens.len - 2].value, ">&") and
-        std.mem.eql(u8, tokens[tokens.len - 1].value, "1"))
+    if (tokens.len < 3) return tokens;
+    const descriptor = tokens[tokens.len - 3];
+    const operator = tokens[tokens.len - 2];
+    const target = tokens[tokens.len - 1];
+    if (std.mem.eql(u8, descriptor.raw, "2") and
+        descriptor.end == operator.start and
+        !operator.quoted and
+        !target.quoted and
+        std.mem.eql(u8, operator.value, ">&") and
+        std.mem.eql(u8, target.value, "1"))
     {
         return tokens[0 .. tokens.len - 3];
     }
@@ -100,8 +99,7 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     if (tokens.len == 0) return false;
     for (tokens) |token| {
         if (isUnsupportedAutoOperator(token) or
-            tokenHasDynamicShellSyntax(token.raw) or
-            startsComment(token.raw))
+            tokenHasDynamicShellSyntax(token.raw))
         {
             return false;
         }
@@ -128,7 +126,8 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
 
 // `^` and `#` are globs in zsh with `extendedglob`, which fx replays from the
 // user's startup files: `^x` matches every file not named `x`, and `x#`
-// matches any run of `x`, so a workspace file could supply the word.
+// matches any run of `x`, so a workspace file could supply the word. A word
+// that starts with an unquoted `#` also starts a comment in every shell.
 fn tokenHasDynamicShellSyntax(raw: []const u8) bool {
     for (raw) |byte| switch (byte) {
         '$', '`', '*', '?', '[', '~', '^', '#', '\n', '\r', ';', '(', ')', '{', '}' => return true,
@@ -359,7 +358,16 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch ^nomatch .",
         "git fetch --prun#e",
         "npm install react@^18",
+        // Quoting does not help: the check reads the word as written.
+        "npm install 'react@^18'",
         "npm test x##",
+        // The shell reads `2` as a file descriptor only when it is bare and
+        // touches `>&`. Each of these passes `2` to git as an argument and
+        // redirects standard output.
+        "git status \\2>&1",
+        "git status\t\\2>&1",
+        "git status 2 >&1",
+        "git status '2'>&1",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,
@@ -2128,7 +2136,7 @@ fn checkShellParity(command: []const u8, mode: ParityMode) !void {
 
 /// Finds the shell, or returns null to skip it. The Linux unit test job and
 /// the nightly Fuzz workflow install every shell and set
-/// `FX_SHELL_PARITY_ALL_SHELLS`, so a missing shell there fails instead of
+/// `FX_TEST_SHELL_PARITY_ALL_SHELLS`, so a missing shell there fails instead of
 /// quietly narrowing the check. Tests read the process environment from
 /// `std.testing.environ`, since fx's own environment is never set up in them.
 fn parityShellPath(shell: ParityShell) !?[]const u8 {
@@ -2136,7 +2144,7 @@ fn parityShellPath(shell: ParityShell) !?[]const u8 {
         std.Io.Dir.accessAbsolute(std.testing.io, path, .{}) catch continue;
         return path;
     }
-    if (try std.testing.environ.contains(std.testing.allocator, "FX_SHELL_PARITY_ALL_SHELLS")) {
+    if (try std.testing.environ.contains(std.testing.allocator, "FX_TEST_SHELL_PARITY_ALL_SHELLS")) {
         // The failure output names the path where the shell was expected.
         std.testing.expectEqualStrings(shell.paths[0], "") catch {};
         return error.TestShellParityShellMissing;

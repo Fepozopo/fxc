@@ -15,7 +15,7 @@ const max_model_id_bytes: usize = 1024;
 pub const max_catalog_bytes: usize = 4 * 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://chatgpt.com/backend-api/codex/models";
-const e2e_models_endpoint_env = "FX_E2E_OPENAI_CODEX_MODELS_URL";
+const e2e_models_endpoint_env = "FX_TEST_OPENAI_CODEX_MODELS_URL";
 
 pub const reviewer_model = "gpt-5.6-luna";
 /// Title generation tracks the smallest catalog-backed fast model
@@ -181,8 +181,6 @@ const FetchOperation = struct {
     account_id: ?[]const u8,
 
     pub fn run(self: *@This()) !FetchResponse {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
-        defer client.deinit();
         var auth_header: ?[]u8 = null;
         defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
         var headers: std.http.Client.Request.Headers = .{
@@ -206,7 +204,7 @@ const FetchOperation = struct {
         extra_len += 1;
         extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
         extra_len += 1;
-        const result = client.fetch(.{
+        const result = gateway_client.fetchOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = headers,
@@ -384,4 +382,29 @@ test "host-managed Codex catalog auth carries no local headers" {
     const auth = catalogRequestAuth(.host_managed) orelse return error.TestExpectedHostManagedCatalogAuth;
     try std.testing.expect(auth.credential == null);
     try std.testing.expect(auth.account_id == null);
+}
+
+test "a Codex catalog fetch stops at once when cancelled during a lookup that hangs" {
+    const stuck_lookup_testing = @import("stuck_lookup_testing.zig");
+    var stuck = stuck_lookup_testing.StuckLookups.install();
+    defer gateway_client.waitForOwnClientOpenJobs() catch {};
+    defer stuck.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    const canceller = try stuck.cancelOnceStuck(&cancel);
+    defer canceller.join();
+    var operation = FetchOperation{
+        .alloc = std.testing.allocator,
+        .url = "https://codex.stuck-lookup.test/backend-api/codex/models",
+        .credential = "codex-key",
+        .account_id = "account-example",
+    };
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(error.Cancelled, gateway_client.runBoundedHttpOperation(
+        FetchResponse,
+        std.testing.allocator,
+        &cancel,
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(fetch_timeout_ms) }),
+        &operation,
+    ));
+    try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
 }

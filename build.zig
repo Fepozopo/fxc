@@ -13,6 +13,7 @@ const PgsoArtifact = enum {
     file_index,
     ui_activity,
     approval_review,
+    unit_tests,
 };
 
 const NapiSurface = enum {
@@ -57,6 +58,7 @@ pub fn build(b: *std.Build) void {
     // Whether this is a libfx artifact, which leaves out what only the fx
     // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
+    build_options.addOption(bool, "builtin_tools", true);
 
     const fuzz_corpora = readFuzzCorpora(b);
     const fuzz_corpus = addFuzzCorpusModule(b, fuzz_corpora);
@@ -112,6 +114,16 @@ pub fn build(b: *std.Build) void {
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     const test_paths_module = test_paths.createModule();
     exe.root_module.addImport("test_paths", test_paths_module);
+    // The unit tests for the Linux PGSO step that relinks them from
+    // transformed code. It builds them position independent: a test there
+    // defines the wasm host's `extern "fx"` functions itself, and Zig rejects
+    // a library extern in a static executable that is not. `install-test`
+    // does not install fx, so the build links only the tests. Run it from the
+    // repository root after `zig build` with the same prefix.
+    const pgso_tests = b.addTest(.{ .root_module = exe.root_module });
+    pgso_tests.pie = true;
+    const install_pgso_tests = b.addInstallArtifact(pgso_tests, .{ .dest_sub_path = "fx-test" });
+    b.step("install-test", "Install the unit test executable without running it").dependOn(&install_pgso_tests.step);
 
     // The session manager's own tests, as fx compiles it (no hooks).
     const session_manager_tests = b.addTest(.{ .root_module = session_manager });
@@ -324,18 +336,22 @@ pub fn build(b: *std.Build) void {
             .file_index => file_index_bench,
             .ui_activity => ui_activity_bench,
             .approval_review => approval_review_bench,
+            .unit_tests => pgso_tests,
         };
         const output_name = switch (artifact) {
             .fx => "pgso/fx.bc",
             .file_index => "pgso/file-index.bc",
             .ui_activity => "pgso/ui-activity.bc",
             .approval_review => "pgso/approval-review.bc",
+            .unit_tests => "pgso/unit-tests.bc",
         };
         const install_ir = b.addInstallFile(
             selected.getEmittedLlvmBc(),
             output_name,
         );
         pgso_ir_step.dependOn(&install_ir.step);
+        // The tests launch the fx installed under this build's prefix.
+        if (artifact == .unit_tests) pgso_ir_step.dependOn(b.getInstallStep());
     } else {
         const missing_artifact = b.addFail(
             "pgso-ir requires -Dpgso-artifact",
@@ -372,6 +388,7 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
+    wasm_options.addOption(bool, "builtin_tools", true);
 
     const wasm_root = switch (surface) {
         .core => "src/wasm_core_main.zig",
@@ -418,6 +435,8 @@ fn addNapiArtifact(
     napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
+    // libfx agents run only the host's tools, so the addon leaves fx's out.
+    napi_options.addOption(bool, "builtin_tools", false);
 
     const root = switch (surface) {
         .core => "src/napi_core_main.zig",
@@ -431,6 +450,17 @@ fn addNapiArtifact(
             .target = target,
             .optimize = .safe,
             .link_libc = true,
+            // Node never unwinds C++ exceptions through the addon, and its Zig
+            // code already bounds-checks in ReleaseSafe, so unwind tables and
+            // stack canaries only add size. Unlike the fx executable, the
+            // addon keeps frame pointers: Apple's arm64 ABI requires them,
+            // crash reports and profilers of the app walk them through the
+            // addon, and on x86-64 they make it about 0.2 MB smaller.
+            .stack_check = false,
+            .stack_protector = false,
+            .omit_frame_pointer = false,
+            .unwind_tables = .none,
+            .error_tracing = false,
             .strip = true,
         }),
     });

@@ -1,28 +1,85 @@
-//! fx's side of the usage module: HTTP through the gateway client, the
-//! clock, and which sign-in `/usage` reads with.
+//! fx's side of the usage module: HTTP through the gateway client, or the
+//! JS host's `fetch` in WebAssembly, the clock, and which sign-in `/usage`
+//! reads with.
 
 const std = @import("std");
 const usage = @import("../../usage/usage.zig");
 const client = @import("../../gateway/client.zig");
+const js_host_stream_provider = @import("../../gateway/js_host_stream_provider.zig");
+const stream_provider = @import("../agent/stream_provider.zig");
+const host_target = @import("../hosts/target.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const oauth_session = @import("../auth/oauth_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
+const stored_login_testing = @import("../auth/stored_login_testing.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
 const vercel_api_origin = "https://api.vercel.com";
 /// Test-only: a file holding the current time in milliseconds, so the E2E
 /// driver can move `/usage`'s clock. Unset in normal use.
-const clock_file_env = "FX_E2E_USAGE_CLOCK_FILE";
+const clock_file_env = "FX_TEST_USAGE_CLOCK_FILE";
 
+/// A host with no home directory, for a dashboard that `host` replaces once
+/// the home is known.
+pub const unset: usage.Host = .{ .fetch_fn = fetch, .now_fn = now, .io_fn = io, .home = "", .renew_fn = renewFromStore };
+
+/// `home` is the user's home directory; the cache follows `$FX_HOME`.
 pub fn host(home: []const u8) usage.Host {
-    return .{ .fetch_fn = fetch, .now_fn = now, .io_fn = io, .home = home };
+    return .{
+        .fetch_fn = fetch,
+        .now_fn = now,
+        .io_fn = io,
+        .home = profile_paths.rootParent(home),
+        .fx_dir_name = profile_paths.rootName(),
+        .renew_fn = renewFromStore,
+    };
+}
+
+/// `host` for the WebAssembly terminal, which runs each fetch inside its event
+/// loop: while a request waits on the JS host, it pulses `app` so the
+/// terminal keeps drawing and reading input. Quitting cancels the request.
+pub fn cooperativeHost(comptime App: type, app: *App, home: []const u8) usage.Host {
+    const Cooperative = struct {
+        fn fetch(ctx: ?*anyopaque, alloc: Allocator, request: usage.Request, cancel: *std.atomic.Value(bool)) usage.FetchError!usage.Response {
+            return send(alloc, request, cancel, .{ .ctx = ctx.?, .run = pulse });
+        }
+
+        fn pulse(ctx: *anyopaque) anyerror!void {
+            const owner: *App = @ptrCast(@alignCast(ctx));
+            try owner.cooperativeTransportPulse(owner.screenAgent());
+            if (owner.should_exit) return error.Cancelled;
+        }
+    };
+    return .{ .ctx = app, .fetch_fn = Cooperative.fetch, .now_fn = now, .io_fn = io, .home = home };
 }
 
 fn io(_: ?*anyopaque) std.Io {
     return io_mod.getIo();
+}
+
+/// A newer token for a sign-in the provider refused, which another fx process
+/// saved since this one read it: the stored fx login for the same team, or
+/// the stored Codex or Grok sign-in for the same account. Never refreshes the
+/// sign-in; an API key has nothing to renew.
+fn renewFromStore(_: ?*anyopaque, alloc: Allocator, renewal: usage.Renewal) ?[]u8 {
+    const sign_in: auth_runtime.SharedSignIn = switch (renewal.scope) {
+        .member => .{ .source = .fx_login, .team = renewal.team },
+        .codex => .{ .source = .chatgpt_subscription, .account_id = renewal.account_id },
+        .grok => .{ .source = .grok_subscription, .account_id = renewal.account_id },
+        .api_key => return null,
+    };
+    var stored = (auth_runtime.storedReplacement(alloc, sign_in, renewal.rejected) catch return null) orelse {
+        debug_trace.logf("usage", "refused sign-in has no newer stored token scope={t}", .{renewal.scope});
+        return null;
+    };
+    defer stored.deinit(alloc);
+    debug_trace.logf("usage", "refused sign-in renewed from the store scope={t}", .{renewal.scope});
+    return alloc.dupe(u8, stored.token) catch null;
 }
 
 /// Room for a credential's display label.
@@ -78,7 +135,7 @@ fn fromParts(
             .bearer = bearer,
             .team = team,
             .subject = account orelse team orelse "",
-            .label = std.mem.print(label_buf, "{s} (fx login)", .{team_slug orelse team orelse "no team"}) catch "fx login",
+            .label = std.mem.print(label_buf, "{s} (fx login)", .{types.displayGatewayTeam(team_slug, team) orelse "no team"}) catch "fx login",
         },
         .stored_key, .ai_gateway_api_key => .{
             .scope = .api_key,
@@ -111,7 +168,7 @@ const chatgpt_origin = "https://chatgpt.com";
 
 /// `https://chatgpt.com`, or a loopback origin set by E2E tests.
 fn chatgptOrigin() []const u8 {
-    const override = io_mod.getenv("FX_E2E_CHATGPT_ORIGIN") orelse return chatgpt_origin;
+    const override = io_mod.getenv("FX_TEST_CHATGPT_ORIGIN") orelse return chatgpt_origin;
     return if (client.isLoopbackHttpUrl(override)) override else chatgpt_origin;
 }
 
@@ -119,7 +176,7 @@ const grok_origin = "https://cli-chat-proxy.grok.com/v1";
 
 /// The Grok CLI proxy, or a loopback origin set by E2E tests.
 fn grokOrigin() []const u8 {
-    const override = io_mod.getenv("FX_E2E_GROK_ORIGIN") orelse return grok_origin;
+    const override = io_mod.getenv("FX_TEST_GROK_ORIGIN") orelse return grok_origin;
     return if (client.isLoopbackHttpUrl(override)) override else grok_origin;
 }
 
@@ -134,6 +191,17 @@ fn fetch(
     request: usage.Request,
     cancel: *std.atomic.Value(bool),
 ) usage.FetchError!usage.Response {
+    return send(alloc, request, cancel, null);
+}
+
+/// One usage GET: through fx's HTTP client natively, and through the JS
+/// host's `fetch` in WebAssembly, pulsing `pulse` while it waits.
+fn send(
+    alloc: Allocator,
+    request: usage.Request,
+    cancel: *std.atomic.Value(bool),
+    pulse: ?stream_provider.CooperativePulse,
+) usage.FetchError!usage.Response {
     const origin = switch (request.service) {
         .gateway => client.gatewayBaseUrl(),
         .vercel_api => vercelApiOrigin(),
@@ -147,7 +215,11 @@ fn fetch(
     } else .none;
     const url = try alloc.print("{s}{s}", .{ origin, request.path });
     defer alloc.free(url);
-    const result = client.fetchUsageGet(alloc, request.bearer, request.team, account, url, cancel) catch |err| switch (err) {
+    const sent = if (comptime host_target.is_wasm)
+        client.fetchUsageGetThroughHost(alloc, js_host_stream_provider.transport, request.bearer, request.team, account, url, cancel, pulse)
+    else
+        client.fetchUsageGet(alloc, request.bearer, request.team, account, url, cancel);
+    const result = sent catch |err| switch (err) {
         error.Cancelled => return error.Cancelled,
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -179,4 +251,35 @@ fn readClockFile(path: []const u8) ?i64 {
     defer file.close(file_io);
     const len = file.readPositionalAll(file_io, &buf, 0) catch return null;
     return std.fmt.parseInt(i64, std.mem.trim(u8, buf[0..len], " \t\r\n"), 10) catch null;
+}
+
+test "a refused /usage sign-in renews only to a newer stored token for the same sign-in" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    // Another fx process renewed the login after this one read it.
+    try home.store("rotated-token", "team-id", stored_login_testing.far_future_ms);
+
+    const renewed = renewFromStore(null, alloc, .{ .scope = .member, .rejected = "launch-token", .team = "team-id", .account_id = null }).?;
+    defer alloc.free(renewed);
+    try std.testing.expectEqualStrings("rotated-token", renewed);
+    // The store still holds the refused token: nothing newer to send.
+    try std.testing.expect(renewFromStore(null, alloc, .{ .scope = .member, .rejected = "rotated-token", .team = "team-id", .account_id = null }) == null);
+    // Another team's login is never sent.
+    try std.testing.expect(renewFromStore(null, alloc, .{ .scope = .member, .rejected = "launch-token", .team = "team-other", .account_id = null }) == null);
+    // An API key has nothing to renew.
+    try std.testing.expect(renewFromStore(null, alloc, .{ .scope = .api_key, .rejected = "vck_key", .team = null, .account_id = null }) == null);
+}
+
+test "the usage label names a login's team only by a valid team name" {
+    var bad_buf: LabelBuffer = undefined;
+    const bad = fromParts(.fx_login, "token", "team_123", "\x1b]2;title\x07", null, &bad_buf).?;
+    try std.testing.expectEqualStrings("team_123 (fx login)", bad.label);
+    var good_buf: LabelBuffer = undefined;
+    const good = fromParts(.fx_login, "token", "team_123", "vercel-labs", null, &good_buf).?;
+    try std.testing.expectEqualStrings("vercel-labs (fx login)", good.label);
+    var neither_buf: LabelBuffer = undefined;
+    const neither = fromParts(.fx_login, "token", "team 123", "\xe2\x80\xaeslug", null, &neither_buf).?;
+    try std.testing.expectEqualStrings("no team (fx login)", neither.label);
 }

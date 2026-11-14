@@ -3,14 +3,15 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
-import { fakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { logLines, onlySessionId } from "./saved-sessions";
+import { fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
 let cleanup: string | null = null;
-let gateway: ReturnType<typeof startFakeGateway> | null = null;
+let gateway: ReturnType<typeof startFakeGateway> | ReturnType<typeof startDynamicFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
 
 afterEach(async () => {
@@ -283,7 +284,7 @@ describe("fx mcp", () => {
     );
     const both = await mcp(root, "remove", "twin");
     expect(both.code).toBe(2);
-    expect(both.stderr).toBe("twin is in both ~/.fx/mcp.json and .mcp.json. Add --profile or --project.\n");
+    expect(both.stderr).toBe("twin is in both ~/.fx/mcp.json and .mcp.json. Add --global or --project.\n");
 
     const project = await mcp(root, "remove", "--project", "twin");
     expect(project.code).toBe(0);
@@ -297,6 +298,17 @@ describe("fx mcp", () => {
     const gone = await mcp(root, "remove", "solo");
     expect(gone.code).toBe(1);
     expect(gone.stderr).toBe("No MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
+
+    // `--global` names ~/.fx/mcp.json; the older `--profile` still works.
+    const global = await mcp(root, "remove", "--global", "twin");
+    expect(global.code).toBe(0);
+    expect(JSON.parse(readFileSync(root.profilePath, "utf8"))).toEqual({ mcpServers: {}, other: 1 });
+    const profile = await mcp(root, "remove", "--profile", "twin");
+    expect(profile.code).toBe(1);
+    // The older --profile still names the profile file, with a warning.
+    expect(profile.stderr).toBe(
+      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.18; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
+    );
   });
 
   test("approve and reject say exactly what they trust", async () => {
@@ -360,14 +372,14 @@ describe("fx mcp", () => {
     expect(overview.stdout).toStartWith("usage: fx mcp COMMAND\n\n  list [--json]               configured servers; never connects\n");
     const verbHelp = await mcp(root, "remove", "-h");
     expect(verbHelp.code).toBe(0);
-    expect(verbHelp.stdout).toBe("usage: fx mcp remove [--project | --profile] NAME\n");
+    expect(verbHelp.stdout).toBe("usage: fx mcp remove [--global | --project] NAME\n");
 
     const unknownVerb = await mcp(root, "nope");
     expect(unknownVerb.code).toBe(2);
-    expect(unknownVerb.stderr).toStartWith("'nope' isn't a fx mcp command.\nusage: fx mcp COMMAND\n");
+    expect(unknownVerb.stderr).toStartWith("'nope' isn't an fx mcp command.\nusage: fx mcp COMMAND\n");
     const badFlag = await mcp(root, "logout", "--json", "x");
     expect(badFlag.code).toBe(2);
-    expect(badFlag.stderr).toBe("fx mcp logout has no --json flag.\nusage: fx mcp logout NAME\n");
+    expect(badFlag.stderr).toBe("fx mcp logout: unknown flag --json\nusage: fx mcp logout NAME\n");
 
     for (const [args, message] of [
       [["auth", "x"], "fx mcp auth is now fx mcp login NAME.\n"],
@@ -442,19 +454,41 @@ describe("/mcp in the shell", () => {
     await tui.sendText("/mcp nope");
     await tui.waitForText("'nope' isn't a /mcp command.", 10_000);
     await tui.sendText("/mcp list --json");
-    await tui.waitForText("/mcp list has no --json flag.", 10_000);
+    await tui.waitForText("/mcp list: unknown flag --json", 10_000);
     await tui.sendText("/mcp auth web");
     await tui.waitForText("/mcp auth is now /mcp login NAME.", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toEqual({ type: "http", url: "https://w.example/mcp" });
   }, 90_000);
 
-  test.skipIf(!tmuxAvailable())("a config change never freezes the shell, and a server runs one copy at a time", async () => {
+  test.skipIf(!tmuxAvailable())("/mcp add joins a backslash-newline in its arguments the way the shell does", async () => {
+    // Every shell reads `"a\<newline>b"` as `ab`, so that is the argument
+    // the saved server gets.
+    const root = createRoot();
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.pasteText('/mcp add probe -- /bin/echo "a\\\nb"');
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Added probe to ~/.fx/mcp.json.", 10_000);
+    expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.probe).toEqual({ command: "/bin/echo", args: ["ab"] });
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a config change restarts only the server it changed, never freezes the shell, and a server runs one copy at a time", async () => {
     // `s` keeps running after its input closes and ignores SIGTERM, so fx
     // takes about 3 s to stop it: 1.5 s for it to exit, 1.5 s after SIGTERM.
     const root = createRoot();
     const pidPath = join(root.home, "s.pid");
     const eofPath = join(root.home, "s.eof");
-    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_IGNORE_EOF: "1", FX_MCP_IGNORE_TERM: "1", FX_MCP_PID_PATH: pidPath, FX_MCP_EOF_PATH: eofPath } }) } }));
+    const projPid = join(root.home, "proj.pid");
+    const env = { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_IGNORE_EOF: "1", FX_MCP_IGNORE_TERM: "1", FX_MCP_PID_PATH: pidPath, FX_MCP_EOF_PATH: eofPath };
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env }) } }));
+    writeFileSync(root.projectPath, JSON.stringify({ mcpServers: { proj: fixtureServer({ env: { FX_MCP_PID_PATH: projPid } }) } }));
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true,
@@ -466,34 +500,53 @@ describe("/mcp in the shell", () => {
     // `s` outlives fx's SIGTERM at quit, so every copy is killed here.
     const pids = new Set<number>();
     const killServers = () => {
-      if (existsSync(pidPath)) pids.add(Number(readFileSync(pidPath, "utf8")));
+      for (const path of [pidPath, projPid]) if (existsSync(path)) pids.add(Number(readFileSync(path, "utf8")));
       for (const pid of pids) if (isRunning(pid)) process.kill(pid, "SIGKILL");
     };
+    const pidIn = (path: string) => (existsSync(path) ? Number(readFileSync(path, "utf8").trim() || "0") : 0);
     try {
       await tui.waitForComposer(15_000);
       // `s` starts on its own once the first frame is up and writes its pid.
-      // Nothing is wrong, so the status line says nothing about MCP.
       const upBy = Date.now() + 10_000;
-      while (!(existsSync(pidPath) && readFileSync(pidPath, "utf8").trim() !== "") && Date.now() < upBy) await Bun.sleep(5);
-      const oldPid = Number(readFileSync(pidPath, "utf8"));
+      while (pidIn(pidPath) === 0 && Date.now() < upBy) await Bun.sleep(5);
+      const oldPid = pidIn(pidPath);
       pids.add(oldPid);
 
+      // Adding a server, approving one, and removing one leave `s` as it was.
       await tui.sendText("/mcp add web https://w.example/mcp");
+      await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+      await tui.sendText("/mcp approve proj");
+      await tui.waitForText("Approved proj", 10_000);
+      const projBy = Date.now() + 10_000;
+      while (pidIn(projPid) === 0 && Date.now() < projBy) await Bun.sleep(5);
+      expect(pidIn(projPid)).not.toBe(0);
+      await tui.sendText("/mcp remove web");
+      await tui.waitForText("Removed web from ~/.fx/mcp.json.", 10_000);
+      expect(pidIn(pidPath)).toBe(oldPid);
+      expect(existsSync(eofPath)).toBe(false);
+      expect(isRunning(oldPid)).toBe(true);
+
+      // Removed, `s` stops; added back at once, the new copy waits for it.
+      await tui.sendText("/mcp remove s");
+      await tui.waitForText("Removed s from ~/.fx/mcp.json.", 10_000);
       const eofBy = Date.now() + 10_000;
       // The fixture creates the file, then writes its pid.
       while (!(existsSync(eofPath) && readFileSync(eofPath, "utf8").trim() !== "") && Date.now() < eofBy) await Bun.sleep(5);
       expect(readFileSync(eofPath, "utf8").trim()).toBe(String(oldPid));
-      // The old host is stopping `s` now. Typing still shows at once.
+      const flags = Object.entries(env).map(([k, v]) => `--env ${k}=${v}`).join(" ");
+      await tui.sendText(`/mcp add ${flags} s -- ${process.execPath} ${MODERN_FIXTURE}`);
+      await tui.waitForText("Added s to ~/.fx/mcp.json.", 10_000);
+      // The old copy is still stopping. Typing still shows at once.
       const typedAt = Date.now();
       await tui.sendLiteral("zq");
       await tui.waitForText("zq", 5_000);
       expect(Date.now() - typedAt).toBeLessThan(1_000);
       expect(isRunning(oldPid)).toBe(true);
 
-      // The new host starts `s` only once the old copy is gone.
+      // The new copy starts only once the old one is gone.
       const startBy = Date.now() + 15_000;
-      while (Number(readFileSync(pidPath, "utf8")) === oldPid && Date.now() < startBy) await Bun.sleep(5);
-      expect(Number(readFileSync(pidPath, "utf8"))).not.toBe(oldPid);
+      while (pidIn(pidPath) === oldPid && Date.now() < startBy) await Bun.sleep(5);
+      expect(pidIn(pidPath)).not.toBe(oldPid);
       expect(isRunning(oldPid)).toBe(false);
       await tui.sendKeys("C-u");
       await tui.sendText("/mcp list");
@@ -506,8 +559,8 @@ describe("/mcp in the shell", () => {
     }
   }, 90_000);
 
-  test.skipIf(!tmuxAvailable())("a config change while a server is in use lets it finish, and the server never runs twice", async () => {
-    // `s` takes 3 s to start, so `/mcp show s` holds the old host while the config changes.
+  test.skipIf(!tmuxAvailable())("a config change while a server is in use leaves it running, and the call finishes on the same process", async () => {
+    // `s` takes 3 s to start, so `/mcp show s` is waiting on it while the config changes.
     const root = createRoot();
     const pidPath = join(root.home, "s.pid");
     writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_DISCOVER_DELAY_MS: "3000", FX_MCP_PID_PATH: pidPath } }) } }));
@@ -533,21 +586,216 @@ describe("/mcp in the shell", () => {
       await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
       expect(await tui.capturePane()).not.toContain("Echo text through the modern MCP fixture");
 
-      // The moment a new copy starts, the old one must be gone.
-      const nextBy = Date.now() + 15_000;
-      while (Number(readFileSync(pidPath, "utf8")) === oldPid && Date.now() < nextBy) await Bun.sleep(5);
-      const oldAliveAtSwitch = isRunning(oldPid);
-      pids.add(Number(readFileSync(pidPath, "utf8")));
-      expect(pids.size).toBe(2);
-      expect(oldAliveAtSwitch).toBe(false);
-      // And the show finished on the old host.
+      // The show answers from the copy it was waiting on, which keeps running.
       await tui.waitForText("Echo text through the modern MCP fixture", 10_000);
+      pids.add(Number(readFileSync(pidPath, "utf8")));
+      expect([...pids]).toEqual([oldPid]);
+      expect(isRunning(oldPid)).toBe(true);
     } finally {
       await tui?.kill();
       tui = null;
       for (const pid of pids) if (isRunning(pid)) process.kill(pid, "SIGKILL");
     }
   }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a server added or removed by fx mcp outside the session reaches the next prompt and /mcp", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer() } });
+    gateway = startFakeGateway([fakeGatewayFinalText("first done"), fakeGatewayFinalText("second done")], {
+      models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }],
+    });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    // Every string in a request, decoded, so the menu and notes read as the model reads them.
+    const strings = (value: unknown): string[] =>
+      typeof value === "string" ? [value]
+        : Array.isArray(value) ? value.flatMap(strings)
+        : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings)
+        : [];
+    const text = (body: string) => strings(JSON.parse(body)).join("\n");
+    const menu = (body: string) => {
+      const all = text(body);
+      return all.slice(all.indexOf("<toolbox>"), all.indexOf("</toolbox>"));
+    };
+    // The toolbox's change note, as its MCP servers line.
+    const notedServers = (body: string) => /The toolbox now holds[\s\S]*?MCP servers: (.*)\n/.exec(text(body))?.[1] ?? "";
+
+    // Another fx process writes the profile, as an agent's shell tool would.
+    expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
+    // The next prompt loads it first, so its own request tells the model.
+    await tui.sendText("first prompt");
+    await tui.waitForText("first done", 15_000);
+    expect(gateway.requests).toHaveLength(1);
+    const firstMenu = menu(gateway.requests[0]!.body);
+    expect(firstMenu).toContain("- fixture");
+    expect(firstMenu).toContain("- outside");
+    // The session runs it, so `/mcp list` reports it.
+    await tui.sendText("/mcp list");
+    await tui.waitForText(/outside +~\/\.fx\/mcp\.json +stdio/, 10_000);
+
+    // Removed the same way, it's gone by the next prompt. The menu stays as
+    // first sent, so nothing earlier requests sent changes, and a note names
+    // the servers toolbox holds now.
+    expect((await mcp(root, "remove", "outside")).code).toBe(0);
+    await tui.sendText("second prompt");
+    await tui.waitForText("second done", 15_000);
+    expect(gateway.requests).toHaveLength(2);
+    expect(menu(gateway.requests[1]!.body)).toBe(firstMenu);
+    expect(notedServers(gateway.requests[1]!.body)).toBe("fixture");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a change noted in a turn that compaction folds away is noted again, and the menu stays as first sent", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer(), outside: fixtureServer() } });
+    let answered = 0;
+    const dynamic = startDynamicFakeGateway((raw: string) => {
+      const request = JSON.parse(raw);
+      if (request.tools?.length === 0 && request.toolChoice?.type === "none") return fakeGatewayFinalText("Turn 1\nIn between: none");
+      answered += 1;
+      return fakeGatewayFinalText(`done ${answered}`);
+    }, { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    gateway = dynamic;
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: dynamic.baseUrl, FX_GATEWAY_CHAT_URL: dynamic.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const strings = (value: unknown): string[] =>
+      typeof value === "string" ? [value]
+        : Array.isArray(value) ? value.flatMap(strings)
+        : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings)
+        : [];
+    const text = (body: string) => strings(JSON.parse(body)).join("\n");
+    const menu = (body: string) => {
+      const all = text(body);
+      return all.slice(all.indexOf("<toolbox>"), all.indexOf("</toolbox>"));
+    };
+    const notedServers = (body: string) => [...text(body).matchAll(/The toolbox now holds[\s\S]*?MCP servers: (.*)\n/g)].map((match) => match[1]);
+    const agentBodies = () => dynamic.requests.map((request) => request.body)
+      .filter((body) => { const request = JSON.parse(body); return !(request.tools?.length === 0 && request.toolChoice?.type === "none"); });
+    // Each turn ends with its status line; the next prompt waits for it, so
+    // no keystroke lands while the turn is still finishing.
+    const prompt = async (words: string) => {
+      const turn = answered + 1;
+      await tui!.sendText(words);
+      const ended = new RegExp(`done ${turn}\\n\\s*\\d+s \\(↑`);
+      await tui!.waitForPane((pane) => ended.test(pane), 15_000);
+      await tui!.waitForComposer(15_000);
+    };
+    const compactions = () => logLines(root.home, onlySessionId(root.home)).filter((line) => line.kind === "compacted").length;
+
+    await prompt("first prompt");
+    const firstMenu = menu(agentBodies()[0]!);
+    expect(firstMenu).toContain("- fixture");
+    expect(firstMenu).toContain("- outside");
+    // The note telling the model that outside is gone goes in this turn.
+    expect((await mcp(root, "remove", "outside")).code).toBe(0);
+    await prompt("NOTED_TURN_PROMPT");
+    expect(notedServers(agentBodies()[1]!)).toEqual(["fixture"]);
+    // Four more turns, so the noted turn is older than the turns compaction keeps.
+    for (const n of [3, 4, 5, 6]) await prompt(`prompt ${n}`);
+
+    await tui.sendText("/compact");
+    for (let i = 0; i < 600 && compactions() === 0; i++) await Bun.sleep(25);
+    expect(compactions()).toBe(1);
+    await tui.waitForComposer(15_000);
+    await prompt("after compaction");
+    const after = agentBodies().at(-1)!;
+    // The noted turn was folded into the summary, and its note with it; the
+    // newer turns follow as sent.
+    const users = JSON.parse(after).prompt.filter((message: any) => message.role === "user")
+      .map((message: any) => typeof message.content === "string" ? message.content : message.content.map((part: any) => part.text ?? "").join(""));
+    expect(users[0]).toStartWith("<compacted_conversation>");
+    expect(users[0]).toContain("NOTED_TURN_PROMPT");
+    expect(users.slice(1, -1)).toEqual(["prompt 3", "prompt 4", "prompt 5", "prompt 6"]);
+    // The note rides the new prompt, after everything earlier requests sent.
+    expect(users.at(-1)).toStartWith("after compaction\n");
+    // The conversation keeps its menu, so fx tells the model again what the
+    // toolbox holds now.
+    expect(menu(after)).toBe(firstMenu);
+    expect(notedServers(after)).toEqual(["fixture"]);
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("a prompt sent while a turn runs keeps the current servers, and the next prompt after the turn loads the change", async () => {
+    // Only SIGTERM ends it: it never reads stdin, and never answers.
+    const root = createRoot({
+      mcpServers: { slow: { command: "/bin/sh", args: ["-c", "echo $$ > slow.pid; trap 'exit 0' TERM; while :; do sleep 0.05; done"] } },
+    });
+    const held = heldFakeGatewayFinalText();
+    gateway = startFakeGateway([held.response, fakeGatewayFinalText("second done"), fakeGatewayFinalText("third done")], {
+      models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }],
+    });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const pidPath = join(root.workspace, "slow.pid");
+    for (let i = 0; i < 200 && !existsSync(pidPath); i++) await Bun.sleep(25);
+    const pid = Number(readFileSync(pidPath, "utf8").trim());
+    try {
+      expect(isRunning(pid)).toBe(true);
+      await tui.sendText("first prompt");
+      for (let i = 0; i < 600 && gateway.requests.length === 0; i++) await Bun.sleep(25);
+      expect(gateway.requests).toHaveLength(1);
+      // While the turn runs, another fx removes the server and a prompt is sent.
+      expect((await mcp(root, "remove", "slow")).code).toBe(0);
+      await tui.sendText("second prompt");
+      await tui.waitForText("second prompt", 10_000);
+      // A removed server stops within about 1.5 s; this one keeps running.
+      for (let i = 0; i < 50; i++) {
+        expect(isRunning(pid)).toBe(true);
+        await Bun.sleep(50);
+      }
+      held.release("first done");
+      await tui.waitForText("second done", 15_000);
+      // The next prompt, sent with no turn running, loads the change.
+      await tui.sendText("third prompt");
+      await tui.waitForText("third done", 15_000);
+      for (let i = 0; i < 200 && isRunning(pid); i++) await Bun.sleep(25);
+      expect(isRunning(pid)).toBe(false);
+    } finally {
+      held.dispose();
+      if (isRunning(pid)) process.kill(pid, "SIGKILL");
+    }
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a project .mcp.json that is a FIFO or a link to /dev/tty can't stop the shell starting or checking the config", async () => {
+    for (const kind of ["fifo", "tty"] as const) {
+      const root = createRoot();
+      if (kind === "fifo") expect(Bun.spawnSync(["mkfifo", root.projectPath]).exitCode).toBe(0);
+      else symlinkSync("/dev/tty", root.projectPath);
+      gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 30,
+        env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      });
+      await tui.waitForComposer(15_000);
+      // `/mcp list` checks the config files again before it answers.
+      await tui.sendText("/mcp list");
+      await tui.waitForText("No MCP servers configured", 10_000);
+      expect(await tui.captureFullScrollback()).toContain(".mcp.json server 'unknown' was skipped: fx can't read it.");
+      await tui.kill();
+      tui = null;
+      gateway.stop();
+      gateway = null;
+      rmSync(cleanup!, { recursive: true, force: true });
+      cleanup = null;
+    }
+  }, 60_000);
 
   test.skipIf(!tmuxAvailable())("the status line, not the transcript, names waiting project servers and config problems", async () => {
     const root = createRoot(
@@ -715,6 +963,25 @@ describe("/mcp in the shell", () => {
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeUndefined();
     expect(await tui.captureFullScrollback()).not.toContain("Removed web");
   }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp names HOME and writes nothing when HOME is not absolute", async () => {
+    // fx treats a relative HOME as unset, and the shell's /mcp must not build
+    // `.fx/mcp.json` against the workspace instead.
+    const root = createRoot();
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, HOME: "relative/home", FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp add web https://w.example/mcp");
+    await tui.waitForText("/mcp: HOME is not set to an absolute path", 10_000);
+    expect(existsSync(join(root.workspace, ".fx"))).toBe(false);
+    expect(existsSync(join(root.workspace, "relative"))).toBe(false);
+  }, 60_000);
 });
 
 describe("fx ask", () => {

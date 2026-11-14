@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const testing_listener = @import("../shared/testing_listener.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -12,7 +13,10 @@ const js_host_auth = @import("js_host_auth.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const pending_revocation = @import("pending_revocation.zig");
 const secret = @import("secret.zig");
+const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -20,6 +24,9 @@ else
 
 const Allocator = std.mem.Allocator;
 const teams_endpoint = "https://api.vercel.com/v2/teams";
+/// A team list returns full team objects, so it can far exceed the OAuth
+/// transport's default response limit.
+const teams_response_max_bytes: usize = 4 * 1024 * 1024;
 const poll_wait_slice_ms: u64 = 100;
 pub const poll_request_timeout_ms: i64 = 15_000;
 const max_poll_interval_ms = std.math.maxInt(u64) / std.time.ns_per_ms;
@@ -37,11 +44,16 @@ pub const LoginError = error{
 const LogoutError = error{SessionDeleteFailed};
 
 pub const remote_revocation_warning = "Warning: signed out locally, but the remote session could not be revoked.";
+/// `remote_revocation_warning`, when the session's tokens are kept and fx
+/// revokes them later (`pending_revocation`).
+pub const remote_revocation_retry_warning = remote_revocation_warning ++ " " ++ pending_revocation.retry_later ++ ".";
 
 pub const LogoutResult = struct {
     session_deleted: bool = false,
     local_durability_failed: bool = false,
     remote_revocation_failed: bool = false,
+    /// The unconfirmed revocation's tokens are kept, and fx revokes them later.
+    retry_kept: bool = false,
 };
 
 pub const Team = struct {
@@ -191,6 +203,8 @@ pub const SignInState = enum {
 
 pub const SignInSnapshot = struct {
     state: SignInState = .idle,
+    /// The flow is polling but its device code is still being requested.
+    preparing: bool = false,
     verification_uri: []const u8 = "",
     verification_uri_complete: ?[]const u8 = null,
     user_code: []const u8 = "",
@@ -294,6 +308,7 @@ pub fn prepareBrowserLogin(
 pub const CompleteSignInFn = *const fn (
     ?*anyopaque,
     Allocator,
+    oauth_transport.Provider,
     []const u8,
     []const u8,
     *oauth.TokenSet,
@@ -326,16 +341,34 @@ pub const SignInRuntime = struct {
     failure: ?anyerror = null,
     poll_state: ?LoginPollState = null,
     deps: SignInRuntimeDeps = .{},
+    /// Set once when a device code requested on the worker becomes ready, so
+    /// the input loop can open the browser for it.
+    browser_pending: bool = false,
 
+    /// Starts an fx login sign-in. On native hosts the issuer discovery and
+    /// device-code request run on the sign-in worker, so the input loop never
+    /// waits on them; `snapshot().preparing` holds until the code arrives.
     pub fn start(
         self: *Self,
         alloc: Allocator,
         transport: oauth_transport.Provider,
     ) !bool {
-        const prepared = try prepareLogin(alloc, transport);
-        return self.startPrepared(alloc, prepared, .{
-            .oauth_transport = transport,
-        });
+        if (comptime host_target.is_wasm) {
+            const prepared = try prepareLogin(alloc, transport);
+            return self.startPrepared(alloc, prepared, .{
+                .oauth_transport = transport,
+            });
+        }
+        return self.startPreparedWithMode(alloc, null, .{ .oauth_transport = transport }, false);
+    }
+
+    /// Returns true once after the worker publishes a device code.
+    pub fn takeBrowserPending(self: *Self) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const pending = self.browser_pending;
+        self.browser_pending = false;
+        return pending;
     }
 
     pub fn startPrepared(
@@ -356,33 +389,34 @@ pub const SignInRuntime = struct {
         return self.startPreparedWithMode(alloc, prepared, deps, true);
     }
 
+    /// Without `prepared`, the worker requests the device code before it
+    /// polls; cooperative hosts have no worker and must pass one.
     fn startPreparedWithMode(
         self: *Self,
         alloc: Allocator,
-        prepared: PreparedLogin,
+        prepared: ?PreparedLogin,
         deps: SignInRuntimeDeps,
         comptime cooperative: bool,
     ) !bool {
-        const poll_state = if (cooperative)
-            LoginPollState.init(deps.poll, prepared.device) catch |err| {
-                var rejected = prepared;
-                rejected.deinit(alloc);
+        const poll_state = if (cooperative) poll: {
+            const device = if (prepared) |value| value.device else return error.LoginFlowMissing;
+            break :poll LoginPollState.init(deps.poll, device) catch |err| {
+                releasePrepared(alloc, prepared);
                 if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
                 return err;
-            }
-        else
-            null;
+            };
+        } else null;
         self.mutex.lockUncancelable(io_mod.getIo());
         if (self.thread != null or self.state == .polling or self.completion != null) {
             self.mutex.unlock(io_mod.getIo());
-            var rejected = prepared;
-            rejected.deinit(alloc);
+            releasePrepared(alloc, prepared);
             if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
             return false;
         }
         self.state = .polling;
         self.failure = null;
         self.flow = prepared;
+        self.browser_pending = false;
         self.poll_state = poll_state;
         self.deps = deps;
         self.deps.poll.cancel_flag = &self.cancel_requested;
@@ -428,7 +462,10 @@ pub const SignInRuntime = struct {
         const mutable = @constCast(self);
         mutable.mutex.lockUncancelable(io_mod.getIo());
         defer mutable.mutex.unlock(io_mod.getIo());
-        const flow = self.flow orelse return .{ .state = self.state };
+        const flow = self.flow orelse return .{
+            .state = self.state,
+            .preparing = self.state == .polling,
+        };
         return .{
             .state = self.state,
             .verification_uri = flow.device.verification_uri,
@@ -491,8 +528,31 @@ pub const SignInRuntime = struct {
         };
     }
 
+    /// Requests the device code for a flow started without one, through a
+    /// transport `cancel` can stop. Returns whether the flow can poll.
+    fn prepareFlow(self: *Self, alloc: Allocator) bool {
+        var transport: oauth_transport.Cancellable = .{ .inner = self.deps.oauth_transport, .cancel_flag = &self.cancel_requested };
+        const prepared = prepareLogin(alloc, transport.provider()) catch |err| {
+            self.publishFailure(err);
+            return false;
+        };
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.state != .polling or self.cancel_requested.load(.seq_cst)) {
+            self.mutex.unlock(io_mod.getIo());
+            debug_trace.logf("auth", "sign-in dropped prepared device code reason=cancelled", .{});
+            var discarded = prepared;
+            discarded.deinit(alloc);
+            return false;
+        }
+        self.flow = prepared;
+        self.browser_pending = true;
+        self.mutex.unlock(io_mod.getIo());
+        return true;
+    }
+
     fn workerMain(self: *Self, alloc: Allocator) void {
         defer self.finishAttempt(alloc);
+        if (self.flow == null and !self.prepareFlow(alloc)) return;
         const flow = if (self.flow) |*prepared| prepared else return;
         var prompt = BrowserOpenPrompt{ .url = flow.device.verification_uri };
         var token = pollForTokenWithDeps(
@@ -556,9 +616,11 @@ pub const SignInRuntime = struct {
             debug_trace.logf("auth", "sign-in discarded token after cancel", .{});
             return;
         }
+        var transport: oauth_transport.Cancellable = .{ .inner = self.deps.oauth_transport, .cancel_flag = &self.cancel_requested };
         var completion = self.deps.complete(
             self.deps.ctx,
             alloc,
+            transport.provider(),
             flow.metadata.issuer,
             flow.client_id,
             token,
@@ -611,6 +673,7 @@ pub const SignInRuntime = struct {
         self.flow = null;
         self.poll_state = null;
         self.deps = .{};
+        self.browser_pending = false;
         self.mutex.unlock(io_mod.getIo());
         if (flow) |*prepared| prepared.deinit(alloc);
         if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
@@ -632,6 +695,11 @@ pub const SignInRuntime = struct {
         if (finish) |notify| notify(ctx, alloc, saved);
     }
 };
+
+fn releasePrepared(alloc: Allocator, prepared: ?PreparedLogin) void {
+    var owned = prepared orelse return;
+    owned.deinit(alloc);
+}
 
 fn prepareLogin(
     alloc: Allocator,
@@ -663,14 +731,17 @@ fn prepareLogin(
 fn completeSignIn(
     _: ?*anyopaque,
     alloc: Allocator,
+    transport: oauth_transport.Provider,
     issuer_url: []const u8,
     client_id: []const u8,
     token: *oauth.TokenSet,
 ) !SignInCompletion {
-    var teams = fetchTeams(alloc, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
+    var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
-    const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
+    // The new login starts on the person's team, so the team picker selects
+    // it and closing the picker keeps it.
+    const session = try take_login_session(alloc, issuer_url, client_id, token, savedLoginTeam(alloc, teams.items), now_ms);
     return .{ .vercel = .{
         .session = session,
         .teams = teams,
@@ -718,9 +789,10 @@ pub fn runLogin(
     );
     defer token.deinit(alloc);
 
-    var teams = fetchTeams(alloc, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
+    var teams = fetchTeams(alloc, transport, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
     defer freeTeams(alloc, &teams);
-    const selected_team_index = try selectTeam(alloc, teams.items, null);
+    const saved_team = savedLoginTeam(alloc, teams.items);
+    const selected_team_index = try selectTeam(alloc, teams.items, if (saved_team) |team| team.id else null);
     const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
 
     const now_ms = io_mod.milliTimestamp();
@@ -740,6 +812,51 @@ pub fn runLogin(
     };
 }
 
+/// The team a new fx login starts on, so signing in again keeps the person's
+/// team instead of the first team of the list: the saved login's team, else
+/// the team fx kept when it retired the last login (`oauth_session.loadKeptTeam`),
+/// when the new account's list has it. Null means the first team; the trace
+/// says why, without naming the team.
+fn savedLoginTeam(alloc: Allocator, teams: []const Team) ?*const Team {
+    if (teams.len == 0) return null;
+    var saved = oauth_session.load(alloc) catch |err| blk: {
+        debug_trace.logf("auth", "saved login not read for the team choice err={s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (saved) |*session| session.deinit(alloc);
+    if (saved) |session| {
+        if (session.team_id != null or session.team_slug != null) {
+            return startingTeam(teams, session.team_id, session.team_slug, "saved_login");
+        }
+    }
+    var kept = oauth_session.loadKeptTeam(alloc) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=no_known_team", .{});
+        return null;
+    };
+    defer kept.deinit(alloc);
+    return startingTeam(teams, kept.id, kept.slug, "kept_team");
+}
+
+fn startingTeam(teams: []const Team, id: ?[]const u8, slug: ?[]const u8, comptime source: []const u8) ?*const Team {
+    const team = teamIn(teams, id, slug) orelse {
+        debug_trace.logf("auth", "sign-in starts on the first team reason=" ++ source ++ "_not_in_list", .{});
+        return null;
+    };
+    debug_trace.logf("auth", "sign-in starts on a known team source=" ++ source, .{});
+    return team;
+}
+
+/// The team in `teams` with the id `id`, else with the slug `slug`.
+fn teamIn(teams: []const Team, id: ?[]const u8, slug: ?[]const u8) ?*const Team {
+    if (id) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.id, value)) return team;
+    };
+    if (slug) |value| for (teams) |*team| {
+        if (std.mem.eql(u8, team.slug, value)) return team;
+    };
+    return null;
+}
+
 fn take_login_session(
     alloc: Allocator,
     issuer_url: []const u8,
@@ -749,7 +866,7 @@ fn take_login_session(
     now_ms: i64,
 ) !oauth_session.Session {
     const refresh_token = token.refresh_token orelse return LoginError.NoRefreshToken;
-    const expires_at_ms = try oauth.expiry_timestamp_ms(now_ms, token.expires_in);
+    const expires_at_ms = try oauth.expiryTimestampMs(now_ms, token.expires_in);
     const owned_issuer = try alloc.dupe(u8, issuer_url);
     errdefer alloc.free(owned_issuer);
     const owned_client_id = try alloc.dupe(u8, client_id);
@@ -817,7 +934,7 @@ pub fn loadTeamSelection(
     };
     errdefer session.deinit(alloc);
 
-    const teams = try fetchTeams(alloc, session.access_token, session.issuer);
+    const teams = try fetchTeams(alloc, transport, session.access_token, session.issuer);
     return .{
         .session = session,
         .teams = teams,
@@ -837,10 +954,42 @@ fn sameCredentialState(left: oauth_session.Session, right: oauth_session.Session
 pub fn logout(
     alloc: Allocator,
     transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
 ) !LogoutResult {
+    var local = try logoutLocally(alloc);
+    defer if (local.session) |*session| session.deinit(alloc);
+    var result = local.result;
+    if (local.session) |session| {
+        if (before_revocation) |notice| notice.run(notice.context);
+        revokeLoggedOutSession(alloc, transport, session) catch |err| {
+            result.remote_revocation_failed = true;
+            result.retry_kept = local.kept and pending_revocation.retryable(err);
+            if (local.kept and !result.retry_kept) pending_revocation.forget(alloc, .fx_login, session.refresh_token);
+            return result;
+        };
+        if (local.kept) pending_revocation.forget(alloc, .fx_login, session.refresh_token);
+    }
+    return result;
+}
+
+/// The outcome of deleting the saved fx login session, with the deleted
+/// session kept so its tokens can still be revoked.
+pub const LocalLogout = struct {
+    result: LogoutResult = .{},
+    /// Owned by the caller when set; release it with `Session.deinit` using
+    /// the allocator passed to `logoutLocally`.
+    session: ?oauth_session.Session = null,
+    /// Whether `session`'s tokens are kept to revoke later
+    /// (`pending_revocation`). Forget them once the revocation is confirmed.
+    kept: bool = false,
+};
+
+/// Deletes the saved fx login session without contacting the issuer. Revoke
+/// the returned session with `revokeLoggedOutSession`, then release it.
+pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
     var session: ?oauth_session.Session = null;
     var session_load_failed = false;
-    defer if (session) |*loaded| loaded.deinit(alloc);
+    var kept = false;
     const delete_result = blk: {
         var mutation = (oauth_session.beginExistingMutation() catch {
             return LogoutError.SessionDeleteFailed;
@@ -853,49 +1002,96 @@ pub fn logout(
                 break :load null;
             },
         };
-        break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
+        // Kept before the login is deleted, so a revocation that never
+        // completes still leaves the tokens for a later retry.
+        if (session) |loaded| kept = pending_revocation.keep(alloc, .fx_login, keptTokens(loaded));
+        const deleted = mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
         };
+        // Signing out forgets the team fx kept for the next sign-in.
+        if (mutation.forgetTeam()) |forgotten| {
+            if (forgotten) debug_trace.logf("auth", "kept team forgotten reason=logout", .{});
+        } else |err| {
+            debug_trace.logf("auth", "kept team not forgotten err={s}", .{@errorName(err)});
+        }
+        break :blk deleted;
     };
-
-    var remote_revocation_failed = session_load_failed;
-    if (session != null) {
-        const loaded = session.?;
-        revokeLogoutSession(alloc, transport, loaded) catch {
-            remote_revocation_failed = true;
-        };
+    if (kept and !delete_result.session_deleted) {
+        // The login is still saved, so its tokens must not be revoked later.
+        pending_revocation.forget(alloc, .fx_login, session.?.refresh_token);
+        kept = false;
     }
-
     return .{
-        .session_deleted = delete_result.session_deleted,
-        .local_durability_failed = delete_result.local_cleanup_failed,
-        .remote_revocation_failed = remote_revocation_failed,
+        .result = .{
+            .session_deleted = delete_result.session_deleted,
+            .local_durability_failed = delete_result.local_cleanup_failed,
+            .remote_revocation_failed = session_load_failed,
+        },
+        .session = session,
+        .kept = kept,
     };
 }
 
-fn revokeLogoutSession(
+fn keptTokens(session: oauth_session.Session) pending_revocation.Tokens {
+    return .{
+        .refresh_token = session.refresh_token,
+        .access_token = session.access_token,
+        .issuer = session.issuer,
+        .client_id = session.client_id,
+    };
+}
+
+/// Revokes the fx login sign-outs that earlier logouts kept because the
+/// issuer did not confirm them (`pending_revocation.retry`).
+pub fn retryKeptSignOuts(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    before_revocation: ?oauth.BeforeRevocation,
+) pending_revocation.RetryOutcome {
+    return pending_revocation.retry(alloc, .fx_login, .{ .context = &transport, .run = revokeKept }, before_revocation);
+}
+
+fn revokeKept(context: *const anyopaque, alloc: Allocator, tokens: pending_revocation.Tokens) anyerror!void {
+    const transport: *const oauth_transport.Provider = @ptrCast(@alignCast(context));
+    if (tokens.access_token.len == 0 or tokens.issuer.len == 0 or tokens.client_id.len == 0) return error.KeptSignOutUnusable;
+    return revokeTokens(alloc, transport.*, tokens.issuer, tokens.client_id, tokens.refresh_token, tokens.access_token);
+}
+
+/// Revokes a signed-out session's refresh and access tokens at its issuer.
+pub fn revokeLoggedOutSession(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     session: oauth_session.Session,
 ) !void {
-    var metadata = try oauth.discover(alloc, transport, session.issuer);
+    return revokeTokens(alloc, transport, session.issuer, session.client_id, session.refresh_token, session.access_token);
+}
+
+fn revokeTokens(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    issuer: []const u8,
+    client_id: []const u8,
+    refresh_token: []const u8,
+    access_token: []const u8,
+) !void {
+    var metadata = try oauth.discover(alloc, transport, issuer);
     defer metadata.deinit(alloc);
     const endpoint = metadata.revocation_endpoint orelse return error.RevocationEndpointMissing;
-    try oauth_session.validateE2EEndpoint(session.issuer, endpoint);
+    try oauth_session.validateE2EEndpoint(issuer, endpoint);
     const refresh_result = oauth.revokeToken(
         alloc,
         transport,
         endpoint,
-        session.client_id,
-        session.refresh_token,
+        client_id,
+        refresh_token,
         .refresh_token,
     );
     const access_result = oauth.revokeToken(
         alloc,
         transport,
         endpoint,
-        session.client_id,
-        session.access_token,
+        client_id,
+        access_token,
         .access_token,
     );
     try refresh_result;
@@ -948,7 +1144,7 @@ const LoginPollState = struct {
     fn init(deps: LoginPollDeps, device: oauth.DeviceAuthorization) !LoginPollState {
         const now_ms = deps.now_ms(deps.ctx);
         return .{
-            .expires_at_ms = try oauth.expiry_timestamp_ms(now_ms, device.expires_in),
+            .expires_at_ms = try oauth.expiryTimestampMs(now_ms, device.expires_in),
             .interval_ms = try poll_interval_ms(device.interval),
             .next_poll_at_ms = now_ms,
         };
@@ -1167,11 +1363,15 @@ fn discardStdinLine() void {
     }
 }
 
-fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8) !std.ArrayList(Team) {
+/// Lists the account's teams through `transport`, which bounds the request
+/// with a deadline and the caller's cancel flag.
+fn fetchTeams(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    access_token: []const u8,
+    issuer_url: []const u8,
+) !std.ArrayList(Team) {
     if (comptime host_target.is_wasm) return fetchTeamsFromJsHost(alloc, access_token, issuer_url);
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
         try alloc.print("{s}/v2/teams", .{issuer_url})
     else
@@ -1182,23 +1382,15 @@ fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8
     const auth_header = try alloc.print("Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, auth_header);
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    const result = try client.fetch(.{
-        .location = .{ .url = endpoint },
-        .method = .GET,
-        .headers = .{
-            .authorization = .{ .override = auth_header },
-            .accept_encoding = .omit,
-        },
-        .response_writer = &out.writer,
-        .redirect_behavior = .unhandled,
+    var response = try transport.execute(alloc, .{
+        .method = .get,
+        .url = endpoint,
+        .authorization = auth_header,
+        .max_response_bytes = teams_response_max_bytes,
     });
-    if (result.status != .ok) return error.TeamRequestFailed;
-    const body = try out.toOwnedSlice();
-    defer alloc.free(body);
-    return parseTeams(alloc, body);
+    defer response.deinit(alloc);
+    if (response.disposition != .accepted) return error.TeamRequestFailed;
+    return parseTeams(alloc, response.body);
 }
 
 fn fetchTeamsFromJsHost(
@@ -1236,8 +1428,17 @@ fn parseTeams(alloc: Allocator, bytes: []const u8) !std.ArrayList(Team) {
         const id = entry.object.get("id") orelse continue;
         const slug = entry.object.get("slug") orelse continue;
         if (id != .string or slug != .string) continue;
+        // fx sends the id or the slug as the team and saves the slug, so a
+        // team whose id or slug it could not send is left out.
+        if (!types.validGatewayTeam(id.string) or !types.validGatewayTeam(slug.string)) {
+            debug_trace.logf("auth", "team list entry skipped reason=invalid_team_id_or_slug", .{});
+            continue;
+        }
+        // The picker and the team notices show the name, so a name that
+        // would not draw as it is shows as the slug.
         const name_value = entry.object.get("name");
-        const name = if (name_value != null and name_value.? == .string and name_value.?.string.len > 0)
+        const name = if (name_value != null and name_value.? == .string and name_value.?.string.len > 0 and
+            text_utils.isTerminalSafe(name_value.?.string))
             name_value.?.string
         else
             slug.string;
@@ -1254,9 +1455,10 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     if (teams.len == 0) return null;
     if (teams.len == 1) return 0;
 
-    const default_index = defaultTeamIndex(teams, current);
+    const current_index = currentTeamIndex(teams, current);
+    const default_index = current_index orelse 0;
     const index = if (canUseInteractiveTeamPicker())
-        selectTeamInteractive(alloc, teams, default_index) catch |err| switch (err) {
+        selectTeamInteractive(alloc, teams, default_index, current_index) catch |err| switch (err) {
             error.NotATerminal => try selectTeamByLine(alloc, teams, default_index),
             else => return err,
         }
@@ -1265,12 +1467,12 @@ fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usi
     return index;
 }
 
-fn defaultTeamIndex(teams: []const Team, current: ?[]const u8) usize {
-    const needle = current orelse return 0;
+fn currentTeamIndex(teams: []const Team, current: ?[]const u8) ?usize {
+    const needle = current orelse return null;
     for (teams, 0..) |team, i| {
         if (std.mem.eql(u8, team.id, needle) or std.mem.eql(u8, team.slug, needle)) return i;
     }
-    return 0;
+    return null;
 }
 
 fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
@@ -1296,7 +1498,9 @@ fn selectTeamByLine(alloc: Allocator, teams: []const Team, default_index: usize)
     }
 }
 
-fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize) !usize {
+/// `current_index` is the team the login already uses, labeled "(current)";
+/// null when it has none in `teams`.
+fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: usize, current_index: ?usize) !usize {
     var raw = try TeamPickerRawMode.enable();
     defer raw.disable();
 
@@ -1305,17 +1509,17 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 
     var selected = default_index;
     var first_render = true;
-    try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+    try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
 
     while (true) {
         switch (try readTeamPickerKey()) {
             .up => {
                 selected = if (selected == 0) teams.len - 1 else selected - 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .down => {
                 selected = if (selected + 1 == teams.len) 0 else selected + 1;
-                try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
+                try renderTeamPicker(alloc, teams, selected, current_index, &first_render);
             },
             .enter => return selected,
             .cancel => return LoginError.InvalidTeamSelection,
@@ -1336,7 +1540,7 @@ fn renderTeamPicker(
     alloc: Allocator,
     teams: []const Team,
     selected: usize,
-    default_index: usize,
+    current_index: ?usize,
     first_render: *bool,
 ) !void {
     if (!first_render.*) {
@@ -1347,7 +1551,7 @@ fn renderTeamPicker(
 
     for (teams, 0..) |team, i| {
         const prefix = if (i == selected) "  › " else "    ";
-        const marker = if (i == default_index) " (current)" else "";
+        const marker = if (current_index == i) " (current)" else "";
         try writeStdoutFmt("\x1b[2K{s}{d}. {s} ({s}){s}\n", .{ prefix, i + 1, team.name, team.slug, marker });
     }
     first_render.* = false;
@@ -1492,6 +1696,43 @@ fn dupeTeam(alloc: Allocator, source_id: []const u8, source_slug: []const u8, so
         .slug = slug,
         .name = name,
     };
+}
+
+test "parseTeams keeps only teams fx can use, under a name that is safe for the terminal" {
+    const alloc = std.testing.allocator;
+    var teams = try parseTeams(alloc,
+        \\{"teams":[
+        \\{"id":"team_1","slug":"one","name":"One"},
+        \\{"id":"team_2","slug":"\u001b[2Jtwo","name":"Two"},
+        \\{"id":"team 3","slug":"three","name":"Three"},
+        \\{"id":"team_4","slug":"four","name":"\u001b]2;title\u0007Four"},
+        \\{"id":"team_5","slug":"five","name":"\u202eFive"},
+        \\{"id":"team_6","slug":"six","name":"Équipe Café"},
+        \\{"id":"team_7","slug":"seven","name":""}
+        \\]}
+    );
+    defer freeTeams(alloc, &teams);
+    const expected = [_][3][]const u8{
+        .{ "team_1", "one", "One" },
+        .{ "team_4", "four", "four" },
+        .{ "team_5", "five", "five" },
+        .{ "team_6", "six", "Équipe Café" },
+        .{ "team_7", "seven", "seven" },
+    };
+    try std.testing.expectEqual(expected.len, teams.items.len);
+    for (expected, teams.items) |want, team| {
+        try std.testing.expectEqualStrings(want[0], team.id);
+        try std.testing.expectEqualStrings(want[1], team.slug);
+        try std.testing.expectEqualStrings(want[2], team.name);
+    }
+
+    // A list with no usable team is an empty list, as for an account with
+    // no teams.
+    var none = try parseTeams(alloc,
+        \\{"teams":[{"id":"team x","slug":"x","name":"X"},{"id":"team_y","slug":"y\u0007","name":"Y"}]}
+    );
+    defer freeTeams(alloc, &none);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
 }
 
 fn check_parse_teams_allocation_failures(alloc: Allocator) !void {
@@ -1881,6 +2122,7 @@ const SignInTestState = struct {
     fn complete(
         raw: ?*anyopaque,
         alloc: Allocator,
+        _: oauth_transport.Provider,
         issuer_url: []const u8,
         client_id: []const u8,
         token: *oauth.TokenSet,
@@ -1939,6 +2181,7 @@ const CooperativeSignInTestState = struct {
     fn complete(
         raw: ?*anyopaque,
         alloc: Allocator,
+        _: oauth_transport.Provider,
         issuer_url: []const u8,
         client_id: []const u8,
         token: *oauth.TokenSet,
@@ -2083,6 +2326,26 @@ test "sign-in runtime releases an owned provider context exactly once" {
     try std.testing.expectEqual(@as(usize, 1), cleanup_count);
 }
 
+test "sign-in snapshot reports preparing only until the device code exists" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    try std.testing.expect(!runtime.snapshot().preparing);
+
+    // `start` on a native host polls before its worker has the device code.
+    runtime.state = .polling;
+    try std.testing.expect(runtime.snapshot().preparing);
+    try std.testing.expect(!runtime.takeBrowserPending());
+    runtime.state = .idle;
+
+    try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), .{}));
+    const prepared = runtime.snapshot();
+    try std.testing.expectEqual(SignInState.polling, prepared.state);
+    try std.testing.expect(!prepared.preparing);
+    try std.testing.expect(prepared.verification_uri.len > 0);
+    try std.testing.expect(runtime.cancel(alloc));
+    runtime.deinit(alloc);
+}
+
 const WithholdingTokenFixture = struct {
     io_backend: std.Io.Threaded = .init_single_threaded,
     server: std.Io.net.Server,
@@ -2105,16 +2368,12 @@ const WithholdingTokenFixture = struct {
 
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
-        const zio = self.io();
         self.stopping.store(true, .seq_cst);
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
-            self.wakeAccept();
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -2128,26 +2387,15 @@ const WithholdingTokenFixture = struct {
         return self.io_backend.io();
     }
 
-    fn wakeAccept(self: *@This()) void {
-        var wake_backend: std.Io.Threaded = .init_single_threaded;
-        const zio = wake_backend.io();
-        const address = std.Io.net.IpAddress{
-            .ip4 = .loopback(self.server.socket.address.getPort()),
-        };
-        var stream = address.connect(zio, .{ .mode = .stream }) catch return;
-        stream.close(zio);
-    }
-
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
-            if (self.stopping.load(.seq_cst) and err == error.SocketNotListening) return;
             self.failure = err;
         };
     }
 
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         self.accepted.store(true, .seq_cst);

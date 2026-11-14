@@ -3,7 +3,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const default_startup_timeout_ms: u32 = 30_000;
-pub const default_operation_timeout_ms: u32 = 60_000;
+/// How long a request may go without an answer or progress. Tools such as
+/// browser automation run for minutes without reporting progress.
+pub const default_operation_timeout_ms: u32 = 5 * 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
 
@@ -161,7 +163,7 @@ pub const McpServerConfig = struct {
     scope: ConfigScope = .profile,
     required: bool = false,
     /// Advertise this server's tool schemas on every model turn instead of
-    /// loading them on demand through capability search.
+    /// offering them through toolbox.
     always_loaded: bool = false,
     /// Host-issued registration for a server the host serves over its own
     /// connection. Such a server speaks modern MCP through the runtime's

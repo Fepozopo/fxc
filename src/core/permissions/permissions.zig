@@ -71,17 +71,6 @@ pub const PermissionEngine = struct {
     pub fn formatPermissionsText(self: PermissionEngine, alloc: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
         return formatPermissionsStatus(alloc, workspace_root, self.mode, self.grants.items, self.rules);
     }
-
-    pub fn formatPermissionsNoticeBody(self: PermissionEngine, alloc: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
-        const live = try liveSessionGrants(alloc, self.grants.items);
-        defer alloc.free(live);
-        return (output_contracts.PermissionsSnapshot{
-            .workspace_root = workspace_root,
-            .mode = self.mode,
-            .grants = live,
-            .rules = self.rules,
-        }).renderInteractiveBody(alloc);
-    }
 };
 
 pub const RuleDecision = types.RuleDecision;
@@ -109,11 +98,7 @@ pub fn isWebFetchToolName(tool_name: []const u8) bool {
 }
 
 pub fn permissionModeLabel(mode: PermissionMode) []const u8 {
-    return switch (mode) {
-        .ask => "ask",
-        .auto => "auto",
-        .yolo => "yolo",
-    };
+    return mode.label();
 }
 
 /// Human-readable name; permissionModeLabel retains the persisted and wire value.
@@ -166,6 +151,8 @@ pub fn permissionTargetForCall(
     call: types.ToolCall,
     target_kind: PermissionTargetKind,
 ) ![]const u8 {
+    // A toolbox open or search is decided as the tool it replaced.
+    if (call.toolbox_lookup) |lookup| return arena.dupe(u8, lookup.target);
     if (isTypedFileMutationTool(call.name)) {
         return error.TypedFileMutationTargetRequired;
     }
@@ -177,12 +164,6 @@ pub fn permissionTargetForCall(
             return arena.print("{s}#{s}", .{ source, skill });
         }
         return arena.dupe(u8, source);
-    }
-
-    if (std.mem.eql(u8, call.name, "skill")) {
-        if (call.resolved_skill) |prepared| return arena.dupe(u8, prepared.skill.name);
-        const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-        return arena.dupe(u8, try tool_args.requiredStringArg(args, "name"));
     }
 
     if (isWebSearchToolName(call.name)) {
@@ -1444,7 +1425,7 @@ pub fn liveSessionGrantCount(grants: []const types.PermissionGrant) usize {
 
 /// Copies the grants that still apply, for display. Caller frees the slice;
 /// the grant strings stay borrowed.
-fn liveSessionGrants(alloc: std.mem.Allocator, grants: []const types.PermissionGrant) ![]types.PermissionGrant {
+pub fn liveSessionGrants(alloc: std.mem.Allocator, grants: []const types.PermissionGrant) ![]types.PermissionGrant {
     var live: std.ArrayList(types.PermissionGrant) = .empty;
     errdefer live.deinit(alloc);
     for (grants) |grant| {
@@ -1996,7 +1977,8 @@ test "PermissionEngine stores deduplicates clears replaces and deinitializes own
 test "permissionModeLabel maps active permission mode labels" {
     try std.testing.expectEqualStrings("ask", permissionModeLabel(.ask));
     try std.testing.expectEqualStrings("auto", permissionModeLabel(.auto));
-    try std.testing.expectEqualStrings("yolo", permissionModeLabel(.yolo));
+    try std.testing.expectEqualStrings("full-access", permissionModeLabel(.yolo));
+    try std.testing.expectEqual(PermissionMode.yolo, PermissionMode.parse(permissionModeLabel(.yolo)).?);
     try std.testing.expectEqualStrings("full access", permissionModeDisplayLabel(.yolo));
 }
 
@@ -2069,15 +2051,17 @@ test "permissionTargetForCall preserves run_command cwd targets" {
     try std.testing.expectEqualStrings("/tmp/workspace::zig build", try permissionTargetForCall(arena, "/tmp/workspace", default_workspace_cwd, .command_cwd));
 }
 
-test "permissionTargetForCall preserves skill and install skill targets" {
+test "permissionTargetForCall decides toolbox opens and install skill targets" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // The target is the skill the open names, never the raw location.
     const skill_call: types.ToolCall = .{
         .id = "call_1",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"vercel-react-best-practices\",\"location\":\"/tmp/outside</path>\\ninjected\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"open\":\"/tmp/outside</path>\\ninjected\"}",
+        .toolbox_lookup = .{ .permission = "skill", .target = "vercel-react-best-practices" },
     };
     const install_call: types.ToolCall = .{
         .id = "call_2",

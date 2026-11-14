@@ -37,6 +37,10 @@ const ActiveTokenRequest = struct {
 pub const GatewayFailureDiagnostics = struct {
     schema: []const u8 = "",
     request_shape: []const u8 = "",
+    /// The provider's own reason behind `terminal_stop_reason`.
+    provider_stop_reason: []const u8 = "",
+    /// What the gateway said about a failed call, masked for display.
+    error_message: []const u8 = "",
 };
 
 pub fn recordGatewayCallMetric(model: []const u8, started_at_ms: i64, status: u16, response_bytes: u32, input_tokens: u32, output_tokens: u32, turn_id: u64, step_id: u64, subagent_id: u64, error_name: []const u8, terminal_stop_reason: []const u8) void {
@@ -73,8 +77,10 @@ pub fn recordGatewayCallMetricWithDiagnostics(
     call.setModel(model);
     if (error_name.len > 0) call.setError(error_name);
     if (terminal_stop_reason.len > 0) call.setTerminalStopReason(terminal_stop_reason);
+    if (failure_diagnostics.provider_stop_reason.len > 0) call.setProviderStopReason(failure_diagnostics.provider_stop_reason);
     if (failure_diagnostics.schema.len > 0) call.setGatewaySchemaDiagnostic(failure_diagnostics.schema);
     if (failure_diagnostics.request_shape.len > 0) call.setGatewayRequestShape(failure_diagnostics.request_shape);
+    if (failure_diagnostics.error_message.len > 0) call.setGatewayErrorMessage(failure_diagnostics.error_message);
     diagnostics.recordNetworkCall(call);
 }
 

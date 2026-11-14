@@ -10,7 +10,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
@@ -25,11 +25,22 @@ const AUTH_ENV_KEYS = [
 ] as const;
 const DEFAULT_UNSET_ENV_KEYS = [
   ...AUTH_ENV_KEYS,
-  "FX_E2E_GATEWAY_CHAT_URL",
-  "FX_E2E_GATEWAY_MODELS_URL",
-  "FX_E2E_GATEWAY_CREDITS_URL",
-  "FX_E2E_UPGRADE_BASE_URL",
+  "FX_TEST_GATEWAY_CHAT_URL",
+  "FX_TEST_GATEWAY_MODELS_URL",
+  "FX_TEST_GATEWAY_CREDITS_URL",
+  "FX_TEST_UPGRADE_BASE_URL",
   "FX_PERMISSION_MODE",
+  "FX_HOME",
+  // A pane inherits the tmux server's environment, which a developer's shell
+  // may have filled: their terminal recording would start on every test's fx,
+  // and the bridge of the fx session that started the server would point
+  // `fx mcp call` at that session.
+  "FX_DEBUG_RECORD",
+  "FX_DEBUG_RECORD_SILENT_BANNER",
+  "FX_RECORD",
+  "FX_RECORD_INPUT",
+  "FX_MCP_CALL_SOCKET",
+  "FX_MCP_CALL_TOKEN",
 ] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
@@ -95,17 +106,31 @@ export function parseSingleChildPid(output: string, parentPid: number): number {
   return pid;
 }
 
+/// A process's whole command line. `-ww` keeps ps from cutting it to a
+/// terminal's width when its output is not a terminal.
+function processCommandLine(pid: number): string {
+  try {
+    return execFileSync("ps", ["-ww", "-o", "args=", "-p", String(pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return "";
+  }
+}
+
 export function buildObservedCommand(
   command: string,
   stderrPath: string | undefined,
   exitStatusPath: string,
+  cwd: string,
 ): string {
   const childCommand = stderrPath
     ? `/bin/sh -c ${shellQuote(`exec ${command} 2>${shellQuote(stderrPath)}`)}`
     : command;
+  const changeDirectory = `cd -- ${shellQuote(resolve(cwd))}${stderrPath ? ` 2>${shellQuote(stderrPath)}` : ""}`;
   const observer = `/bin/sh -c ${shellQuote([
-    childCommand,
-    "status=$?",
+    `if ${changeDirectory}; then ${childCommand}; status=$?; else status=125; fi`,
     `printf '%s\\n' \"$status\" > ${shellQuote(exitStatusPath)}`,
     'exit "$status"',
   ].join("; "))}`;
@@ -169,16 +194,78 @@ export function fakeShellRun(
   });
 }
 
+// Marks a fake review decision that fx will hold, without reading its stream.
+const HELD_REVIEW_HEADER = "x-fake-review-held";
+
+// A caution without `evidence` reaches fx as an unproven caution, which fx
+// clears. Use fakeGatewayHeldDecision for a review that must hold the action.
 export function fakeGatewayPermissionDecision(
   decision: "clear" | "caution" = "clear",
   toolCallId = "permission_decision_1",
   rationale = "test fixture",
+  evidence?: string,
+  category: "prompt_injection" | "system_harm" = "system_harm",
 ) {
-  return fakeGatewayToolCall(toolCallId, "permission_decision", {
+  const response = fakeGatewayToolCall(toolCallId, "permission_decision", {
     risk: decision === "clear" ? "low" : "high",
     decision,
     rationale,
+    ...(evidence === undefined ? {} : { category, evidence }),
   });
+  if (decision === "caution" && evidence !== undefined) response.headers.set(HELD_REVIEW_HEADER, "1");
+  return response;
+}
+
+// fx holds an action only when the review names a harm and quotes evidence
+// found in the pending action, so this answers with a system-harm caution
+// that quotes the action line of the review request it receives.
+export function fakeGatewayHeldDecision(
+  toolCallId = "permission_decision_1",
+  rationale = "test fixture",
+) {
+  return (body: string) =>
+    fakeGatewayPermissionDecision("caution", toolCallId, rationale, reviewedActionEvidence(body));
+}
+
+// fx confirms a held decision with a second, identical review request. A fake
+// reviewer answers that confirmation the way it answered the first request,
+// and only that one request, so format and transport retries still take the
+// next queued answer.
+export function confirmationReplay() {
+  let held: { body: string; response: Response } | undefined;
+  return {
+    replay(body: string): Response | undefined {
+      if (held?.body !== body) return undefined;
+      const { response } = held;
+      held = undefined;
+      return response;
+    },
+    record(body: string, response: Response): Response {
+      held = response.headers.has(HELD_REVIEW_HEADER) ? { body, response: response.clone() } : undefined;
+      return response;
+    },
+  };
+}
+
+export function reviewedActionEvidence(body: string): string {
+  const texts: string[] = [];
+  const collect = (value: unknown) => {
+    if (typeof value === "string") texts.push(value);
+    else if (Array.isArray(value)) value.forEach(collect);
+    else if (value && typeof value === "object") Object.values(value).forEach(collect);
+  };
+  collect(JSON.parse(body));
+  const instruction = texts.find((text) => text.includes("<permission_review>"));
+  if (!instruction) throw new Error("review request has no permission_review instruction");
+  const action = instruction.slice(instruction.lastIndexOf("\naction: "));
+  const line = action.split("\n").find((entry) => /^(command|arguments_json|path): /.test(entry));
+  if (!line) throw new Error("review request has no reviewed action line");
+  return line
+    .slice(line.indexOf(": ") + 2)
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&")
+    .slice(0, 160);
 }
 
 export function fakeGatewaySerializedToolCall(
@@ -292,9 +379,18 @@ export type FakeGatewayResponse =
   | Response
   | ((body: string) => Response | Promise<Response>);
 
+// A title response can also read the request's headers, such as the bearer
+// token fx sent, to answer like a gateway that rejects a stale one.
+export type FakeGatewayTitleResponse =
+  | Response
+  | ((body: string, headers: Headers) => Response | Promise<Response>);
+
 export type FakeGatewayModel = {
   id: string;
   type?: string;
+  // AI Gateway marks a model the team's Token Pass pays for, only for a team
+  // with an active pass.
+  token_pass?: boolean;
   owned_by?: string;
   released?: number;
   tags?: string[];
@@ -326,7 +422,7 @@ export type FakeGatewayOptions = {
       | Promise<FakeGatewayModel[] | Response>);
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
-  titleResponses?: FakeGatewayResponse[];
+  titleResponses?: FakeGatewayTitleResponse[];
   // Answers usage GETs (`/v1/report`, `/ai-gateway/usage-report`, ChatGPT's
   // `/backend-api/wham/...`, Grok's `/billing` and `/settings`); see
   // usage-fakes.ts. Null falls through to the routes below.
@@ -368,8 +464,12 @@ function serveFakeGateway(
 ) {
   const requests: Array<{ body: string; headers: Headers }> = [];
   const classifierRequests: Array<{ body: string; headers: Headers }> = [];
+  // fx's second, identical review of a held action, kept apart so
+  // classifierRequests counts one entry per review.
+  const confirmationRequests: Array<{ body: string; headers: Headers }> = [];
   const evaluationRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
+  const confirmations = confirmationReplay();
   const titleRequests: Array<{ body: string; headers: Headers }> = [];
   const titleResponses = [...(options.titleResponses ?? [])];
   const modelRequests: FakeGatewayModelRequest[] = [];
@@ -429,15 +529,24 @@ function serveFakeGateway(
       const body = await req.text();
       const headers = new Headers(req.headers);
       if (body.includes("\"permission_decision\"")) {
+        const confirmation = confirmations.replay(body);
+        if (confirmation) {
+          confirmationRequests.push({ body, headers });
+          return confirmation;
+        }
         classifierRequests.push({ body, headers });
         const next = classifierResponses.shift();
-        if (next) return typeof next === "function" ? await next(body) : next;
-        return fakeGatewayPermissionDecision(options.classifierDecision ?? "clear");
+        const response = next
+          ? typeof next === "function" ? await next(body) : next
+          : options.classifierDecision === "caution"
+            ? fakeGatewayHeldDecision()(body)
+            : fakeGatewayPermissionDecision("clear");
+        return confirmations.record(body, response);
       }
       if (body.includes(TITLE_GENERATION_MARKER)) {
         titleRequests.push({ body, headers });
         const next = titleResponses.shift();
-        if (next) return typeof next === "function" ? await next(body) : next;
+        if (next) return typeof next === "function" ? await next(body, headers) : next;
         return fakeGatewayTitleDefault();
       }
       requests.push({ body, headers });
@@ -449,6 +558,7 @@ function serveFakeGateway(
     chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
+    confirmationRequests,
     evaluationRequests,
     titleRequests,
     modelRequests,
@@ -472,6 +582,29 @@ export function startFakeGateway(
     }
     return typeof next === "function" ? await next(body) : next;
   }, options);
+}
+
+// The Token Pass models of a coding-agent catalog as AI Gateway sends them: a
+// team with an active pass gets `token_pass: true` on each, and any other team
+// gets the same models without the mark.
+export function tokenPassCatalog(hasPass: boolean): FakeGatewayModel[] {
+  return [
+    { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+    ...["moonshotai/kimi-k3", "zai/glm-5.3", "zai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"].map((id) => ({
+      id,
+      type: "language",
+      tags: ["tool-use"],
+      ...(hasPass ? { token_pass: true } : {}),
+    })),
+  ];
+}
+
+// fx asks AI Gateway's credits endpoint whether the team has Token Pass. With
+// no fake gateway, that request would reach the real AI Gateway, so it goes to
+// a closed loopback port, where it fails at once.
+export function localCreditsEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  if (env.FX_GATEWAY_BASE_URL || env.FX_TEST_GATEWAY_CREDITS_URL) return env;
+  return { ...env, FX_TEST_GATEWAY_CREDITS_URL: "http://127.0.0.1:9/coding-agent/v1/credits" };
 }
 
 // Same server and classifier handling as startFakeGateway, but every
@@ -582,7 +715,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
-    const env = providerVersionTestEnv(requestedEnv);
+    const env = localCreditsEnv(providerVersionTestEnv(requestedEnv));
 
     if (
       minimumHistoryLines !== undefined &&
@@ -628,8 +761,10 @@ export class TmuxSession {
     );
     const defaultArgs = [
       ["FX_DISABLE_KEYCHAIN", "1"],
-      ["FX_SKIP_ONBOARDING", "1"],
+      ["FX_TEST_SKIP_ONBOARDING", "1"],
       ["FX_SOUND", "0"],
+      // fx panics if it makes a network request on the input loop.
+      ["FX_TEST_INPUT_LOOP_NETWORK_GUARD", "1"],
     ].flatMap(([key, value]) =>
       Object.prototype.hasOwnProperty.call(env, key) ? [] : [shellQuote(`${key}=${value}`)]
     );
@@ -647,11 +782,12 @@ export class TmuxSession {
       command,
       stderrPath,
       exitStatusPath,
+      cwd,
     );
     const processEnv = {
       ...process.env,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_SOUND: process.env.FX_SOUND ?? "0",
     };
     for (const key of DEFAULT_UNSET_ENV_KEYS) delete processEnv[key];
@@ -1143,16 +1279,26 @@ export class TmuxSession {
     return value;
   }
 
+  /// The process of the command the session runs. The watcher shell that
+  /// records the exit status is not always the pane's own process: on Linux,
+  /// tmux's bash stays between the pane and the watcher. Every wrapper's command
+  /// line names this session's exit status file and the command's does not, so
+  /// the command is the first child down the chain that does not name it.
   processPid(): number {
-    const panePid = this.panePid();
-    let children = "";
-    try {
-      children = execFileSync("pgrep", ["-P", String(panePid)], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch {}
-    return parseSingleChildPid(children, panePid);
+    let parent = this.panePid();
+    for (let depth = 0; depth < 4; depth += 1) {
+      let children = "";
+      try {
+        children = execFileSync("pgrep", ["-P", String(parent)], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch {}
+      const child = parseSingleChildPid(children, parent);
+      if (!processCommandLine(child).includes(this.exitStatusPath)) return child;
+      parent = child;
+    }
+    throw new Error(`no command process under tmux pane ${this.panePid()}`);
   }
 
   historyLimit(): number {

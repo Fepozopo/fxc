@@ -26,6 +26,8 @@ import {
 } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
+// The persistence fault comes from a library the loader preloads into fx.
+const PRELOADS_LIBRARIES = loadsPreloadedLibraries(FX_BIN);
 const TIMEOUT = 30_000;
 const TRACE_SCOPES = "agent,worker,gateway,history,interrupt,prompt";
 const PARTIAL_CHUNKS = [
@@ -50,6 +52,22 @@ let session: TmuxSession | null = null;
 let gateway: GatewayHandle | null = null;
 let root: string | null = null;
 
+// A static Linux binary has no ELF interpreter, so nothing acts on
+// LD_PRELOAD. macOS binaries always load through dyld.
+function loadsPreloadedLibraries(binary: string): boolean {
+  if (process.platform !== "linux" || !existsSync(binary)) return true;
+  const elf = readFileSync(binary);
+  const PT_INTERP = 3;
+  if (elf.readUInt32BE(0) !== 0x7f454c46 || elf[4] !== 2 || elf[5] !== 1) return true;
+  const offset = Number(elf.readBigUInt64LE(0x20));
+  const size = elf.readUInt16LE(0x36);
+  const count = elf.readUInt16LE(0x38);
+  for (let i = 0; i < count; i++) {
+    if (elf.readUInt32LE(offset + i * size) === PT_INTERP) return true;
+  }
+  return false;
+}
+
 afterEach(async () => {
   if (session) {
     await session.kill();
@@ -64,7 +82,7 @@ afterEach(async () => {
 });
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
-  for (const inject of [false, true]) test(`quit reports final history persistence failure with fault=${inject}`, async () => {
+  for (const inject of [false, true]) test.skipIf(inject && !PRELOADS_LIBRARIES)(`quit reports final history persistence failure with fault=${inject}`, async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-shutdown-save-")));
     const home = join(root, "home"), workspace = join(root, "workspace");
     mkdirSync(home); mkdirSync(workspace);
@@ -82,9 +100,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       fakeGatewayFinalText("SHUTDOWN_RESUMED_281"),
     ]);
     const env = { HOME: home, AI_GATEWAY_API_KEY: "fake-shutdown-save", VERCEL_OIDC_TOKEN: undefined,
-      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+      FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
     try {
       const seeded = await runFx(["ask", "--json", "Save the first fact."], { cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(seeded.code).toBe(0); expect(seeded.stderr).toBe("");
@@ -113,10 +131,10 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(readFileSync(receipt, "utf8")).toContain(`target=${eventPath}`);
         expect(readFileSync(tracePath, "utf8")).toContain("shutdown finished prompt persistence failed");
         expect(session.paneStatus().status).toBe(1);
-        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|unable to.*sav/i);
+        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|couldn.t.*sav|unable to.*sav/i);
       } else { expect(session.paneStatus().status).toBe(0); expect(stderr).toBe(""); }
       expect(readFileSync(eventPath).subarray(0, saved.length).equals(saved)).toBe(true);
-      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without repeating work."], {
+      const resumed = await runFx(["ask", "--json", "--resume", id, "Continue without repeating work."], {
         cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(resumed.code).toBe(0); expect(resumed.stderr).toBe("");
       expect(JSON.parse(resumed.stdout).session_id).toBe(id);
@@ -153,7 +171,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},input`,
           FX_TRACE_LOG: tracePath,
@@ -232,7 +250,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},input`,
           FX_TRACE_LOG: tracePath,
@@ -255,7 +273,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(countOccurrences(readTrace(tracePath), "event=worker_begin")).toBe(2);
 
       await session.sendKeys("C-o");
-      await session.waitForText("full detail", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await session.sendKeys("C-o");
       await session.waitForText("Thinking", TIMEOUT);
       await session.sendKeys("C-c");
@@ -322,7 +340,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
@@ -422,12 +440,14 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           HOME: home,
           AI_GATEWAY_API_KEY: "fake-steer-retract-key",
           VERCEL_OIDC_TOKEN: undefined,
+          // Holds the steer behind the running command so it can be taken back.
+          FX_TEST_STEER_YIELD_GRACE_MS: "600000",
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
@@ -511,8 +531,8 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
         },
@@ -532,7 +552,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.waitForText("What can fx do differently?", TIMEOUT);
       const cancelledGrid = await session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -689,7 +709,7 @@ while :; do sleep 1; done
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},core`,
           FX_TRACE_LOG: tracePath,
@@ -725,7 +745,7 @@ while :; do sleep 1; done
         TIMEOUT,
       );
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
-      expect(immediateCancellation).toContain("■ Cancelled");
+      expect(immediateCancellation).toContain("▪ Cancelled");
       expect(immediateCancellation).not.toContain("system: cancelled");
       expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(
@@ -816,7 +836,7 @@ while :; do sleep 1; done
           FX_PERMISSION_MODE: "full-access",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},core,shutdown`,
           FX_TRACE_LOG: tracePath,
@@ -882,13 +902,13 @@ while :; do sleep 1; done
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},tool,ui_activity`,
           FX_TRACE_LOG: tracePath,
           // The search holds its result until this file exists, so it is
           // still running when the turn is cancelled.
-          FX_E2E_GREP_RELEASE: releasePath,
+          FX_TEST_GREP_RELEASE: releasePath,
         },
       });
       await session.waitForComposer(TIMEOUT);
@@ -972,7 +992,7 @@ while :; do sleep 1; done
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
