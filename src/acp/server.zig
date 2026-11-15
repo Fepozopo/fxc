@@ -21,6 +21,8 @@ const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const token_pass = @import("../core/gateway/token_pass.zig");
+const token_pass_check = @import("../core/app/token_pass_check.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
@@ -36,6 +38,7 @@ const session_title_generation = @import("../core/session/session_title_generati
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
+const subagent_reports = @import("../core/subagent/reports.zig");
 const subagent_child_state = @import("../core/subagent/child_state.zig");
 const subagent_authority = @import("../core/subagent/authority.zig");
 const types = @import("../core/shared/types.zig");
@@ -334,6 +337,11 @@ pub const ServerState = struct {
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
+    /// Whether the credential's team has Token Pass: the check that asks.
+    token_pass_run: ?token_pass_check.Check = null,
+    /// The profile's speeds, kept while nothing chose the model, so new
+    /// sessions follow the team's start model (`token_pass.startModel`).
+    token_pass_start: ?struct { fast_mode: bool, ultrafast_mode: bool } = null,
     process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
@@ -341,6 +349,8 @@ pub const ServerState = struct {
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// The built-in tools offered through toolbox, fixed for the server.
+    toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
     configured_ultrafast_mode: bool = false,
@@ -349,12 +359,19 @@ pub const ServerState = struct {
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     session_titles: bool = true,
+    cache_warming: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     worker: worker_runtime.WorkerRuntime = .{},
+    /// What each report queued in `worker` answers, oldest first, so the
+    /// prompt can show it on the subagent call that sent the work (decision
+    /// 26). Guarded by `report_mutex`, which also covers posting the report,
+    /// so both stay in the same order.
+    report_calls: std.ArrayList(ReportCall) = .empty,
+    report_mutex: std.Io.Mutex = .init,
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     /// A v2 session's children (D22), borrowed by `subagent_host`.
@@ -379,6 +396,7 @@ pub const ServerState = struct {
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
+        if (self.token_pass_run) |*check| check.finish(self.alloc, "shutdown");
         // Terminals end with this process. Ending them first also releases
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
@@ -407,6 +425,8 @@ pub const ServerState = struct {
         self.skills.deinit(self.alloc);
         self.context_snapshot.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
+        for (self.report_calls.items) |*call| call.deinit(std.heap.c_allocator);
+        self.report_calls.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
@@ -640,6 +660,7 @@ pub fn refreshModelCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
+    rejected_token: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
     if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
@@ -652,6 +673,7 @@ pub fn refreshModelCredential(
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(state.alloc);
 
@@ -788,7 +810,102 @@ fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *s
         state.alloc.destroy(children);
         return;
     };
+    // A child whose profile lists a tool kept behind toolbox keeps toolbox.
+    state.subagent_host.?.authority_resolver.toolbox_behind = &state.toolbox_behind;
+    state.subagent_host.?.report_sink = .{ .context = state, .post_fn = postAcpReport };
     state.subagent_v2_children = children;
+    // What a restart left owed reaches the session as its next turns.
+    state.subagent_host.?.resumeReports(v2);
+}
+
+/// The host's report sink: queues the report or message for the prompt,
+/// which runs it as the session's next turn once its own turn ends.
+fn postAcpReport(
+    raw: ?*anyopaque,
+    _: *subagent_tool_host.Runtime,
+    delivery: subagent_tool_host.Delivery,
+) subagent_tool_host.PostReportError!void {
+    const state: *ServerState = @ptrCast(@alignCast(raw.?));
+    const alloc = std.heap.c_allocator;
+    const text = switch (delivery) {
+        .report => |report| try subagent_reports.message(alloc, report, state.max_tool_result_bytes),
+        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, state.max_tool_result_bytes, null, message.user_typed),
+    };
+    var owns_text = true;
+    defer if (owns_text) alloc.free(text);
+    var call = try ReportCall.init(alloc, delivery);
+    var owns_call = true;
+    defer if (owns_call) call.deinit(alloc);
+    state.report_mutex.lockUncancelable(io_mod.getIo());
+    defer state.report_mutex.unlock(io_mod.getIo());
+    try state.report_calls.append(alloc, call);
+    owns_call = false;
+    state.worker.postMail(alloc, .{
+        .prompt = text,
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .ask,
+        .history = &.{},
+        .grants = &.{},
+        .author = .child,
+        .mail = if (delivery == .report) .report else .message,
+    }) catch |err| {
+        var dropped = state.report_calls.pop().?;
+        dropped.deinit(alloc);
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.QueueFull => error.QueueFull,
+            else => error.AgentGone,
+        };
+    };
+    owns_text = false;
+}
+
+/// What a queued report answers. All strings are owned (`std.heap.c_allocator`).
+pub const ReportCall = struct {
+    /// The subagent call that sent the work; empty for a message a child sent.
+    call_id: []u8,
+    child_id: []u8,
+    work_id: []u8,
+    /// How the work ended; null for a message.
+    outcome: ?subagent_child_state.Outcome,
+
+    fn init(alloc: Allocator, delivery: subagent_tool_host.Delivery) !ReportCall {
+        const call_id = try alloc.dupe(u8, switch (delivery) {
+            .report => |report| report.call_id,
+            .message => "",
+        });
+        errdefer alloc.free(call_id);
+        const child_id = try alloc.dupe(u8, switch (delivery) {
+            .report => |report| report.child_id,
+            .message => |message| message.child_id,
+        });
+        errdefer alloc.free(child_id);
+        const work_id = try alloc.dupe(u8, switch (delivery) {
+            .report => |report| report.work_id,
+            .message => "",
+        });
+        return .{ .call_id = call_id, .child_id = child_id, .work_id = work_id, .outcome = switch (delivery) {
+            .report => |report| report.outcome,
+            .message => null,
+        } };
+    }
+
+    pub fn deinit(self: *ReportCall, alloc: Allocator) void {
+        alloc.free(self.call_id);
+        alloc.free(self.child_id);
+        alloc.free(self.work_id);
+    }
+};
+
+/// What the oldest queued report answers, owned by the caller. Null when
+/// the queue holds none.
+pub fn takeReportCall(state: *ServerState) ?ReportCall {
+    state.report_mutex.lockUncancelable(io_mod.getIo());
+    defer state.report_mutex.unlock(io_mod.getIo());
+    if (state.report_calls.items.len == 0) return null;
+    return state.report_calls.orderedRemove(0);
 }
 
 fn resolveSubagentAuthority(
@@ -1375,6 +1492,7 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
 
 fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     reapActivePrompt(state, false);
+    pollTokenPass(state);
     const method = AcpMethod.parse(msg.method);
 
     if (method == .initialize) {
@@ -2165,7 +2283,9 @@ fn handleKernelSnapshot(
             open_turn_names_images = session_codec.checkpointNamesImages(journal.pending_resume.?, null, null);
         }
     }
-    const snapshot_bytes = if (open_turn_names_images)
+    const snapshot_bytes = if (yielded and session_codec.executionUsesNotesSchema(journal.pending_resume.?.execution))
+        journal_events.encodeSnapshotWithNotes(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), open_turn.written(), checkpoint)
+    else if (open_turn_names_images)
         journal_events.encodeSnapshotNamingImages(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), open_turn.written(), checkpoint)
     else
         journal_events.encodeSnapshot(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), if (yielded) open_turn.written() else null, checkpoint);
@@ -2704,6 +2824,58 @@ test "ordinary ACP ignores private libfx capabilities" {
     try std.testing.expectEqual(@as(usize, 0), request.host_instructions.len);
 }
 
+/// Asks whether the credential's team has Token Pass. A team with Token Pass
+/// starts new sessions on the Token Pass default when nothing chose the
+/// model. The check waits here only when fx has no saved answer, and
+/// `pollTokenPass` takes a later answer.
+fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: config_runtime.ModelSource) void {
+    if (state.provider != .gateway) return;
+    const source = state.credential_source orelse return;
+    const api_key: ?[]const u8 = if (state.api_key.len > 0) state.api_key else null;
+    // A client that sends `initialize` again replaces the earlier check.
+    if (state.token_pass_run) |*earlier| earlier.finish(alloc, "initialize_retried");
+    state.token_pass_run = null;
+    state.token_pass_start = null;
+    const named = token_pass_check.name(alloc, source, api_key, state.account_id, state.gateway_team) orelse return;
+    state.token_pass_run = .{ .named = named, .home = state.cfg.home_override orelse io_mod.homeDir() };
+    state.token_pass_run.?.begin(
+        alloc,
+        state.cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
+        .{ .credential = api_key, .credential_source = source, .tenant = state.gateway_team },
+        token_pass_check.first_prompt_wait_ms,
+    );
+    if (model_source != .compiled_default or state.process_model_override) return;
+    state.token_pass_start = .{ .fast_mode = state.fast_mode, .ultrafast_mode = state.ultrafast_mode };
+    applyTokenPassStartModel(state);
+}
+
+fn pollTokenPass(state: *ServerState) void {
+    const check = if (state.token_pass_run) |*value| value else return;
+    const before = check.has_pass;
+    if (check.lookup.task != null) check.poll(state.alloc);
+    _ = check.observeCatalog(state.alloc);
+    if (check.has_pass != before) applyTokenPassStartModel(state);
+}
+
+/// Puts new sessions on the team's start model, unless a client chose
+/// another model since. Token Pass credit pays only for standard speed.
+fn applyTokenPassStartModel(state: *ServerState) void {
+    const profile = state.token_pass_start orelse return;
+    const has_pass = if (state.token_pass_run) |check| check.has_pass else false;
+    const target = token_pass.startModelFor(state.selected_model, state.configured_model, has_pass) orelse return;
+    if (!std.mem.eql(u8, state.selected_model, target)) {
+        const owned = state.alloc.dupe(u8, target) catch |err| {
+            debug_trace.logf("token_pass", "start model not applied err={s}", .{@errorName(err)});
+            return;
+        };
+        if (state.selected_model.len > 0) state.alloc.free(state.selected_model);
+        state.selected_model = owned;
+        debug_trace.logf("token_pass", "start model={s}", .{target});
+    }
+    state.fast_mode = if (has_pass) false else profile.fast_mode;
+    state.ultrafast_mode = if (has_pass) false else profile.ultrafast_mode;
+}
+
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.minimal_kernel) {
         var startup = try app_lifecycle.loadLibfxStartupState(
@@ -2739,6 +2911,7 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
         state.cfg.default_model,
         state.cfg.default_agent_step_limit,
         state.cfg.auth_mode,
+        null,
         state.cfg.model_override,
     );
 }
@@ -2771,9 +2944,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     var startup = loadConfiguredStartupState(state, alloc) catch |err| {
         const model_message = config_runtime.modelNotSelectedMessage(err);
+        const settings_message = if (model_message == null) try config_runtime.configuredProviderMessage(alloc, err) else null;
+        defer if (settings_message) |message| alloc.free(message);
         return state.writer.writeError(alloc, msg.id, .{
-            .code = if (model_message != null) ErrorCode.invalid_request else ErrorCode.internal_error,
-            .message = model_message orelse "Failed to load startup state",
+            .code = if (model_message != null or settings_message != null) ErrorCode.invalid_request else ErrorCode.internal_error,
+            .message = model_message orelse settings_message orelse "Failed to load startup state",
         });
     };
     defer startup.deinit(alloc);
@@ -2898,13 +3073,18 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.auto_compact_percent = startup.auto_compact_percent;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
+    state.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, state.cfg.tool_placement_overrides);
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
+    if (comptime !host_target.is_wasm) {
+        if (!state.cfg.minimal_kernel) startTokenPassCheck(state, alloc, startup.model_source);
+    }
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
+    state.cache_warming = startup.cache_warming;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
@@ -2917,31 +3097,15 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
 
     if (!state.cfg.minimal_kernel) {
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
         const startup_catalog = catalogProviderFor(state, state.provider) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = "Selected provider is unavailable in this host",
             });
-        _ = try state.capability_resolver.resolve(
-            state.alloc,
-            startup_catalog,
-            .{
-                .access = if (state.cfg.auth_mode == .host_managed)
-                    .host_managed
-                else
-                    credentials.catalogAccessForCredentialAndAccount(
-                        state.credential_source,
-                        state.api_key,
-                        state.gateway_team,
-                        state.account_id,
-                    ),
-                .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &catalog_cancel_flag,
-            },
-            state.selected_model,
-            state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
-        );
+        _ = try resolveSelectedModelCapabilities(state, startup_catalog);
+        // The catalog just loaded; its Token Pass marks can answer for the
+        // team when the credits check could not.
+        if (comptime !host_target.is_wasm) pollTokenPass(state);
     }
 
     if (state.cfg.effort_override) |raw| {
@@ -2991,6 +3155,38 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+/// The selected model's capabilities from `provider`'s catalog, loading it
+/// first if needed. A first load whose request cannot connect gives up after
+/// `gateway_provider.catalog_connect_wait_ms`, as `fx ask`'s does, so a
+/// dead network doesn't hold up the reply for the 20 to 30 seconds its DNS
+/// lookup or connect takes to fail (`CapabilityResolver.resolveWithin`).
+fn resolveSelectedModelCapabilities(
+    state: *ServerState,
+    provider: model_catalog.Provider,
+) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    return state.capability_resolver.resolveWithin(
+        state.alloc,
+        provider,
+        .{
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &cancel_flag,
+        },
+        state.selected_model,
+        state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
+        gateway_provider.catalog_connect_wait_ms,
+    );
+}
+
 /// Applies a host-supplied reasoning effort override to sessions created after
 /// initialize. A non-default effort must be one of the selected model's
 /// advertised efforts whenever the catalog resolves; a catalog outage leaves
@@ -3007,20 +3203,7 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
         // libfx cores skip the startup catalog resolve; explicit effort and
         // fast overrides are the creation-time consumers that need it.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    state.gateway_team,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        }, state.selected_model, fallback);
+        capabilities = try resolveSelectedModelCapabilities(state, catalog_provider);
     } else {
         capabilities = state.capability_resolver.available(state.selected_model, fallback);
     }
@@ -3126,20 +3309,7 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
         // Shares the effort override's one-shot catalog resolve: creation is
         // the only point that can reject before any turn runs.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    state.gateway_team,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        }, state.selected_model, fallback);
+        capabilities = try resolveSelectedModelCapabilities(state, catalog_provider);
     } else {
         capabilities = state.capability_resolver.available(state.selected_model, fallback);
     }
@@ -3209,21 +3379,7 @@ fn applyUltrafastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
     }
     const catalog_provider = catalogProviderFor(state, state.provider) orelse
         return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode is unavailable for the selected provider");
-    var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-    const bundle = state.cfg.provider_set.select(state.provider);
-    const capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-        .access = if (state.cfg.auth_mode == .host_managed)
-            .host_managed
-        else
-            credentials.catalogAccessForCredentialAndAccount(
-                state.credential_source,
-                state.api_key,
-                state.gateway_team,
-                state.account_id,
-            ),
-        .endpoint = state.cfg.gateway_models_path,
-        .cancel_flag = &catalog_cancel_flag,
-    }, state.selected_model, bundle.fallbackModelCapabilities(state.selected_model));
+    const capabilities = try resolveSelectedModelCapabilities(state, catalog_provider);
     if (state.capability_resolver.state == .failed) {
         return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode requires a verified Gateway model catalog");
     }
@@ -3271,10 +3427,140 @@ test "ultrafastOverrideRejection accepts only Gateway models with the catalog ca
     defer alloc.free(unavailable);
 }
 
+test "ACP answers an ultrafast override without waiting out a model catalog that cannot connect" {
+    // A Gateway catalog on a dead network: its request never connects, and
+    // it fails only when cancelled or once a stalled DNS lookup would give up.
+    const UnconnectableCatalog = struct {
+        give_up_ms: i64 = 6_000,
+
+        fn fetch(raw: ?*anyopaque, _: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const started_ms = model_catalog.clockMs();
+            while (model_catalog.clockMs() - started_ms < self.give_up_ms) {
+                if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
+                    return .{ .failure = .{ .category = .cancellation } };
+                };
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+            return .{ .failure = .{ .category = .transport } };
+        }
+    };
+    const Capture = struct {
+        saw_catalog_failure: bool = false,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.find(u8, frame, "requires a verified Gateway model catalog") != null) {
+                self.saw_catalog_failure = true;
+            }
+        }
+    };
+    var catalog = UnconnectableCatalog{};
+    var capture = Capture{};
+    var model = "openai/gpt-5.5".*;
+    var state = ServerState{
+        .alloc = std.testing.allocator,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&capture, Capture.write),
+        .selected_model = &model,
+    };
+    defer state.capability_resolver.deinit(state.alloc);
+    state.cfg.auth_mode = .host_managed;
+    state.cfg.gateway_models_path = "/v1/models";
+    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{
+        .model_catalog = .{ .context = &catalog, .fetch_fn = UnconnectableCatalog.fetch, .reports_connection = true },
+    });
+    var msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "initialize" };
+
+    const started_ms = model_catalog.clockMs();
+    try std.testing.expect(!try applyUltrafastOverride(&state, std.testing.allocator, &msg, true));
+    const elapsed_ms = model_catalog.clockMs() - started_ms;
+
+    // The override fails as on any catalog outage, after the first load's wait
+    // rather than after the lookup gives up.
+    try std.testing.expect(elapsed_ms < 5_000);
+    try std.testing.expect(capture.saw_catalog_failure);
+    try std.testing.expect(!state.ultrafast_mode);
+}
+
+test "ACP keeps its model catalog when a due refresh cannot connect" {
+    // A Gateway catalog that answers, then goes behind a dead network: its
+    // request never connects, and it fails only when cancelled or once a
+    // stalled DNS lookup would give up.
+    const RefreshingCatalog = struct {
+        answers: std.atomic.Value(bool) = .init(true),
+        give_up_ms: i64 = 6_000,
+
+        fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.answers.load(.seq_cst)) {
+                if (input.connected) |connected| connected.store(true, .release);
+                var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+                errdefer model_catalog.freeModelCatalog(alloc, &entries);
+                const id = try alloc.dupe(u8, "openai/gpt-5.5");
+                errdefer alloc.free(id);
+                const model_type = try alloc.dupe(u8, "language");
+                errdefer alloc.free(model_type);
+                try entries.append(alloc, .{ .id = id, .model_type = model_type });
+                return .{ .catalog = entries };
+            }
+            const started_ms = model_catalog.clockMs();
+            while (model_catalog.clockMs() - started_ms < self.give_up_ms) {
+                if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
+                    return .{ .failure = .{ .category = .cancellation } };
+                };
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+            return .{ .failure = .{ .category = .transport } };
+        }
+    };
+    var catalog = RefreshingCatalog{};
+    var model = "openai/gpt-5.5".*;
+    var state = ServerState{
+        .alloc = std.testing.allocator,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+        .selected_model = &model,
+    };
+    defer state.capability_resolver.deinit(state.alloc);
+    state.cfg.minimal_kernel = false;
+    state.cfg.auth_mode = .host_managed;
+    state.cfg.gateway_models_path = "/v1/models";
+    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{
+        .model_catalog = .{
+            .context = &catalog,
+            .fetch_fn = RefreshingCatalog.fetch,
+            .reports_connection = true,
+            .refresh_interval_ms = 60_000,
+        },
+    });
+    var active: ActiveSessionState = undefined;
+    active.provider = .gateway;
+    state.active_session = active;
+
+    try refreshModelCatalogForOptions(&state);
+    try std.testing.expectEqual(@as(usize, 1), state.capability_resolver.catalogEntries().?.len);
+
+    // The refresh interval passes while the network is down.
+    state.capability_resolver.last_attempt_ms -= 60_000;
+    catalog.answers.store(false, .seq_cst);
+    const started_ms = model_catalog.clockMs();
+    try refreshModelCatalogForOptions(&state);
+    const elapsed_ms = model_catalog.clockMs() - started_ms;
+
+    // The refresh fails as on any catalog outage, after the wait for its
+    // connection rather than after the lookup gives up, and the models the
+    // catalog already listed stay in use.
+    try std.testing.expect(elapsed_ms < 5_000);
+    try std.testing.expectEqualStrings("openai/gpt-5.5", state.capability_resolver.catalogEntries().?[0].id);
+}
+
 fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
+        // A prompt waiting for its subagents' reports stops waiting.
+        state.worker.nudgeWaiter();
         // A libfx turn keeps its queued steering until it ends, which hands
         // back what never reached the model.
         if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);
@@ -3674,6 +3960,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+/// Loads the catalog when it is due, before a reply that lists its models. A
+/// due load whose request cannot connect gives up after
+/// `gateway_provider.catalog_connect_wait_ms` and keeps the catalog fx
+/// already has (`CapabilityResolver.refreshWithin`), so a dead network does
+/// not hold up the reply, or the prompt sent after it, for the 20 to 30
+/// seconds its DNS lookup or connect takes to fail.
 pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     if (comptime host_target.is_wasm) return;
     if (state.cfg.minimal_kernel) return;
@@ -3682,7 +3974,7 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     std.debug.assert(state.active_prompt == null);
     // Restoring the same session can leave its previous cancellation flag set.
     var cancel_flag = std.atomic.Value(bool).init(false);
-    try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
+    try state.capability_resolver.refreshWithin(state.alloc, provider, .{
         .access = if (state.cfg.auth_mode == .host_managed)
             .host_managed
         else
@@ -3694,7 +3986,7 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
             ),
         .endpoint = state.cfg.gateway_models_path,
         .cancel_flag = &cancel_flag,
-    });
+    }, gateway_provider.catalog_connect_wait_ms);
 }
 
 fn commitActiveSessionProvider(
@@ -4117,6 +4409,8 @@ pub fn loadStartingMode(state: *ServerState, alloc: Allocator) StartingMode {
             }
         }
     }
+    // `fx acp --permission-mode` beats the saved mode, as FX_PERMISSION_MODE does.
+    if (state.cfg.permission_override) |mode| state.permission_mode = mode;
     return .{
         .id = state.cfg.mode_registry.startingModeId(state.permission_mode),
         .permission_mode = state.permission_mode,

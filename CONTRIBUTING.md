@@ -6,7 +6,7 @@ Code conventions live in [AGENTS.md](AGENTS.md): which module owns which behavio
 
 ## Report a problem
 
-Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, `/trace` copies a private diagnostic trace that you can attach. Issues are public, so review the trace and remove secrets before you post it.
+Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, run `/trace` to create a private diagnostic trace. Share it as a link from [fx.sh/share](https://fx.sh/share), which hides private data before upload. Or zip the trace file and attach the `.zip`; GitHub does not accept `.jsonl` files. On macOS, `/trace` copies the file itself to the clipboard, so paste it on fx.sh/share rather than in the issue. Issues are public, so review the trace and remove secrets before you post it.
 
 Report security vulnerabilities through the [contact page](https://fx.sh/contact), not in a public issue.
 
@@ -54,6 +54,17 @@ These rules apply to every change:
 
 If a coding agent helps with your change, point it at AGENTS.md. Any prose the agent writes for your contribution, including pull request titles and descriptions, commit messages, documentation, and issues, must follow the `technical-writer` skill in `.fx/skills/technical-writer/`.
 
+### Add or change a command, flag, or setting
+
+Commands, flags, settings, environment variables, slash commands, and `--json` output are what people and scripts rely on, so fx gives them all one shape. Someone who knows git and the Unix command line should be able to guess what a control is called, where it goes, and which source wins when two disagree:
+
+- Each concept has one name, written in each surface's case: `permission_mode` in settings and JSON, `--permission-mode` as a flag, and `FX_PERMISSION_MODE` as an environment variable.
+- A subcommand is an action, a flag changes one run and never saves, a setting persists, and an environment variable carries context from CI, a wrapper script, or a test.
+- Results go to stdout and diagnostics to stderr, `--json` fields are only added, and a usage error exits with 2.
+- A rename keeps the old spelling working with a warning that names its replacement and the release that drops it.
+
+The `fx-cli-shape` skill in `.fx/skills/fx-cli-shape/` has the full rules, the names that are already decided, and a script that lists the controls a diff adds or removes. Read it before you add, rename, or remove a control, and point your coding agent at it too. CI's `python3 -m scripts.check_cli_shape` fails when code reads an `FX_*` variable, compares a flag by hand, or parses a setting that its registries don't list. A new top-level command, a new stable environment variable, or a new project-safe setting needs a maintainer's approval in the pull request.
+
 ## Test your change
 
 Run the tests that cover your change, build fx, and then use `./zig-out/bin/fx` to exercise the change yourself. Tests don't always start the full runtime, attach a terminal, or spawn background threads, so a passing suite can still miss a startup crash or a rendering regression. Confirm that fx didn't abort, that stderr is clean, and that the behavior matches what you'll describe in the pull request.
@@ -71,11 +82,12 @@ Zig unit tests sit in `test` blocks inside the source file they cover, and `zig 
 
 ### Add an end-to-end test file
 
-Every root `tests/e2e/*.test.ts` file needs an entry in the first two files below, and in the third only when it branches on the platform. CI fails when a required entry is missing or stale:
+Every root `tests/e2e/*.test.ts` file needs an entry in the first three files below, and in the fourth only when it branches on the platform. CI fails when a required entry is missing or stale:
 
 | File | Entry |
 | --- | --- |
 | `scripts/pgso/corpus.json` | Exactly one classification: training, verification-only, or intentional exclusion |
+| `scripts/pgso/tests/test_corpus.py` | The same file in the matching training, verification, or exclusion list, in `corpus.json` order |
 | `tests/e2e/ci-shard-weights.json` | A weight that balances the four CI shards |
 | `tests/e2e/macos-platform-tests.json` | Needed only when the file branches on `process.platform` or `platform()` being `darwin` or `linux` |
 
@@ -141,7 +153,7 @@ python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin
 
 ### Check a TLA+ model
 
-`tests/tla/` holds TLA+ models of fx, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer, and libfx. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the libfx model; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
+`tests/tla/` holds TLA+ models of fx, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer, and libfx. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the libfx and MCP models on `main` and on pull requests that change the code they cover; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
 
 ```bash
 tests/tla/session_manager/check.sh SessionLog
@@ -158,6 +170,16 @@ cd tests/evals
 bun install
 bun test
 ```
+
+`prompt-cache-ab.test.ts` compares how two fx builds keep the provider's prompt cache through mid-session changes: a branch switch, a permission change, folder rules, a restart, and a named skill. A recording proxy keeps every request, and for each run it reports the requests that break the cached prefix, the new and cached input tokens, and whether the answers are right. It runs only when the variables name two builds and the models to try:
+
+```bash
+cd tests/evals
+FX_CACHE_AB_BASELINE_BIN=/abs/path/to/base/fx FX_CACHE_AB_CANDIDATE_BIN=/abs/path/to/zig-out/bin/fx \
+  FX_CACHE_AB_MODELS=anthropic/claude-haiku-5.5,openai/gpt-6.1-sol bun test prompt-cache-ab.test.ts
+```
+
+`FX_CACHE_AB_SCENARIOS` picks scenarios by name, and `FX_CACHE_AB_OUTPUT_DIR` keeps each run's requests and summary. One run per scenario varies, so compare several.
 
 ## Open a pull request
 
@@ -191,7 +213,7 @@ These five checks must pass before a pull request merges:
 
 | Check | What it runs |
 | --- | --- |
-| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs |
+| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs, including the libfx durable-session model check when the change needs it |
 | `E2E (deterministic)` | Every end-to-end file, split across four weighted shards, plus the MCP conformance baseline |
 | `Shellcheck` | `bash -n` and `shellcheck` on the scripts listed in the job, such as `benchmarks/startup.sh` and `scripts/detect-macos-need.sh` |
 | `Startup Latency` | The benchmarked CLI commands on a ReleaseSafe build, each held to 2 ms, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |
@@ -210,17 +232,47 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 
 When the detector can't read the change, the `macOS arm64` check fails instead of passing.
 
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's four model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
+
+- `sdk/`
+- The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
+- The Node-API or WebAssembly core entry point
+- `src/acp/`, `src/core/hosts/`, or `src/core/session_manager/`
+
+The `TLA+ MCP models and drivers` job takes about 20 minutes and runs its checks when the change touches:
+
+- `src/mcp/`, `src/core/mcp_host/`, or `src/core/mcp/`
+- The models in `tests/tla/mcp/` or `tests/tla/mcp_host/`, or their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, or `tests/tla/drivers/lib/`
+- The `tests/e2e/fixtures/mcp-*` servers, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`
+
+The `TLA+ transcript window model` job takes about 4 minutes and runs its checks when the change touches:
+
+- `src/ui/transcript/transcript_window*`
+- The model in `tests/tla/transcript_window/` or its drivers in `tests/tla/drivers/transcript_window/`
+- The driver code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`
+
+The `TLA+ subagent and session-write models` job takes a few minutes and runs its checks when the change touches:
+
+- `src/core/subagent/`, `src/core/session/`, `src/core/agent/worker_runtime.zig`, or `src/core/agent/runtime/parallel_execution.zig`
+- The models in `tests/tla/subagent/`, the session-write and live sessions models in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`
+- The shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
+
+All four run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+
 Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
 
 - The binary size workflow builds each release target for the pull request and its base commit on native runners, reports the size change, and smoke-tests every target's binary. Growth of 52,429 bytes (0.05 MiB) or more on a platform adds a warning. Investigate growth you can't explain.
 - The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline itself changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. Stable releases always run it. [scripts/pgso/README.md](scripts/pgso/README.md) explains the pipeline and its acceptance gates.
+- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` qualifies a Linux x86_64 candidate the same way, and the stable release ships it as the Linux x86_64 binary.
 
 Other runs start only on request:
 
 | Run | Command |
 | --- | --- |
 | macOS checks | `gh workflow run macos.yml --ref your-branch`, or add the `ci:macos` label |
+| libfx durable-session and MCP model checks | `gh workflow run ci.yml --ref your-branch` |
 | PGSO qualification | `gh workflow run pgso-macos-arm64.yml --ref your-branch` |
+| Linux PGSO qualification | `gh workflow run pgso-linux-arm64.yml --ref your-branch` or `pgso-linux-x86_64.yml` |
 | Live ACP suite | `gh workflow run ci.yml --ref your-branch -f acp_live=true` |
 | Long-turn memory benchmark | `gh workflow run bench.yml --ref your-branch -f long_turn_memory=true` |
 | libfx runtime benchmark | `gh workflow run bench.yml --ref your-branch -f libfx_runtime=true` |

@@ -3,7 +3,9 @@ const result_store = @import("../../core/session/result_store.zig");
 const command_replay_store = @import("../../core/session/command_replay_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const compactor = @import("../../core/compactor/compactor.zig");
 const read_result_presentation = @import("../../core/tooling/read_tool_result_presentation.zig");
 
@@ -37,30 +39,26 @@ pub const Input = struct {
 };
 
 pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result arguments must be valid JSON") };
-    };
+    var decoder: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "read_tool_result" };
+    var parsed = decoder.parse(args_json) catch |err| return .{ .failure = try decoder.takeFailure(err) };
     defer parsed.deinit();
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result arguments must be an object") };
-    }
-    const args = if (parsed.value.object.get("request")) |request| blk: {
-        if (request != .object) {
-            return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
-        }
-        break :blk request.object;
-    } else parsed.value.object;
-    if (args.get("search")) |value| return decodeSearch(ctx.allocator, value);
-    const handle_value = args.get("handle") orelse {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result requires string field \"handle\"") };
+    // The row reads the request the same way (read_tool_result_presentation.zig).
+    const args = (try tool_args.unwrapRequest(parsed.arena.allocator(), parsed.value.object)) orelse {
+        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
     };
-    if (handle_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must be a string") };
+    if (args.get("search")) |value| {
+        // search reads saved history and ignores a handle, so a call that
+        // sends both meant to look inside the handle's output.
+        if (args.get("handle")) |handle| if (handle != .null) {
+            return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result: search finds saved turns and takes no handle; to find text in this handle's output, pass query instead") };
+        };
+        return decodeSearch(ctx.allocator, value);
     }
+    const handle = decoder.requiredString(args, "handle") catch |err| return .{ .failure = try decoder.takeFailure(err) };
 
     const input = try ctx.allocator.create(Input);
     errdefer ctx.allocator.destroy(input);
-    input.* = .{ .handle = try ctx.allocator.dupe(u8, handle_value.string) };
+    input.* = .{ .handle = try ctx.allocator.dupe(u8, handle) };
     errdefer input.deinit(ctx.allocator);
 
     if (args.get("start_byte")) |value| {
@@ -301,6 +299,32 @@ test "read_tool_result decodes range and query inputs" {
     }
 }
 
+test "read_tool_result refuses search with a handle and points to query" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "{\"handle\":\"h.txt\",\"search\":[\"CHECKSUM\"]}");
+    switch (decoded) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            try std.testing.expect(std.mem.find(u8, failure, "pass query") != null);
+        },
+    }
+    const without_handle = try decode(.{ .allocator = alloc }, "{\"handle\":null,\"search\":[\"CHECKSUM\"]}");
+    switch (without_handle) {
+        .input => |input| {
+            defer input.deinit(alloc);
+            try std.testing.expect(input.as(Input).selector == .search);
+        },
+        .failure => |failure| {
+            alloc.free(failure);
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
 test "read_tool_result decodes nested model requests" {
     const alloc = std.testing.allocator;
     const decoded = try decode(
@@ -319,6 +343,114 @@ test "read_tool_result decodes nested model requests" {
         .range => return error.TestUnexpectedDecodeFailure,
         .search => return error.TestUnexpectedDecodeFailure,
     }
+}
+
+const request_refusal = "read_tool_result field \"request\" must be an object";
+
+fn expectDecodeFailure(args_json: []const u8, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    switch (try decode(.{ .allocator = alloc }, args_json)) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            try std.testing.expectEqualStrings(expected, failure);
+        },
+    }
+}
+
+test "read_tool_result decodes a request sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "{\"request\":\"{\\\"handle\\\":\\\"h.txt\\\",\\\"query\\\":\\\"needle\\\"}\"}");
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    const typed = input.as(Input);
+    try std.testing.expectEqualStrings("h.txt", typed.handle);
+    switch (typed.selector) {
+        .query => |query| try std.testing.expectEqualStrings("needle", query),
+        .range, .search => return error.TestUnexpectedDecodeFailure,
+    }
+
+    const search = try decode(.{ .allocator = alloc }, "{\"request\":\"{\\\"search\\\":[\\\"retry budget\\\"]}\"}");
+    switch (search) {
+        .input => |value| {
+            defer value.deinit(alloc);
+            try std.testing.expect(value.as(Input).selector == .search);
+        },
+        .failure => return error.TestUnexpectedDecodeFailure,
+    }
+
+    // Text that is not one object, an object encoded twice, and text nested
+    // deeper than tool input may be are refused as before.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const twice = try std.json.Stringify.valueAlloc(arena, "{\"handle\":\"h.txt\"}", .{});
+    const deep = text_utils.repeat("{\"a\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
+    for ([_][]const u8{ "[1]", "x", "null", "", twice, deep }) |text| {
+        try expectDecodeFailure(try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{}), request_refusal);
+    }
+}
+
+const max_fuzz_request_text_bytes: usize = 16 * 1024;
+
+fn fuzzRequestText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_request_text_bytes + 1]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+    // Text that is not UTF-8 fails the argument parse before request is read.
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+    const args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{})).object;
+    const request = try tool_args.unwrapRequest(arena, args);
+
+    // decode refuses the request exactly when the row finds no object in it.
+    switch (try decode(.{ .allocator = alloc }, args_json)) {
+        .input => |input| {
+            input.deinit(alloc);
+            try std.testing.expect(request != null);
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            try std.testing.expectEqual(request == null, std.mem.eql(u8, failure, request_refusal));
+        },
+    }
+
+    // The row's label for the text is the label of the object it holds, or
+    // the tool's default when the text does not fit the label's buffer.
+    const from_text = presentation(args) orelse return;
+    const object_json = try std.json.Stringify.valueAlloc(arena, .{ .request = std.json.Value{ .object = request.? } }, .{});
+    const object_args = (try std.json.parseFromSliceLeaky(std.json.Value, arena, object_json, .{})).object;
+    const from_object = presentation(object_args) orelse return error.TestExpectedPresentation;
+    try std.testing.expectEqual(from_object.activity_kind, from_text.activity_kind);
+    try std.testing.expectEqualStrings(from_object.action_label, from_text.action_label);
+    try std.testing.expectEqualStrings(from_object.completed_action_label, from_text.completed_action_label);
+    try std.testing.expectEqualStrings(from_object.label_arg_default, from_text.label_arg_default);
+}
+
+test "read_tool_result requests sent as JSON text decode and label alike" {
+    try std.testing.fuzz({}, fuzzRequestText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"handle\":\"fx-command-replay-0123.bin\",\"query\":\"error:\"}",
+            "{\"handle\":\"result-x\",\"start_byte\":9}",
+            "{\"handle\":\" t5 \"}",
+            "{\"search\":[\"retry budget\"]}",
+            "{\"handle\":\"h.txt\",\"search\":[\"x\"]}",
+            "[1]",
+            "\"{\\\"handle\\\":\\\"h.txt\\\"}\"",
+            "{",
+        }) ++ @import("fuzz_corpus").read_tool_result_request_text.*),
+    });
 }
 
 test "read_tool_result treats exact empty legacy query as range" {

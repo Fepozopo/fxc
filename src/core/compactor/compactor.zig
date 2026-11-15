@@ -34,6 +34,7 @@ const trace = @import("trace.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -54,12 +55,16 @@ pub const traceLog = trace.log;
 pub const TraceEvent = trace.Event;
 pub const trace_ring_capacity = trace.ring_capacity;
 pub const snapshotTrace = trace.snapshot;
+pub const trace_failure_capacity = trace.failure_ring_capacity;
+pub const snapshotTraceFailures = trace.snapshotFailures;
+pub const traceFailureCount = trace.failureCount;
 pub const resetTrace = trace.reset;
 
 // The `auto_compact_percent` setting.
 pub const default_percent = settings.default_percent;
 pub const isValidPercent = settings.isValidPercent;
 pub const resolvePercent = settings.resolvePercent;
+pub const parsePercent = settings.parsePercent;
 
 // Saved checkpoints, read back when a session is loaded or shown.
 pub const modelText = checkpoint.modelText;
@@ -285,6 +290,9 @@ fn legacyEarlier(arena: Allocator, store: ?Store, summary: []const u8) !?summari
 fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message: types.ChatMessage) !void {
     const content = message.content orelse "";
     switch (message.role) {
+        // A saved turn's context notes come back as system messages, which
+        // are fx's context, not the conversation, and never reach the
+        // summarizer's messages (D93).
         .system => {},
         .user => if (message.context_origin == .user_turn) {
             try items.append(arena, .{ .user = content });
@@ -319,7 +327,7 @@ const question_tool = "ask_user_question";
 /// not list answers, as when the question was not answered.
 fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const []const u8 {
     const Answered = struct { answer: []const u8 };
-    const answered = std.json.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return &.{},
     };
@@ -348,6 +356,22 @@ test "a question's result gives the user's answers, not the questions" {
     try std.testing.expectEqual(@as(usize, 1), items.items[0].tool_result.answers.len);
     try std.testing.expectEqualStrings("Legitimate, push", items.items[0].tool_result.answers[0]);
     try std.testing.expectEqual(@as(usize, 0), items.items[1].tool_result.answers.len);
+}
+
+test "a message fx sent the model on its own is a note for the summary, never the user's words" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // What a saved turn restores for a tool's notice or a Stop hook's message
+    // (`session.zig` `restoredSteeringChatMessage`), beside the user's own update.
+    var items: std.ArrayList(summarize.Item) = .empty;
+    try appendItems(arena, &items, .{ .role = .user, .content = "None of the requested images were read by Vision.", .recovery_prompt = true });
+    try appendItems(arena, &items, .{ .role = .user, .content = "Continue the turn. fx hook context:\nverify", .recovery_prompt = true });
+    try appendItems(arena, &items, .{ .role = .user, .content = "use the staging key", .restored_steering = true, .context_origin = .user_turn });
+    try std.testing.expectEqual(@as(usize, 3), items.items.len);
+    try std.testing.expectEqualStrings("None of the requested images were read by Vision.", items.items[0].note);
+    try std.testing.expectEqualStrings("Continue the turn. fx hook context:\nverify", items.items[1].note);
+    try std.testing.expectEqualStrings("use the staging key", items.items[2].user);
 }
 
 /// The handle of a tool's whole output that fx saved separately, when the

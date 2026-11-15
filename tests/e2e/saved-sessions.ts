@@ -62,6 +62,23 @@ export function logLines(home: string, id: string): LogLine[] {
   return lines;
 }
 
+/// Every line of a session's log whose turns may compact in the middle. A
+/// turn is superseded only after a compaction in it moved its first results
+/// out of the agent's view, once for that compaction
+/// (`tests/tla/session/TurnStream.tla` SupersedeExplained).
+export function logLinesAfterCompaction(home: string, id: string): LogLine[] {
+  const lines = readLog(home, id);
+  let compacted = false;
+  for (const line of lines) {
+    if (line.kind === "turn_started") compacted = false;
+    if (line.kind === "compacted") compacted = true;
+    if (line.type !== "superseded") continue;
+    expect({ seq: line.seq, compacted }).toEqual({ seq: line.seq, compacted: true });
+    compacted = false;
+  }
+  return lines;
+}
+
 /// Every saved session's id, children included.
 export function savedSessionIds(home: string): string[] {
   return readdirSync(storeRoot(home)).filter((name) => !name.startsWith(".") && !name.startsWith("index"));
@@ -81,6 +98,33 @@ export function rootSessionIds(home: string): string[] {
     const first = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8").split("\n", 1)[0]!;
     return JSON.parse(first).role !== "child";
   });
+}
+
+/// How many turns the saved root sessions have committed. A session fx is
+/// still creating counts as none yet.
+export function committedRootTurns(home: string): number {
+  try {
+    return rootSessionIds(home).reduce(
+      (sum, id) => sum + logLines(home, id).filter((line) => line.kind === "turn_committed").length,
+      0,
+    );
+  } catch {
+    return 0;
+  }
+}
+
+/// Waits until the saved root sessions hold more than `after` committed
+/// turns. A fake model holds a child's answer on it: a report that arrives
+/// while the parent's turn still runs joins that turn (`postMail` in
+/// `src/core/agent/worker_runtime.zig`), so the receipt never gets its own
+/// step.
+export async function waitForRootTurnCommitted(home: string, after = 0, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (committedRootTurns(home) > after) return;
+    await Bun.sleep(20);
+  }
+  throw new Error(`no root session committed more than ${after} turns`);
 }
 
 /// The parent's lines about its children, with fx's data parsed.
@@ -112,10 +156,18 @@ export function compactionRecordPath(home: string, id: string, name: string): st
 }
 
 /// The command replays session `id` kept: each is one of its blobs, named in
-/// the session by its handle, `fx-command-replay-<hash>.bin` (D44).
+/// the session by its handle, `fx-command-replay-<run>-<hash>.bin` (D44, D91).
+/// A handle from before D91 has no run id.
 export function commandReplays(home: string, id: string): { name: string; path: string }[] {
-  const names = [...new Set(savedText(home, id).match(/fx-command-replay-[0-9a-f]{64}\.bin/g) ?? [])];
-  return names.map((name) => ({ name, path: join(sessionDir(home, id), "blobs", name.slice("fx-command-replay-".length, -".bin".length)) }));
+  const names = [...new Set(savedText(home, id).match(commandReplayHandles) ?? [])];
+  return names.map((name) => ({ name, path: join(sessionDir(home, id), "blobs", commandReplayHash(name)) }));
+}
+
+const commandReplayHandles = /fx-command-replay-(?:[0-9a-f]{12}-)?[0-9a-f]{64}\.bin/g;
+
+/// The hash of the blob a command replay handle names, which comes last.
+export function commandReplayHash(handle: string): string {
+  return /([0-9a-f]{64})\.bin$/.exec(handle)![1]!;
 }
 
 /// Every tool call a saved history holds, finished or left open by an

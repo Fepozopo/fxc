@@ -175,6 +175,12 @@ pub const ToolExecutionRequest = struct {
     expected_mcp_binding: ?types.McpToolBinding = null,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
+    /// The built-in tools this agent offers through toolbox, which
+    /// `toolbox {search}` finds by name and description.
+    toolbox_behind: []const []const u8 = &.{},
+    /// The MCP servers the toolbox menu lists, so an open of a name that is
+    /// also a skill can ask which one is meant.
+    toolbox_mcp_servers: []const []const u8 = &.{},
     /// The owning agent loop already ran its policy-neutral idempotency and
     /// availability classifiers for this exact effective call.
     classification_complete: bool = false,
@@ -186,6 +192,8 @@ pub const ToolExecutionRequest = struct {
     /// Present for interactive tool calls so streamed command output can stay
     /// attached to the status row that owns this exact call.
     lifecycle_id: ?types.ToolLifecycleId = null,
+    /// The row group of that status row, for rows the call adds beside it.
+    presentation_group_id: ?types.ToolPresentationGroupId = null,
 };
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;

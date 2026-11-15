@@ -14,6 +14,7 @@ const termScripts = [
   "test-term-history.mjs",
   "test-term-workspace.mjs",
   "test-term-agents-md.mjs",
+  "test-term-usage.mjs",
 ];
 const commands = [
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-wasm-jspi-tier-up.mjs", import.meta.url))]],
@@ -24,6 +25,7 @@ const commands = [
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-step-limit.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-effort.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-fast.mjs", import.meta.url)), "wasm"]],
+  [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-prompt-cache.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-images.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-tool-start.mjs", import.meta.url)), "wasm"]],
   [process.execPath, ["--experimental-wasm-jspi", fileURLToPath(new URL("test-agent-reserved-tool-names.mjs", import.meta.url)), "wasm"]],

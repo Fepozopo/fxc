@@ -67,6 +67,10 @@ pub const ResumableSessionContinuation = store_types.ResumableSessionContinuatio
 pub const ResumableSessionPage = store_types.ResumableSessionPage;
 pub const SessionListScope = store_types.SessionListScope;
 pub const SessionListPage = store_types.SessionListPage;
+pub const LiveState = store_types.LiveState;
+pub const LiveAgent = store_types.LiveAgent;
+pub const LiveSession = store_types.LiveSession;
+pub const LiveSessionList = store_types.LiveSessionList;
 pub const session_list_default_limit: usize = 100;
 pub const session_list_max_limit: usize = 100;
 const automatic_legacy_max_bytes = store_types.automatic_legacy_max_bytes;
@@ -203,12 +207,12 @@ pub const Store = struct {
 
     fn openRememberedDirectory(self: Store, create: bool) !?io_mod.VerifiedDir {
         const zio = io_mod.getIo();
-        var home = std.Io.Dir.openDirAbsolute(zio, self.home_dir, .{ .iterate = true }) catch |err| switch (err) {
+        var home = std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(self.home_dir), .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer home.close(zio);
-        var profile = home.openDir(zio, profile_paths.root_dir_name, .{
+        var profile = home.openDir(zio, profile_paths.rootName(), .{
             .iterate = true,
             .follow_symlinks = false,
         }) catch |err| switch (err) {

@@ -14,7 +14,9 @@ import {
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
+import { latestTraceReportPath, readTraceReport } from "./trace-report";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { EVAL_ERROR_PREFIX } from "./shell-eval-error";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -84,12 +86,12 @@ function gatewayEnv(
     AI_GATEWAY_API_KEY: "fake-ask-presentation-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: "1",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_PERMISSION_MODE: "auto",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
 }
 
@@ -513,11 +515,10 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       const escaped = await session.captureFullScrollbackEscapes();
       expect(scrollback).toContain("Inspect fixture.txt and render the response.");
-      expect(pane.match(/1 tool call · 1 read/g)).toHaveLength(2);
-      expect(pane).toContain("Reading fixture.txt");
+      // Each group's only call is its header, and the failed read is marked.
+      expect(pane).toContain("● Reading fixture.txt");
       expect(pane).toContain("Between groups.");
-      expect(pane).toContain("Reading missing.txt");
-      expect(pane).toContain("failed");
+      expect(pane).toContain("● Failed: Reading missing.txt: Path not found: missing.txt");
       expect(pane).toContain("Ask presentation");
       expect(pane).toContain("bold and docs");
       expect(pane).toContain("first item");
@@ -604,6 +605,37 @@ describe("fx ask presentation", () => {
       expect(escaped).not.toContain("\x1b]8;");
     },
     TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "NO_COLOR and TERM=dumb render like --no-color",
+    async () => {
+      // Both standard variables turn fx ask's color off.
+      for (const env of [{ NO_COLOR: "1" }, { NO_COLOR: undefined, TERM: "dumb" }]) {
+        const root = createRoot();
+        const gateway = startFakeGateway([fakeGatewayFinalText(MARKDOWN)]);
+        gateways.push(gateway);
+
+        const session = await TmuxSession.create({
+          isolated: true,
+          cmd: terminalCommand(["ask", "--no-save", "Render the standard no-color fixture."]),
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root.home, gateway), ...env },
+          width: 120,
+          height: 40,
+          remainOnExit: true,
+        });
+        sessions.push(session);
+
+        await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+        const pane = await session.captureFullScrollback();
+        const escaped = await session.captureFullScrollbackEscapes();
+        expect(pane).toContain("Ask presentation");
+        expect(pane).toContain("const answer: u8 = 42;");
+        expect(escaped).not.toMatch(/\x1b\[[0-9;]*m/);
+      }
+    },
+    TIMEOUT * 2,
   );
 
   test.skipIf(!tmuxAvailable())(
@@ -947,7 +979,7 @@ describe("fx ask presentation", () => {
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain("Run the notice filtering fixture.");
       expect(scrollback).toContain("Notice filtering complete.");
-      expect(scrollback).toContain("1 tool call · 1 command");
+      expect(scrollback).toContain("● Running printf notice-test > ask-notice.txt");
       expect(scrollback).not.toContain("project instructions");
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(scrollback).not.toMatch(/[*✓!✗⊘i] system:/);
@@ -1022,6 +1054,35 @@ describe("fx ask shell startup files", () => {
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);
 
+  // Wrappers such as Socket Firewall's `pnpm` call a helper whose name starts
+  // with `_`, which completion functions share.
+  test("a startup-file wrapper that calls an underscore helper runs through the snapshot", async () => {
+    const root = createRoot();
+    writeStartupFiles(
+      root.home,
+      "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
+        "_fx_wrap_helper() { printf 'FX_WRAPPED_HELPER_OK %s\\n' \"$*\"; }\n" +
+        "fxwrapped() { _fx_wrap_helper fxwrapped \"$@\"; }\n",
+    );
+    const gateway = startFakeGateway([
+      userShellRun("wrapped", "fxwrapped install"),
+      fakeGatewayFinalText("Wrapper checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Run the wrapped command."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0" }, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests[1]!.body).toContain("FX_WRAPPED_HELPER_OK fxwrapped install");
+    expect(gateway.requests[1]!.body).not.toContain("command not found");
+    // The capture is the only full startup, so the command ran from the snapshot.
+    expect(startupLoads(root.home)).toBe(1);
+    expect(result.stderr).not.toContain("shell snapshot unavailable");
+  }, TIMEOUT);
+
   test("a user-profile command with a quoting error carries rewrite guidance", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
@@ -1036,10 +1097,10 @@ describe("fx ask shell startup files", () => {
     );
 
     expect(result.code).toBe(0);
-    // The snapshot runs the command through eval, so zsh reports the error as
-    // `(eval):1:` and bash as `/dev/fd/0: eval:` instead of under the shell's name.
+    // The snapshot runs the command through eval, so each shell reports the
+    // error under `eval` instead of under its own name; see shell-eval-error.ts.
     expect(result.stderr).not.toContain("shell snapshot unavailable");
-    expect(gateway.requests[1]!.body).toMatch(/\(eval\):1:|\/dev\/fd\/0: eval:/);
+    expect(gateway.requests[1]!.body).toMatch(EVAL_ERROR_PREFIX);
     expect(gateway.requests[1]!.body).toContain("The shell could not parse this command");
   }, TIMEOUT);
 
@@ -1147,9 +1208,9 @@ describe("fx ask shell startup files", () => {
       }
 
       expect(gateway.requests[1]!.body).toContain("FX_SECRET_VISIBLE");
-      const report = readdirSync(root.root).find((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
-      expect(report).toBeDefined();
-      expect(readFileSync(join(root.root, report!), "utf8")).not.toContain(secret);
+      const report = readTraceReport(latestTraceReportPath(root.root));
+      expect(report.all("tool_call").map((call) => call.name)).toContain("shell");
+      expect(report.text).not.toContain(secret);
       expect(readFileSync(tracePath, "utf8")).toContain("shell snapshot ready");
       expect(readFileSync(tracePath, "utf8")).not.toContain(secret);
       expect(filesContaining(join(root.home, ".fx"), secret)).toEqual([]);

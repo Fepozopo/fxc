@@ -3,6 +3,7 @@ const activity_runtime = @import("../core/output/activity_runtime.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
+const terminal_env = @import("../core/shared/terminal_env.zig");
 const types = @import("../core/shared/types.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
 const frame_layout = @import("render_engine/frame_layout.zig");
@@ -19,7 +20,7 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const TmuxHistoryClearRunner = *const fn (Allocator, []const []const u8) anyerror!void;
 var tmux_history_clear_test_runner: if (builtin.is_test) ?TmuxHistoryClearRunner else void = if (builtin.is_test) null else {};
 
-const supports_test_pty = switch (builtin.target.os.tag) {
+pub const supports_test_pty = switch (builtin.target.os.tag) {
     .linux,
     .macos,
     .freebsd,
@@ -88,6 +89,8 @@ pub const TerminalState = struct {
         if (std.c.isatty(self.stdin_fd) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
+        // The session draws with cursor movement, which TERM=dumb lacks.
+        if (terminal_env.dumbTerminal()) return error.DumbTerminal;
     }
 
     pub fn captureOriginalTermios(self: *TerminalState) !void {
@@ -217,6 +220,11 @@ pub const TerminalState = struct {
     ) !void {
         var stdout_file = std.Io.File.stdout();
         try stdout_file.writeStreamingAll(io_mod.getIo(), cursor_probe.queryBytes(protocol));
+    }
+
+    pub fn enableBracketedPaste(_: TerminalState) !void {
+        var stdout_file = std.Io.File.stdout();
+        try stdout_file.writeStreamingAll(io_mod.getIo(), ui_terminal.bracketed_paste_enable_sequence);
     }
 
     pub fn enableThemeNotifications(_: TerminalState) !void {
@@ -365,16 +373,7 @@ test "tmux history clear preserves pane modes with a server-owned target" {
 }
 
 pub fn detectSyncUpdatesEnabled(_: Allocator) bool {
-    const override = io_mod.getenv("FX_SYNC_UPDATES");
-
-    const fallback_override = if (override == null)
-        io_mod.getenv("FLASH_SYNC_UPDATES")
-    else
-        null;
-
-    const term = io_mod.getenv("TERM");
-
-    return syncUpdatesEnabledForValues(override orelse fallback_override, term);
+    return syncUpdatesEnabledForValues(io_mod.getenv("FX_SYNC_UPDATES"), io_mod.getenv("TERM"));
 }
 
 pub fn detectHistoryResetUsesRis(_: Allocator) bool {
@@ -600,11 +599,11 @@ test "direct Apple Terminal uses RIS for terminal history resets" {
     try std.testing.expect(!historyResetUsesRisForValues("Ghostty", null));
 }
 
-const TestPty = struct {
+pub const TestPty = struct {
     master: std.posix.fd_t,
     slave: std.posix.fd_t,
 
-    fn open() !TestPty {
+    pub fn open() !TestPty {
         const flags = std.posix.O{
             .ACCMODE = .RDWR,
             .NOCTTY = true,

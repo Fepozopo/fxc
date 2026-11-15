@@ -67,9 +67,9 @@ async function runWithFakeGateway(
         ...env,
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
         FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-        FX_E2E_GATEWAY_CREDITS_URL: undefined,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CREDITS_URL: undefined,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -244,6 +244,67 @@ describe("external file permissions", () => {
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }
+    },
+    TIMEOUT,
+  );
+});
+
+describe("failed edit hints", () => {
+  const SECRET = "FX_E2E_SECRET_VALUE";
+  const CONTENT = `[default]\naws_secret_access_key = ${SECRET}\n`;
+
+  /** Runs one edit_file with a wrong old_string on a file in the external folder, and returns the tool results the model gets next. */
+  async function failedEditResult(permission: (folder: string) => Record<string, unknown>) {
+    const root = createIsolatedRoot("fx-edit-hints-");
+    try {
+      const target = join(root.external, "credentials");
+      writeFileSync(target, CONTENT);
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({ permission: permission(root.external) }),
+      );
+      const { gateway, result } = await runWithFakeGateway(
+        root,
+        ["ask", "--json", "--no-save", "--auto", `Rotate the key in ${target}.`],
+        [
+          fakeGatewayToolCall("rotate_key_1", "edit_file", {
+            path: target,
+            old_string: "aws_secret_access_key = guess",
+            new_string: "aws_secret_access_key = rotated",
+          }),
+          fakeGatewayFinalText("rotation attempted"),
+        ],
+      );
+      const output = parseFxJson(result);
+      expect(output.tool_calls).toContainEqual({ name: "edit_file", status: "error" });
+      expect(readFileSync(target, "utf8")).toBe(CONTENT);
+      expect(gateway.requests).toHaveLength(2);
+      const prompt = JSON.parse(gateway.requests[1]!.body).prompt as Array<{ role: string }>;
+      return JSON.stringify(prompt.filter((message) => message.role === "tool"));
+    } finally {
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  test(
+    "a failed edit of a readable file shows the line it most likely meant",
+    async () => {
+      const toolResults = await failedEditResult((folder) => ({ edit: { [`${folder}/**`]: "allow" } }));
+      expect(toolResults).toContain("the closest match is line 2.");
+      expect(toolResults).toContain(`aws_secret_access_key = ${SECRET}`);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a failed edit of a file a read rule denies keeps the plain message",
+    async () => {
+      const toolResults = await failedEditResult((folder) => ({
+        read: { [`${folder}/**`]: "deny" },
+        edit: { [`${folder}/**`]: "allow" },
+      }));
+      expect(toolResults).toContain("old_string not found in file. Re-read the file");
+      expect(toolResults).not.toContain(SECRET);
     },
     TIMEOUT,
   );

@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const net_connect = @import("net_connect.zig");
+const profile_paths = @import("profile_paths.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
@@ -20,17 +22,44 @@ var global_raw_environ: ?RawEnviron = null;
 var global_libc_environ: bool = false;
 
 pub fn setIo(zio: std.Io) void {
-    real_io = process_io_for(builtin.target.os.tag, zio);
+    real_io = processIo(zio);
+}
+
+/// `zio` with fx's process spawn on Darwin and fx's TCP connect.
+fn processIo(zio: std.Io) std.Io {
+    return net_connect.wrap(process_io_for(builtin.target.os.tag, zio));
+}
+
+/// Tests only: `getIo` returns `zio`, as given, until `restoreIoForTest`
+/// puts the returned value back. Unlike `setIo`, it skips the Darwin
+/// process selection, so `zio` must come from `getIo` to keep it.
+pub fn replaceIoForTest(zio: std.Io) ?std.Io {
+    comptime std.debug.assert(builtin.is_test);
+    const previous = real_io;
+    real_io = zio;
+    return previous;
+}
+
+pub fn restoreIoForTest(previous: ?std.Io) void {
+    comptime std.debug.assert(builtin.is_test);
+    real_io = previous;
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
     return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
 }
 
-pub fn getIo() std.Io {
+// Thousands of call sites reach `getIo`, so it stays out of line: an inlined
+// copy at each one costs more code than the call. The fallback is reached only
+// before main installs the process Io and in tests.
+pub noinline fn getIo() std.Io {
     if (real_io) |zio| return zio;
-    if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
-    return process_io_for(builtin.target.os.tag, fallback_threaded.io());
+    return fallbackIo();
+}
+
+noinline fn fallbackIo() std.Io {
+    if (comptime builtin.is_test) return processIo(std.testing.io);
+    return processIo(fallback_threaded.io());
 }
 
 /// Opens an absolute directory path without following any path component.
@@ -115,6 +144,23 @@ test "getIo Darwin test fallback runs a child through the selected backend" {
     }
     try std.testing.expectEqualStrings("get-io-spawn-ok", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "process I/O connects TCP through net_connect and keeps every other entry" {
+    const original = std.testing.io;
+    const selected = processIo(original);
+    const spawn_selected = process_io_for(builtin.target.os.tag, original);
+
+    try std.testing.expect(selected.userdata == original.userdata);
+    try std.testing.expect(selected.vtable == processIo(original).vtable);
+    inline for (@typeInfo(std.Io.VTable).@"struct".field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, "netConnectIp")) {
+            const replaced = builtin.target.os.tag == .macos or builtin.target.os.tag == .linux;
+            try std.testing.expectEqual(replaced, @field(selected.vtable, field_name) != @field(original.vtable, field_name));
+        } else {
+            try std.testing.expectEqual(@field(spawn_selected.vtable, field_name), @field(selected.vtable, field_name));
+        }
+    }
 }
 
 test "non-Darwin process I/O keeps the original vtable" {
@@ -465,18 +511,24 @@ fn liveLibcEnviron() ?RawEnviron {
     return @ptrCast(std.c.environ);
 }
 
+/// What fx tells the user when `homeDir` returns null, after a prefix such as
+/// `fx mcp: `.
+pub const no_home_dir_reason = "HOME is not set to an absolute path";
+
 /// The home directory fx keeps its own files under: `HOME` when it is an
-/// absolute path, otherwise null. An empty or relative `HOME` counts as
-/// unset, so fx never builds profile paths relative to the current folder.
-/// Child processes still inherit `HOME` unchanged.
+/// absolute path, otherwise `FX_HOME`'s parent, or null when `FX_HOME` is
+/// unset too. An empty or relative `HOME` counts as unset, so fx never builds
+/// profile paths relative to the current folder. Child processes still
+/// inherit `HOME` unchanged.
 pub fn homeDir() ?[]const u8 {
-    const home = getenv("HOME") orelse return null;
-    if (!std.Io.Dir.path.isAbsolute(home)) return null;
+    // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
+    const home = getenv("HOME") orelse return profile_paths.fxHomeParent();
+    if (!std.Io.Dir.path.isAbsolute(home)) return profile_paths.fxHomeParent();
     return home;
 }
 
 pub fn e2eFailIfDurableMutationAttempted() void {
-    const enabled = getenv("FX_E2E_FAIL_ON_DURABLE_MUTATION") orelse return;
+    const enabled = getenv("FX_TEST_FAIL_ON_DURABLE_MUTATION") orelse return;
     if (!std.mem.eql(u8, enabled, "1")) return;
     std.process.exit(86);
 }
@@ -572,14 +624,23 @@ pub fn readFileToEndZ(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: u
     return result[0..data.len :0];
 }
 
-pub fn milliTimestamp() i64 {
+// Called from hundreds of sites; one out-of-line copy keeps each call small.
+pub noinline fn milliTimestamp() i64 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
-pub fn nanoTimestamp() i128 {
+pub noinline fn nanoTimestamp() i128 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
     return @intCast(ts.nanoseconds);
+}
+
+/// Milliseconds on the awake clock, which every process on the machine shares
+/// and which stops while the machine sleeps (mach uptime on macOS). For
+/// timeouts one process sets and another reads.
+pub fn awakeMilliTimestamp() i64 {
+    const ts = std.Io.Timestamp.now(getIo(), .awake);
+    return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
 pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const u8) !void {
@@ -1025,45 +1086,89 @@ pub fn sleep(ns: u64) void {
     getIo().sleep(.{ .nanoseconds = @intCast(ns) }, .real) catch {};
 }
 
-/// Reads terminal attributes. Linux issues the kernel ioctl directly because
-/// Zig 0.17 sizes `std.posix.termios` to the kernel struct, while
-/// `std.posix.tcgetattr` calls into libc, which writes its larger struct and
-/// overruns the caller's stack.
+/// Reads terminal attributes. Every errno is an error, including the EBADF
+/// that `std.posix.tcgetattr` treats as unreachable.
 pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
-    if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
     var term = std.mem.zeroes(std.posix.termios);
-    while (true) switch (std.os.linux.errno(std.os.linux.tcgetattr(fd, &term))) {
+    while (true) switch (tcgetattrErrno(fd, &term)) {
         .SUCCESS => return term,
         .INTR => continue,
-        .BADF => unreachable,
-        .NOTTY => return error.NotATerminal,
+        .BADF, .NOTTY => return error.NotATerminal,
         else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
-/// Sets terminal attributes. See `tcgetattr` for why Linux bypasses libc.
+/// Linux issues the kernel ioctl: libc there writes a larger termios than Zig's.
+fn tcgetattrErrno(fd: std.posix.fd_t, term: *std.posix.termios) std.posix.E {
+    if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcgetattr(fd, term));
+    return std.posix.errno(std.c.tcgetattr(fd, term));
+}
+
+/// Sets terminal attributes. Like `tcgetattr`, every failure is an error,
+/// including the EBADF and EINVAL that `std.posix` treats as unreachable.
 pub fn tcsetattr(
     fd: std.posix.fd_t,
     action: std.posix.TCSA,
     term: std.posix.termios,
 ) std.posix.TermiosSetError!void {
-    if (builtin.target.os.tag != .linux) return std.posix.tcsetattr(fd, action, term);
-    while (true) switch (std.os.linux.errno(std.os.linux.tcsetattr(fd, action, &term))) {
+    while (true) switch (tcsetattrErrno(fd, action, &term)) {
         .SUCCESS => return,
         .INTR => continue,
-        .BADF, .INVAL => unreachable,
-        .NOTTY => return error.NotATerminal,
+        .BADF, .NOTTY => return error.NotATerminal,
         .IO => return error.ProcessOrphaned,
+        .INVAL => return error.Unexpected,
         else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
-test "tcgetattr reports a regular file as not a terminal" {
+fn tcsetattrErrno(fd: std.posix.fd_t, action: std.posix.TCSA, term: *const std.posix.termios) std.posix.E {
+    if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcsetattr(fd, action, term));
+    return std.posix.errno(std.c.tcsetattr(fd, action, term));
+}
+
+test "terminal attributes of a regular file report not a terminal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
     defer file.close(std.testing.io);
     try std.testing.expectError(error.NotATerminal, tcgetattr(file.handle));
+    try std.testing.expectError(
+        error.NotATerminal,
+        tcsetattr(file.handle, .FLUSH, std.mem.zeroes(std.posix.termios)),
+    );
+}
+
+test "terminal attributes of a closed descriptor are an error, not a panic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    // Closed, near the top of the file limit where opens rarely land; dup() if F_DUPFD fails.
+    const floor: c_int = @intCast(@min((try std.posix.getrlimit(.NOFILE)).cur -| 1, 900));
+    var closed = std.c.fcntl(file.handle, std.posix.F.DUPFD, floor);
+    if (closed < 0) closed = std.c.dup(file.handle);
+    try std.testing.expect(closed >= 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.close(closed));
+
+    try std.testing.expectError(error.NotATerminal, tcgetattr(closed));
+    try std.testing.expectError(
+        error.NotATerminal,
+        tcsetattr(closed, .FLUSH, std.mem.zeroes(std.posix.termios)),
+    );
+}
+
+test "terminal attributes with an invalid action are an error, not a panic" {
+    // macOS libc refuses the action with EINVAL before any ioctl. On Linux
+    // the action selects the ioctl itself, so there is no safe invalid one.
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    try std.testing.expectError(
+        error.Unexpected,
+        tcsetattr(file.handle, @fromBackingInt(99), std.mem.zeroes(std.posix.termios)),
+    );
 }
 
 pub fn makeDirRecursive(path: []const u8) !void {
@@ -1867,4 +1972,24 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         error.LockUnsupported,
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
+}
+
+/// Holds each standard stream the parent left closed open on /dev/null,
+/// read-only, so no file fx opens later takes its number. A write meant for a
+/// closed stdout then fails, instead of landing in that file, such as the
+/// session store's lock, and a read of a closed stdin ends at once. Call it
+/// before fx opens anything.
+pub fn reserveClosedStandardStreams() void {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows) return;
+    for ([_]std.c.fd_t{ 0, 1, 2 }) |fd| {
+        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) continue;
+        // `open` returns the lowest free number, which is `fd` once the
+        // closed streams below it are held.
+        const held = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+        if (held < 0) return;
+        if (held != fd) {
+            _ = std.c.dup2(held, fd);
+            _ = std.c.close(held);
+        }
+    }
 }

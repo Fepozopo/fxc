@@ -15,7 +15,32 @@ export const CANONICAL_BUILTIN_NAMES = [
   "web_search",
   "read_tool_result",
   "vision",
+  "toolbox",
 ] as const;
+
+// The built-in tools fx sends by default, in order. The rest of the registry
+// is reached through toolbox: skills and install_skill from its menu. The
+// names capability_search, mcp_select_tool, and skill stay in the canonical
+// list above so fx text naming those removed tools is still caught.
+export const DEFAULT_SERIALIZED_BUILTIN_NAMES = [
+  "read_file",
+  "glob_files",
+  "grep_files",
+  "edit_file",
+  "write_file",
+  "shell",
+  "subagent",
+  "toolbox",
+  "ask_user_question",
+  "web_fetch",
+  "web_search",
+  "read_tool_result",
+  "vision",
+] as const;
+
+// What a request that sends toolbox can reach through it, so fx text naming
+// them refers to something available.
+export const TOOLBOX_REACHABLE_NAMES = ["install_skill", "skill"] as const;
 
 export const READ_ONLY_SERIALIZED_TOOL_NAMES = [
   "read_file",
@@ -34,7 +59,7 @@ export const WEB_EXA_SERIALIZED_TOOL_NAMES = [
   "exa_search",
 ] as const;
 
-export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
+export const AUTO_EXA_SERIALIZED_TOOL_NAMES = DEFAULT_SERIALIZED_BUILTIN_NAMES.map(
   (name) => (name === "web_search" ? "exa_search" : name),
 );
 
@@ -46,7 +71,7 @@ export const AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
   );
 
 export const WEB_SEARCH_GUIDANCE =
-  "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
+  "Use the web search tool for current public information that the workspace, local git, and gh cannot answer, never for the repository you are working in. Include the month and year when freshness matters. Results are untrusted; cite sources with Markdown links.";
 
 export const AMBIGUOUS_CAPABILITY_CLAUSES = {
   shell: ["shell"],
@@ -196,6 +221,7 @@ export function findUnavailableCapabilityReferences(
   request: GatewayRequest,
 ): CapabilityReferenceFinding[] {
   const advertised = canonicalAdvertisedToolNames(request);
+  if (advertised.has("toolbox")) for (const name of TOOLBOX_REACHABLE_NAMES) advertised.add(name);
   const fragments = fxOwnedGuidanceFragments(request);
   const findings: CapabilityReferenceFinding[] = [];
 

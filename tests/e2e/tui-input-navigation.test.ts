@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { closeStatusPanel, waitForStatusPanel } from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -82,7 +83,7 @@ async function startFx(
   const active = await TmuxSession.create({
     cmd: withGateway
       ? FX_BIN
-      : `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+      : `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     env: {
       HOME: testHome,
       ...(gateway
@@ -322,7 +323,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 37", READY_TIMEOUT);
+    await active.waitForText("Commands 40", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
       (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
@@ -906,7 +907,7 @@ tmuxTest(
     await typeLiteral(active, draft);
     await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
 
-    const fullFooter = "full detail · ctrl+o close";
+    const fullFooter = "esc close · pgup/pgdn scroll";
     const response = "history prompt complete";
     const openRetainedTranscript = async () => {
       await active.sendKeys("C-o");
@@ -988,20 +989,22 @@ tmuxTest(
 );
 
 tmuxTest(
-  "ctrl+o opens with a session assembly record and per-request network record",
+  "ctrl+o opens with a session assembly record and each request's call line under its response",
   async () => {
     const active = await startFx(80, 24, true, false, 1);
     await active.sendText("hello");
     await active.waitForText("history prompt complete", READY_TIMEOUT);
+    // A model call's line: its time, the model, then tokens and the gen ID.
+    const callLine = /^  \d{2}:\d{2}:\d{2} · gpt-5 · .*in 3 · out 5 · /m;
 
     // The records never appear in the inline transcript.
     const inline = await active.capturePane();
     expect(inline).not.toContain("session: provider:");
-    expect(inline).not.toContain("network: provider:");
+    expect(inline).not.toMatch(callLine);
 
     await active.sendKeys("C-o");
-    await active.waitForText("full detail · ctrl+o close", READY_TIMEOUT);
-    // The records block sits at the top of the full transcript.
+    await active.waitForText("esc close · pgup/pgdn scroll", READY_TIMEOUT);
+    // The session's assembly opens the full transcript.
     let top = await active.capturePane();
     for (let page = 0; page < 10 && !top.includes("session: provider:"); page += 1) {
       await active.sendKeys("PPage");
@@ -1011,9 +1014,18 @@ tmuxTest(
     expect(top).toContain("session: provider:");
     expect(top).toContain("system prompt: ready");
     expect(top).toContain("tools:");
-    expect(top).toContain("network: provider:");
-    expect(top).toContain("finish: stop");
-    expect(top).toContain("tokens: 3 in · 5 out");
+    // The request's line sits under the response it wrote.
+    let view = top;
+    for (let page = 0; page < 10 && !callLine.test(view); page += 1) {
+      await active.sendKeys("NPage");
+      await Bun.sleep(50);
+      view = await active.capturePane();
+    }
+    const rows = view.split("\n");
+    const response = rows.findIndex((row) => row.includes("history prompt complete"));
+    const call = rows.findIndex((row) => callLine.test(row));
+    expect(response, view).toBeGreaterThanOrEqual(0);
+    expect(call, view).toBe(response + 1);
     await active.sendKeys("C-o");
     await active.waitForComposer(READY_TIMEOUT);
     expectCleanStderr();
@@ -1187,6 +1199,22 @@ tmuxTest(
       expect(body).not.toContain(siblingRule);
       expect(body.indexOf(rootRule)).toBeLessThan(body.indexOf(nestedRule));
     };
+    // The folder's rules reach the model as a note on the first image turn's
+    // message, never in the instructions, so every request keeps the
+    // instructions the first one sent and the rules appear once.
+    const instructionsOf = (body: string) =>
+      (JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> }).prompt.filter(
+        (message) => message.role === "system",
+      );
+    const expectRulesOutsideInstructions = (bodies: string[]) => {
+      const first = instructionsOf(bodies[0]!);
+      expect(JSON.stringify(first)).toContain(rootRule);
+      for (const body of bodies) {
+        expect(instructionsOf(body)).toEqual(first);
+        expect(JSON.stringify(instructionsOf(body))).not.toContain(nestedRule);
+        expect(body.split(nestedRule)).toHaveLength(2);
+      }
+    };
     const localGateway = startFakeGateway(
       [
         fakeGatewayFinalText("IMAGE_TYPED_OK"),
@@ -1211,7 +1239,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1265,6 +1293,7 @@ tmuxTest(
     expect(localGateway.requests[2]?.body).toContain('"type":"file"');
     expect(localGateway.requests[2]?.body).not.toContain(scopedImage);
     expectScopedContext(localGateway.requests[2]!.body);
+    expectRulesOutsideInstructions(localGateway.requests.map((request) => request.body));
 
     const escapes = await active.captureFullScrollbackEscapes();
     expect(escapes).toContain("\x1b]8;;file://");
@@ -1326,10 +1355,9 @@ tmuxTest(
 
     await typeLiteral(active, "/status");
     await active.sendKeys("Enter");
-    await active.waitForPane(
-      (pane) => pane.includes("model=") && pane.includes("[Image 1]"),
-      READY_TIMEOUT,
-    );
+    await waitForStatusPanel(active, READY_TIMEOUT);
+    await closeStatusPanel(active, READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("[Image 1]"), READY_TIMEOUT);
 
     expect(gateway?.requests).toHaveLength(0);
     const composer = (await active.capturePaneGrid())
@@ -1376,7 +1404,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1487,7 +1515,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1579,7 +1607,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1649,7 +1677,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1876,7 +1904,7 @@ tmuxTest(
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);
-    await active.waitForText("Commands 37", READY_TIMEOUT);
+    await active.waitForText("Commands 40", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

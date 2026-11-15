@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import unittest
 import json
+import os
+import subprocess
 import tempfile
+import textwrap
 
 import pathlib
 import dataclasses
 import re
+import types
 
 from scripts.pgso.corpus import Corpus, Scenario
+from scripts.pgso import linux, macos
 from scripts.pgso.distributed import (
     _load_documents,
+    _require_distributed_support,
     aggregate_measurement_shards,
     aggregate_scenario_shards,
     matrix_payload,
@@ -147,6 +153,124 @@ class WorkflowContractTests(unittest.TestCase):
                 )
                 self.assertIn("          overwrite: true\n", upload)
 
+    def test_fx_jobs_upload_the_crash_reports_macos_wrote(self) -> None:
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        workflow = (repo_root / ".github/workflows/pgso-macos-arm64.yml").read_text()
+        for job, output in (("train", "fx-pgso-training"), ("behavior", "fx-pgso-behavior")):
+            with self.subTest(job=job):
+                job_body = re.split(
+                    r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1
+                )[0]
+                before_upload, upload = job_body.split("uses: actions/upload-artifact@", 1)
+                folder = f"{output}-${{{{ matrix.id }}}}/crash-reports"
+                self.assertIn(
+                    "      - name: Collect fx crash reports\n"
+                    "        if: always()\n"
+                    f'        run: scripts/pgso/collect-crash-reports.sh "$RUNNER_TEMP/{folder}"\n',
+                    before_upload,
+                )
+                self.assertIn(f"            ${{{{ runner.temp }}}}/{folder}\n", upload)
+
+    def test_crash_report_collection_copies_only_fx_reports(self) -> None:
+        script = pathlib.Path(__file__).resolve().parents[1] / "collect-crash-reports.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "home"
+            dest = pathlib.Path(tmp) / "out" / "crash-reports"
+            env = {**os.environ, "HOME": str(home)}
+
+            # No report folder at all: nothing to copy, and no empty folder.
+            result = subprocess.run([str(script), str(dest)], env=env, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("fx crash reports: 0\n", result.stdout)
+            self.assertFalse(dest.exists())
+
+            reports = home / "Library/Logs/DiagnosticReports"
+            reports.mkdir(parents=True)
+            for name in ("fx-2026-11-12-083254.ips", "fx-2026-11-12-083301.crash",
+                         "fxpanicprobe-2026-11-12-083254.ips", "bun-2026-11-12-083254.ips"):
+                (reports / name).write_text(name)
+            result = subprocess.run([str(script), str(dest)], env=env, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("fx crash reports: 2\n", result.stdout)
+            self.assertEqual(
+                ["fx-2026-11-12-083254.ips", "fx-2026-11-12-083301.crash"],
+                sorted(path.name for path in dest.iterdir()),
+            )
+
+    def test_linux_workflows_differ_only_in_architecture(self) -> None:
+        workflows = pathlib.Path(__file__).resolve().parents[3] / ".github/workflows"
+        expected = (workflows / "pgso-linux-arm64.yml").read_text()
+        for arm64, x86_64 in (
+            ("Linux arm64 PGSO candidate", "Linux x86_64 PGSO candidate"),
+            ("pgso-linux-arm64", "pgso-linux-x86_64"),
+            ("runs-on: ubuntu-24.04-arm", "runs-on: ubuntu-24.04"),
+            ("Require native arm64 host", "Require native x86_64 host"),
+            ('test "$(uname -m)" = aarch64', 'test "$(uname -m)" = x86_64'),
+            ("--target aarch64-linux", "--target x86_64-linux"),
+        ):
+            self.assertIn(arm64, expected)
+            expected = expected.replace(arm64, x86_64)
+        self.assertEqual(expected, (workflows / "pgso-linux-x86_64.yml").read_text())
+
+    def test_linux_setup_pins_archives_for_each_runner_architecture(self) -> None:
+        action = (
+            pathlib.Path(__file__).resolve().parents[3] / ".github/actions/setup-pgso/action.yml"
+        ).read_text()
+
+        def step_script(step_id: str) -> str:
+            step = action.split(f"      id: {step_id}\n", 1)[1].split("      run: |\n", 1)[1]
+            lines = []
+            for line in step.splitlines():
+                if line.strip() and not line.startswith("        "):
+                    break
+                lines.append(line)
+            return textwrap.dedent("\n".join(lines))
+
+        llvm = "llvmorg-22.1.8/LLVM-22.1.8-Linux"
+        hyperfine = "v1.20.0/hyperfine-v1.20.0"
+        for step_id, arch, url, digest in (
+            ("llvm-linux", "ARM64", f"{llvm}-ARM64.tar.xz",
+             "805efad2bb91cb4967fa569e0881d10c0f69c04461cf671cccbae19f547acc34"),
+            ("llvm-linux", "X64", f"{llvm}-X64.tar.xz",
+             "df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384"),
+            ("hyperfine-linux", "ARM64", f"{hyperfine}-aarch64-unknown-linux-gnu.tar.gz",
+             "90875cb1db7a1d797c311174d061728361e58fc70e3b62262a00635ac3b1997c"),
+            ("hyperfine-linux", "X64", f"{hyperfine}-x86_64-unknown-linux-gnu.tar.gz",
+             "63ad53934062118f5b0be11785e0bb1603d4b91667d1921f2fd8df9a8712040a"),
+            ("llvm-linux", "X86", None, None),
+            ("hyperfine-linux", "ARM", None, None),
+        ):
+            with self.subTest(step=step_id, arch=arch), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                stubs = root / "bin"
+                stubs.mkdir()
+                calls = root / "calls.txt"
+                # The digest check fails on purpose, so the step stops before
+                # it would unpack or link anything.
+                for name, body in (
+                    ("sudo", "exit 0"),
+                    ("curl", f'echo "curl $*" >> {calls}'),
+                    ("sha256sum", f'echo "sha256sum $(cat)" >> {calls}; exit 1'),
+                ):
+                    (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+                    (stubs / name).chmod(0o755)
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", step_script(step_id)],
+                    env={**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}",
+                         "RUNNER_ARCH": arch, "RUNNER_TEMP": tmp},
+                    capture_output=True,
+                    text=True,
+                )
+                recorded = calls.read_text() if calls.exists() else ""
+                self.assertNotEqual(0, result.returncode)
+                if url is None:
+                    self.assertIn(f"::error::no pinned", result.stdout)
+                    self.assertIn(arch, result.stdout)
+                    self.assertEqual("", recorded)
+                else:
+                    self.assertIn(f"/releases/download/{url} ", recorded)
+                    self.assertIn(f"sha256sum {digest}  ", recorded)
+
     def test_behavior_workers_install_pinned_zig_without_llvm(self) -> None:
         repo_root = pathlib.Path(__file__).resolve().parents[3]
         action = (repo_root / ".github/actions/setup-pgso/action.yml").read_text()
@@ -158,10 +282,11 @@ class WorkflowContractTests(unittest.TestCase):
         )[0]
 
         self.assertIn("  zig:\n", action)
-        self.assertIn(
-            "if: inputs.zig == 'true' || inputs.llvm == 'true'",
-            action,
-        )
+        for runner_os in ("macOS", "Linux"):
+            self.assertIn(
+                f"if: runner.os == '{runner_os}' && (inputs.zig == 'true' || inputs.llvm == 'true')",
+                action,
+            )
         self.assertIn('          zig: "true"', behavior_job)
         self.assertNotIn('          llvm: "true"', behavior_job)
 
@@ -212,7 +337,7 @@ class ShardPlanningTests(unittest.TestCase):
             {
                 "include": [
                     {"name": name}
-                    for name in ("help", "version", "status", "doctor", "sessions")
+                    for name in ("help", "version", "status", "sessions")
                 ]
             },
             run_plan("startup", missing_corpus, 20),
@@ -490,15 +615,15 @@ class ShardAggregationTests(unittest.TestCase):
 
     def test_measurement_aggregate_requires_all_passing_gates(self) -> None:
         measurements = aggregate_measurement_shards(
-            (self.measurement("startup-help"), self.measurement("startup-doctor")),
+            (self.measurement("startup-help"), self.measurement("startup-sessions")),
             phase="startup",
-            expected_names=("startup-help", "startup-doctor"),
+            expected_names=("startup-help", "startup-sessions"),
             expected_identity=self.identity,
             expected_artifact_sha256="e" * 64,
         )
 
         self.assertEqual(
-            ["startup-help", "startup-doctor"],
+            ["startup-help", "startup-sessions"],
             [item["name"] for item in measurements],
         )
 
@@ -564,6 +689,16 @@ class ShardAggregationTests(unittest.TestCase):
                 expected_identity=self.identity,
                 expected_artifact_sha256="e" * 64,
             )
+
+
+class DistributedSupportTests(unittest.TestCase):
+    def test_platforms_with_a_startup_exemption_cannot_build_distributed(self) -> None:
+        _require_distributed_support(types.SimpleNamespace(platform=macos))
+        for platform in (linux.ARM64, linux.X86_64):
+            with self.subTest(target=platform.TARGET), self.assertRaisesRegex(
+                PgsoError, f"startup profiles that {platform.DISPLAY_NAME} candidates need"
+            ):
+                _require_distributed_support(types.SimpleNamespace(platform=platform))
 
 
 if __name__ == "__main__":

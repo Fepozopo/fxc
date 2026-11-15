@@ -3,6 +3,7 @@ const versions = @import("../core/gateway/provider_versions.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_client = @import("client.zig");
+const json_decode = @import("../core/shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const lookup_timeout_ms = 3000;
@@ -16,8 +17,8 @@ pub fn resolve(
 ) versions.Error!versions.Version {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const override_name = switch (provider) {
-        .codex => "FX_E2E_CODEX_CLIENT_VERSION",
-        .grok => "FX_E2E_GROK_CLIENT_VERSION",
+        .codex => "FX_TEST_CODEX_CLIENT_VERSION",
+        .grok => "FX_TEST_GROK_CLIENT_VERSION",
     };
     if (io_mod.getenv(override_name)) |value| {
         return versions.Version.parse(value) orelse error.ProviderVersionUnavailable;
@@ -75,12 +76,10 @@ const LookupOperation = struct {
     url: []const u8,
 
     pub fn run(self: *LookupOperation) !Response {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
-        defer client.deinit();
         const buffer = try self.alloc.alloc(u8, max_response_bytes + 1);
         defer self.alloc.free(buffer);
         var writer = std.Io.Writer.fixed(buffer);
-        const result = try client.fetch(.{
+        const result = try gateway_client.fetchOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = .{
@@ -99,8 +98,8 @@ const LookupOperation = struct {
 /// environment. Borrowed; static or environment-owned.
 pub fn versionUrl(provider: versions.Provider) error{ProviderVersionUnavailable}![]const u8 {
     const override_name = switch (provider) {
-        .codex => "FX_E2E_CODEX_VERSION_URL",
-        .grok => "FX_E2E_GROK_VERSION_URL",
+        .codex => "FX_TEST_CODEX_VERSION_URL",
+        .grok => "FX_TEST_GROK_VERSION_URL",
     };
     if (io_mod.getenv(override_name)) |value| {
         if (!gateway_client.isLoopbackHttpUrl(value)) return error.ProviderVersionUnavailable;
@@ -116,7 +115,7 @@ pub fn parseResponse(alloc: Allocator, provider: versions.Provider, body: []cons
     if (body.len > max_response_bytes) return error.ProviderVersionResponseTooLarge;
     if (provider == .grok) return versions.Version.parse(body) orelse error.InvalidProviderVersion;
     const Release = struct { version: []const u8 };
-    const parsed = try std.json.parseFromSlice(Release, alloc, body, .{ .ignore_unknown_fields = true });
+    const parsed = try json_decode.parseFromSlice(Release, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return versions.Version.parse(parsed.value.version) orelse error.InvalidProviderVersion;
 }
@@ -128,4 +127,19 @@ test "provider version metadata parses the two upstream release formats" {
     try std.testing.expectEqualStrings("1.0.13", grok.slice());
     try std.testing.expectError(error.InvalidProviderVersion, parseResponse(std.testing.allocator, .codex, "{\"version\":\"bad\"}"));
     try std.testing.expectError(error.InvalidProviderVersion, parseResponse(std.testing.allocator, .grok, "1.0.13\nHeader: injected"));
+}
+
+test "a version lookup ends at its deadline during a lookup that hangs" {
+    const stuck_lookup_testing = @import("stuck_lookup_testing.zig");
+    var stuck = stuck_lookup_testing.StuckLookups.install();
+    defer gateway_client.waitForOwnClientOpenJobs() catch {};
+    defer stuck.deinit();
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    var context = LookupContext{
+        .cancel_flag = &never_cancelled,
+        .outer_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(100) }),
+    };
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(error.ProviderVersionUnavailable, fetch(&context, std.testing.allocator, .grok));
+    try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
 }

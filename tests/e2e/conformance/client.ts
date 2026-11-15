@@ -96,17 +96,18 @@ function gatewaySteps() {
   const steps = toolCalls.flatMap((call, index) => {
     const name = `mcp_conformance_${call.name}`;
     return [
-      fakeGatewayToolCall(`select_conformance_tool_${index}`, "mcp_select_tool", {
-        name,
+      fakeGatewayToolCall(`open_conformance_tool_${index}`, "toolbox", { open: name }),
+      fakeGatewayToolCall(`call_conformance_tool_${index}`, "toolbox", {
+        run: name,
+        arguments: call.arguments,
       }),
-      fakeGatewayToolCall(`call_conformance_tool_${index}`, name, call.arguments),
     ];
   });
   if (toolCalls.length === 0) {
     steps.push(fakeGatewayToolCall(
       "search_conformance_server",
-      "capability_search",
-      { query: "conformance" },
+      "toolbox",
+      { search: "conformance" },
     ));
   }
   steps.push(fakeGatewayFinalText("MCP conformance client finished."));
@@ -143,7 +144,7 @@ const fxEnv = {
       }
     : {}),
   FX_MODEL: FAKE_GATEWAY_MODEL,
-  FX_SKIP_ONBOARDING: "1",
+  FX_TEST_SKIP_ONBOARDING: "1",
   FX_SOUND: "0",
   NO_COLOR: "1",
 };

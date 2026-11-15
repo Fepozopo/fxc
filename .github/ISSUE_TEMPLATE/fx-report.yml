@@ -1,0 +1,36 @@
+name: fx bug report
+description: Report a problem with fx
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If useful, run `/trace`, review the trace, and remove sensitive information. Share it as a link from [fx.sh/share](https://fx.sh/share), which hides private data before upload. Or zip the trace file and attach the `.zip`; GitHub does not accept `.jsonl` files. On macOS, `/trace` copies the file itself to the clipboard, so paste it on fx.sh/share rather than here.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Issue details
+      description: Describe the issue, expected behavior, and steps to reproduce it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: trace
+    attributes:
+      label: Trace
+      description: Optional. A link from fx.sh/share, or the reviewed and redacted `/trace` file in an attached `.zip`.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: sanitized
+    attributes:
+      label: Sensitive information
+      options:
+        - label: I reviewed the information above and removed secrets and other sensitive data.
+          required: true
+
+# AGENTS: Use the 'technical-writer' skill when writing the content for this issue.

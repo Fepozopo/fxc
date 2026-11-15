@@ -1,16 +1,20 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const stored_login_testing = @import("../auth/stored_login_testing.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const token_pass_mod = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
-const text_utils = @import("../shared/text_utils.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
@@ -22,7 +26,7 @@ else
     struct {};
 
 const Allocator = std.mem.Allocator;
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
 
 /// What asked for a catalog load. Every trigger is user activity, so an idle
 /// session never polls the models endpoint.
@@ -41,6 +45,10 @@ const picker_revalidate_floor_ms: i64 = 5_000;
 /// 20 s, and so on, up to five minutes, so an outage is never hammered.
 const failure_backoff_base_ms: i64 = 5_000;
 const failure_backoff_cap_ms: i64 = 5 * std.time.ms_per_min;
+
+/// How long a request waits for a failed catalog's retry before it goes out
+/// without the catalog's limits.
+const failed_catalog_retry_wait_ms: i64 = 2_000;
 
 fn failureBackoffMs(failure_streak: u32) i64 {
     var delay = failure_backoff_base_ms;
@@ -141,6 +149,75 @@ const OwnedCatalogAccess = struct {
     }
 };
 
+/// A warmup's copy of the shared sign-in it fetches with; it owns the account
+/// and team bytes.
+const OwnedSignIn = struct {
+    sign_in: auth_runtime.SharedSignIn,
+
+    fn init(alloc: Allocator, sign_in: auth_runtime.SharedSignIn) !OwnedSignIn {
+        var owned = sign_in;
+        owned.account_id = if (sign_in.account_id) |account| try alloc.dupe(u8, account) else null;
+        errdefer if (owned.account_id) |account| alloc.free(account);
+        owned.team = if (sign_in.team) |team| try alloc.dupe(u8, team) else null;
+        return .{ .sign_in = owned };
+    }
+
+    fn deinit(self: *OwnedSignIn, alloc: Allocator) void {
+        if (self.sign_in.account_id) |account| alloc.free(account);
+        if (self.sign_in.team) |team| alloc.free(team);
+        self.* = undefined;
+    }
+};
+
+/// Gives the model list's fetch the stored token of its shared sign-in, which
+/// another fx process may have refreshed since the app read it. It never
+/// refreshes the sign-in, and it owns every token it hands to the fetch until
+/// the fetch returns.
+const CatalogSignIn = struct {
+    alloc: Allocator,
+    sign_in: auth_runtime.SharedSignIn,
+    stored: ?credentials.Credential = null,
+    replacement: ?credentials.Credential = null,
+
+    /// The stored token when it differs from `current`
+    /// (tests/tla/session_title/SessionTitle.tla CatalogFirstSendUsesStore).
+    fn storedToken(self: *CatalogSignIn, current: []const u8) ?[]const u8 {
+        var credential = (auth_runtime.readStoredCredential(self.alloc, self.sign_in) catch |err| {
+            debug_trace.logf("catalog", "model catalog keeps its credential reason=stored_read_failed err={s}", .{@errorName(err)});
+            return null;
+        }) orelse return null;
+        if (std.mem.eql(u8, credential.token, current)) {
+            credential.deinit(self.alloc);
+            return null;
+        }
+        if (self.stored) |*old| old.deinit(self.alloc);
+        self.stored = credential;
+        return credential.token;
+    }
+
+    fn hook(self: *CatalogSignIn) model_catalog.RenewAfterRejection {
+        return .{ .context = self, .renew_fn = replace };
+    }
+
+    /// The stored token that replaced `rejected`, or null to fall back.
+    fn replace(context: *anyopaque, rejected: []const u8) ?[]const u8 {
+        const self: *CatalogSignIn = @ptrCast(@alignCast(context));
+        const credential = (auth_runtime.storedReplacement(self.alloc, self.sign_in, rejected) catch |err| {
+            debug_trace.logf("catalog", "model catalog falls back reason=stored_read_failed err={s}", .{@errorName(err)});
+            return null;
+        }) orelse return null;
+        if (self.replacement) |*old| old.deinit(self.alloc);
+        self.replacement = credential;
+        return credential.token;
+    }
+
+    fn deinit(self: *CatalogSignIn) void {
+        if (self.stored) |*credential| credential.deinit(self.alloc);
+        if (self.replacement) |*credential| credential.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
 pub const ModelMenuLoadState = enum {
     loading,
     ready,
@@ -176,6 +253,8 @@ pub const ModelMenuItem = struct {
     id: []u8,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
+    /// Whether the catalog marks this model as paid by the team's Token Pass.
+    token_pass: bool = false,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -284,39 +363,77 @@ pub fn modelMenuFilteredItemCount(
     provider_filter: ModelProviderFilter,
     query: []const u8,
 ) usize {
-    var count: usize = 0;
-    for (items) |item| {
-        if (modelMenuItemMatches(item, provider_filter, query)) count += 1;
-    }
-    return count;
+    return modelMenuRanking(items, provider_filter, query).count();
 }
 
+/// Returns the row at `display_index`. Better matches list first, and rows
+/// that match equally well keep catalog order.
 pub fn modelMenuItemAt(
     items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
     display_index: usize,
 ) ?*const ModelMenuItem {
-    var current: usize = 0;
-    for (items) |*item| {
-        if (!modelMenuItemMatches(item.*, provider_filter, query)) continue;
-        if (current == display_index) return item;
-        current += 1;
-    }
-    return null;
+    const position = modelMenuRanking(items, provider_filter, query).at(display_index) orelse return null;
+    return &items[position];
 }
 
-fn modelMenuItemMatches(
-    item: ModelMenuItem,
+/// The inverse of `modelMenuItemAt` for the first item with `id`.
+fn modelMenuDisplayIndex(
+    items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
-) bool {
-    if (!providerMatchesFilter(item.provider, provider_filter)) return false;
-    const query_text = std.mem.trim(u8, query, " \t\r\n");
-    return query_text.len == 0 or
-        text_utils.containsIgnoreCase(item.id, query_text) or
-        text_utils.containsIgnoreCase(item.provider, query_text);
+    id: []const u8,
+) ?usize {
+    const position = for (items, 0..) |item, position| {
+        if (std.mem.eql(u8, item.id, id)) break position;
+    } else return null;
+    return modelMenuRanking(items, provider_filter, query).rankOf(position);
 }
+
+/// Matches a model on its full id, provider prefix included, so one query
+/// can name both the provider and the model, and on the model's own name
+/// after the last `/`, so typing that name exactly lists it first:
+/// `gpt-4o` finds `openai/gpt-4o` before `openai/gpt-4o-mini`.
+pub fn modelIdMatch(query: []const u8, id: []const u8) ?fuzzy_match.Match {
+    const slash = std.mem.findScalarLast(u8, id, '/') orelse return fuzzy_match.match(query, &.{.{ .text = id }});
+    return fuzzy_match.match(query, &.{ .{ .text = id }, .{ .text = id[slash + 1 ..] } });
+}
+
+/// The Models menu in catalog order, without the rows outside the provider
+/// tab.
+const ModelMenuMatches = struct {
+    items: []const ModelMenuItem,
+    provider_filter: ModelProviderFilter,
+    query: []const u8,
+
+    pub fn matchAt(self: ModelMenuMatches, position: usize) ?fuzzy_match.Match {
+        const item = self.items[position];
+        if (!providerMatchesFilter(item.provider, self.provider_filter)) return null;
+        return modelIdMatch(self.query, item.id);
+    }
+};
+
+fn modelMenuRanking(
+    items: []const ModelMenuItem,
+    provider_filter: ModelProviderFilter,
+    query: []const u8,
+) fuzzy_match.Ranking(ModelMenuMatches) {
+    return .{
+        .context = .{ .items = items, .provider_filter = provider_filter, .query = query },
+        .len = items.len,
+    };
+}
+
+/// The catalog's ids matched the same way, for inline `/model` suggestions.
+const CatalogIdMatches = struct {
+    entries: []const model_catalog.ModelCatalogEntry,
+    query: []const u8,
+
+    pub fn matchAt(self: CatalogIdMatches, position: usize) ?fuzzy_match.Match {
+        return modelIdMatch(self.query, self.entries[position].id);
+    }
+};
 
 fn providerFilter(provider: []const u8) ModelProviderFilter {
     return if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
@@ -345,6 +462,11 @@ fn providerMatchesFilter(provider: []const u8, filter: ModelProviderFilter) bool
     return filter == .all or providerFilter(provider) == filter;
 }
 
+/// Whether the provider tab `filter` lists `item`, whatever is typed.
+pub fn modelProviderFilterKeeps(item: ModelMenuItem, filter: ModelProviderFilter) bool {
+    return providerMatchesFilter(item.provider, filter);
+}
+
 pub const Runtime = struct {
     const Self = @This();
 
@@ -355,8 +477,9 @@ pub const Runtime = struct {
     thread: ?std.Thread = null,
     state: ModelCacheState = .idle,
     /// A fetch is running. Only the first load for an access shows as
-    /// `.loading`; a revalidation or retry leaves the state readers see alone,
-    /// so no reader ever waits on it.
+    /// `.loading`; a revalidation or retry leaves the state readers see alone.
+    /// A request waits up to `failed_catalog_retry_wait_ms` for a failed
+    /// catalog's retry, and on nothing else but a first load.
     fetch_in_flight: bool = false,
     /// Consecutive failed fetches. A success or reset clears it.
     failure_streak: u32 = 0,
@@ -372,6 +495,16 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
     menu: ModelMenu = .{},
+    /// Whether this credential's team has Token Pass: the answer fx saved
+    /// for the team, then the credits check, the provider that served its
+    /// requests, and Token Pass denials. It resets with the catalog, since
+    /// both belong to one credential and team, and every change is published
+    /// to `token_pass_team`. Main thread only, so the mutex does not guard
+    /// it.
+    token_pass: token_pass_mod.Tracker = .{},
+    /// Counts credential changes, so a credits reply that started for an
+    /// earlier credential does not speak for this one.
+    token_pass_epoch: u32 = 0,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -387,25 +520,45 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
     }
 
-    pub fn startWarmup(
+    fn startWarmup(
         self: *Self,
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
         trigger: LoadTrigger,
     ) void {
+        self.startWarmupWithSharedSignIn(provider, access, trigger, null);
+    }
+
+    /// Starts a warmup for `access`. With a shared sign-in, the warmup fetches
+    /// with its stored token, and after a 401 tries once more with a stored
+    /// token that replaced the rejected one before it falls back to the public
+    /// list.
+    pub fn startWarmupWithSharedSignIn(
+        self: *Self,
+        provider: model_catalog.Provider,
+        access: credentials.CatalogAccess,
+        trigger: LoadTrigger,
+        shared_sign_in: ?auth_runtime.SharedSignIn,
+    ) void {
         self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
-        const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
-            self.completeFetch(.{ .failed = .{
-                .access = .init(access),
-                .anonymous_fallback_used = false,
-                .failure = .{ .category = .resource_exhausted },
-            } });
+        const failed_to_copy: model_catalog.FetchResult = .{ .failed = .{
+            .access = .init(access),
+            .anonymous_fallback_used = false,
+            .failure = .{ .category = .resource_exhausted },
+        } };
+        var owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
+            self.completeFetch(failed_to_copy);
             return;
         };
+        const owned_sign_in: ?OwnedSignIn = if (shared_sign_in) |value| OwnedSignIn.init(self.alloc, value) catch {
+            owned_access.deinit(self.alloc);
+            self.completeFetch(failed_to_copy);
+            return;
+        } else null;
 
-        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access }) catch {
+        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access, owned_sign_in }) catch {
             var failed_access = owned_access;
             const failure = model_catalog.FailedOutcome{
                 .access = .init(failed_access.access),
@@ -413,6 +566,10 @@ pub const Runtime = struct {
                 .failure = .{ .category = .runtime, .retryable = true },
             };
             failed_access.deinit(self.alloc);
+            if (owned_sign_in) |value| {
+                var failed_sign_in = value;
+                failed_sign_in.deinit(self.alloc);
+            }
             self.completeFetch(.{ .failed = failure });
             return;
         };
@@ -498,7 +655,8 @@ pub const Runtime = struct {
             self.mutex.unlock(io_mod.getIo());
             return false;
         }
-        // Only a first load blocks request resolution. A revalidation or retry
+        // A first load blocks request resolution, and a failed catalog's retry
+        // holds it for at most `failed_catalog_retry_wait_ms`. A revalidation
         // runs behind the state readers already see.
         const first_load = self.state == .idle;
         if (first_load) self.state = .loading;
@@ -541,6 +699,38 @@ pub const Runtime = struct {
         self.requested_access = null;
         self.mutex.unlock(io_mod.getIo());
         self.cancel_requested.store(false, .seq_cst);
+        if (self.token_pass.status != .unknown) {
+            debug_trace.logf("catalog", "token pass status reset reason=credential_changed", .{});
+        }
+        self.token_pass = .{};
+        token_pass_team.clear();
+        self.token_pass_epoch +%= 1;
+    }
+
+    /// Starts this credential's status from the answer fx saved for its
+    /// team, before the credits check answers.
+    pub fn adoptSavedTokenPass(self: *Self, saved: ?token_pass_mod.Answer) void {
+        self.token_pass = token_pass_mod.Tracker.fromSaved(saved);
+        if (saved != null) debug_trace.logf("catalog", "token pass status={t} source=saved", .{self.token_pass.status});
+        token_pass_team.publishAnswer(saved, false);
+    }
+
+    /// Records what AI Gateway said about this team; `source` names how,
+    /// for the trace.
+    pub fn observeTokenPassAnswer(self: *Self, answer: token_pass_mod.Answer, source: []const u8) void {
+        // Published even when the status stays: an answer AI Gateway gives
+        // in this run outranks the catalog's marks from then on.
+        token_pass_team.publishAnswer(answer, !std.mem.eql(u8, source, token_pass_team.catalog_source));
+        const changed = switch (answer) {
+            .has_pass => self.token_pass.observeCredit(),
+            .no_pass => self.token_pass.observeNoPass(),
+        };
+        if (!changed) return;
+        debug_trace.logf("catalog", "token pass status={t} source={s}", .{ self.token_pass.status, source });
+    }
+
+    pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
+        return self.token_pass.status;
     }
 
     pub fn resetForProviderChange(self: *Self) void {
@@ -570,6 +760,7 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
+        token_pass_team.publishCatalog(self.catalog.items);
         self.outcome = .{ .loaded = .{
             .access = model_catalog.AccessMetadata.init(access),
         } };
@@ -636,6 +827,17 @@ pub const Runtime = struct {
         return self.state == .failed;
     }
 
+    /// Why the catalog is down, or null while it loads, after it loaded, or
+    /// when a failed refresh kept the earlier catalog.
+    pub fn downFailure(self: *Self) ?model_catalog.FailureCategory {
+        self.finishThreadIfDone();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.state != .failed) return null;
+        const failed = self.outcome.last_failure orelse return .runtime;
+        return failed.failure.category;
+    }
+
     pub fn snapshotCachedModelIds(self: *Self, alloc: Allocator) !?std.ArrayList([]u8) {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -689,6 +891,7 @@ pub const Runtime = struct {
         model: []const u8,
         cancel_flag: *std.atomic.Value(bool),
     ) model_capabilities.ResolveError!model_capabilities.Capabilities {
+        var retry_wait_until_ms: ?i64 = null;
         while (true) {
             self.finishThreadIfDone();
             self.mutex.lockUncancelable(io_mod.getIo());
@@ -709,9 +912,19 @@ pub const Runtime = struct {
                 }
                 return model_capabilities.resolveCapabilities(model, metadata);
             }
+            // A request waits a moment for a failed catalog's retry, such as
+            // the one a submitted prompt starts, so a retry that lands quickly
+            // gives this request its limits. A slow retry never holds it.
+            const retry_in_flight = state == .failed and self.fetch_in_flight;
             self.mutex.unlock(io_mod.getIo());
+            const wait_for_retry = retry_in_flight and wait: {
+                const now = model_catalog.clockMs();
+                const until = retry_wait_until_ms orelse now + failed_catalog_retry_wait_ms;
+                retry_wait_until_ms = until;
+                break :wait now < until;
+            };
 
-            switch (state) {
+            switch (if (wait_for_retry) .loading else state) {
                 .loading => {
                     if (cancel_flag.load(.seq_cst)) {
                         debug_trace.logf(
@@ -751,19 +964,23 @@ pub const Runtime = struct {
         return entry.id;
     }
 
+    /// Fills `out` with catalog ids that match `query`, ranked like the model
+    /// menu, and returns how many it wrote. The ids borrow catalog storage.
     pub fn modelCompletions(self: *Self, query: []const u8, out: [][]const u8) usize {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.state != .ready) return 0;
 
+        const ranking: fuzzy_match.Ranking(CatalogIdMatches) = .{
+            .context = .{ .entries = self.catalog.items, .query = query },
+            .len = self.catalog.items.len,
+        };
+        var matches = ranking.iterator();
         var count: usize = 0;
-        for (self.catalog.items) |entry| {
-            if (count >= out.len) break;
-            if (query.len == 0 or text_utils.containsIgnoreCase(entry.id, query)) {
-                out[count] = entry.id;
-                count += 1;
-            }
+        while (count < out.len) : (count += 1) {
+            const position = matches.next() orelse break;
+            out[count] = self.catalog.items[position].id;
         }
         return count;
     }
@@ -772,15 +989,36 @@ pub const Runtime = struct {
         self: *Self,
         provider: model_catalog.Provider,
         owned_access: OwnedCatalogAccess,
+        owned_sign_in: ?OwnedSignIn,
     ) void {
         var access = owned_access;
         defer access.deinit(self.alloc);
+        var sign_in = owned_sign_in;
+        defer if (sign_in) |*value| value.deinit(self.alloc);
+
+        var fetch_access = access.access;
+        var stored: ?CatalogSignIn = null;
+        defer if (stored) |*active| active.deinit();
+        if (sign_in) |value| {
+            if (fetch_access.authorizationCredential()) |current| {
+                if (fetch_access.credentialSource() == value.sign_in.source) {
+                    stored = .{ .alloc = self.alloc, .sign_in = value.sign_in };
+                    if (stored) |*active| {
+                        if (active.storedToken(current)) |token| {
+                            debug_trace.logf("catalog", "model catalog uses the stored credential reason=newer", .{});
+                            fetch_access = fetch_access.withCredential(token);
+                        }
+                    }
+                }
+            }
+        }
 
         self.completeFetch(model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
-            .access = access.access,
+            .access = fetch_access,
             .endpoint = self.models_path,
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
+            .renew_after_rejection = if (stored) |*active| active.hook() else null,
         }));
     }
 
@@ -843,6 +1081,7 @@ pub const Runtime = struct {
                     model_catalog.freeModelCatalog(self.alloc, &self.catalog);
                     self.catalog = catalog;
                     self.outcome = .{ .loaded = loaded.provenance };
+                    token_pass_team.publishCatalog(self.catalog.items);
                 }
                 self.state = .ready;
                 return .{ .ready = .{
@@ -904,7 +1143,7 @@ pub const Runtime = struct {
                 // A retry runs behind the failed state; the picker shows it.
                 menu.load_state = if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, self.token_pass.hasPass()),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
@@ -943,10 +1182,31 @@ fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) M
     };
 }
 
+fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry: model_catalog.ModelCatalogEntry) !void {
+    const id = try alloc.dupe(u8, entry.id);
+    const item: ModelMenuItem = .{
+        .id = id,
+        .provider = modelProvider(id),
+        .capabilities = model_capabilities.resolveCapabilities(
+            id,
+            model_catalog_metadata.fromCatalogEntry(entry),
+        ),
+        .token_pass = entry.token_pass,
+    };
+    items.append(alloc, item) catch |err| {
+        item.deinit(alloc);
+        return err;
+    };
+}
+
+/// Fills `menu` from `catalog`, in catalog order. With `token_pass_first`,
+/// for a team that has Token Pass, the models the catalog marks as paid by
+/// its Token Pass lead the list, in catalog order.
 fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    token_pass_first: bool,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
@@ -955,23 +1215,14 @@ fn hydrateMenuSnapshot(
     }
     try items.ensureTotalCapacity(alloc, catalog.len);
 
+    if (token_pass_first) {
+        for (catalog) |entry| {
+            if (entry.token_pass) try appendMenuItem(alloc, &items, entry);
+        }
+    }
     for (catalog) |entry| {
-        const item = item: {
-            const id = try alloc.dupe(u8, entry.id);
-            errdefer alloc.free(id);
-            break :item ModelMenuItem{
-                .id = id,
-                .provider = modelProvider(id),
-                .capabilities = model_capabilities.resolveCapabilities(
-                    id,
-                    model_catalog_metadata.fromCatalogEntry(entry),
-                ),
-            };
-        };
-        items.append(alloc, item) catch |err| {
-            item.deinit(alloc);
-            return err;
-        };
+        if (token_pass_first and entry.token_pass) continue;
+        try appendMenuItem(alloc, &items, entry);
     }
 
     // A revalidated catalog replaces rows under an open menu; keep the
@@ -983,13 +1234,9 @@ fn hydrateMenuSnapshot(
         .all;
     const selected_index = if (!previous_ready) 0 else selected: {
         const previous = menu.itemAt(menu.selected_index) orelse break :selected 0;
-        var display_index: usize = 0;
-        for (items.items) |item| {
-            if (!modelMenuItemMatches(item, filter, menu.query())) continue;
-            if (std.mem.eql(u8, item.id, previous.id)) break :selected display_index;
-            display_index += 1;
-        }
-        break :selected @min(menu.selected_index, display_index -| 1);
+        if (modelMenuDisplayIndex(items.items, filter, menu.query(), previous.id)) |index| break :selected index;
+        const match_count = modelMenuFilteredItemCount(items.items, filter, menu.query());
+        break :selected @min(menu.selected_index, match_count -| 1);
     };
     // Shift the window with the selection so its row stays put on screen.
     const window_start = if (previous_ready)
@@ -1347,7 +1594,7 @@ test "model picker revalidates past the reopen floor while activity waits for th
     }
 }
 
-test "model cache retries a failed catalog behind the failed state so requests never wait on it" {
+test "model cache retries a failed catalog behind the failed state so requests wait on it only briefly" {
     const public: credentials.CatalogAccess = .{ .public_only = .no_credential };
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");
     defer runtime.deinit();
@@ -1365,10 +1612,17 @@ test "model cache retries a failed catalog behind the failed state so requests n
     try std.testing.expect(runtime.isFailed());
     try std.testing.expect(!runtime.isLoading());
 
-    // A set cancel flag fails any wait at once, so a returned value proves
-    // the request resolved without waiting on the retry.
+    // A set cancel flag fails any wait at once, so the error proves the
+    // request waits on the retry.
     var cancelled = std.atomic.Value(bool).init(true);
-    _ = try runtime.resolveForRequest("first", &cancelled);
+    try std.testing.expectError(error.Cancelled, runtime.resolveForRequest("first", &cancelled));
+    // A retry that has not landed holds a request only for the bound.
+    var live = std.atomic.Value(bool).init(false);
+    const started_ms = model_catalog.clockMs();
+    const unresolved = try runtime.resolveForRequest("first", &live);
+    try std.testing.expect(model_catalog.clockMs() - started_ms >= failed_catalog_retry_wait_ms);
+    try std.testing.expectEqual(@as(?u32, null), unresolved.max_output_tokens);
+    try std.testing.expect(fetchInFlight(&runtime));
     try runtime.openMenu();
     try std.testing.expectEqual(ModelMenuLoadState.loading, runtime.menu.load_state);
 
@@ -1483,6 +1737,100 @@ test "open model menu keeps its provider tab and selection when a revalidated ca
     try std.testing.expectEqual(ModelProviderFilter.all, runtime.menu.providerFilter());
     try std.testing.expectEqualStrings("anthropic/c", runtime.menu.itemAt(runtime.menu.selected_index).?.id);
     try std.testing.expectEqual(@as(usize, 0), runtime.menu.window_start);
+}
+
+/// Lists `private/model` only for `accepted`, and `public/model` without a
+/// token. When `rotate_to` is set, the first authenticated fetch finds the
+/// login renewed by another fx process: the store gets that token, and the
+/// provider rejects the one sent.
+const SharedLoginCatalog = struct {
+    home: *stored_login_testing.StoredLoginHome,
+    accepted: []const u8,
+    rotate_to: ?[]const u8 = null,
+    sent: [3][32]u8 = undefined,
+    sent_len: [3]usize = .{ 0, 0, 0 },
+    calls: usize = 0,
+
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+        const self: *SharedLoginCatalog = @ptrCast(@alignCast(raw.?));
+        const token = input.access.authorizationCredential() orelse "";
+        std.debug.assert(self.calls < self.sent.len and token.len <= self.sent[0].len);
+        @memcpy(self.sent[self.calls][0..token.len], token);
+        self.sent_len[self.calls] = token.len;
+        self.calls += 1;
+        if (token.len == 0) return .{ .catalog = try testCatalog(alloc, "public/model") };
+        if (self.calls == 1) if (self.rotate_to) |rotated| self.home.store(rotated, "team-a", stored_login_testing.far_future_ms) catch unreachable;
+        if (std.mem.eql(u8, token, self.accepted)) return .{ .catalog = try testCatalog(alloc, "private/model") };
+        return .{ .failure = model_catalog.failureForHttpStatus(.unauthorized) };
+    }
+
+    fn provider(self: *SharedLoginCatalog) model_catalog.Provider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+
+    fn sentToken(self: *const SharedLoginCatalog, index: usize) []const u8 {
+        return self.sent[index][0..self.sent_len[index]];
+    }
+};
+
+test "model cache fetches with the stored token of a shared sign-in and never refreshes it" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    const access = credentials.catalogAccessForCredential(.fx_login, "launch-token", "team-a");
+    const sign_in: auth_runtime.SharedSignIn = .{ .source = .fx_login, .team = "team-a" };
+
+    // Another fx process refreshed the login after this one read it.
+    {
+        try home.store("other-fx-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "other-fx-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+        try std.testing.expectEqualStrings("other-fx-token", catalog.sentToken(0));
+        try std.testing.expect(!runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // ...or between the read and the fetch: one more fetch with its token.
+    {
+        try home.store("read-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "rotated-token", .rotate_to = "rotated-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 2), catalog.calls);
+        try std.testing.expectEqualStrings("read-token", catalog.sentToken(0));
+        try std.testing.expectEqualStrings("rotated-token", catalog.sentToken(1));
+        try std.testing.expect(!runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // The store still holds the rejected token: the public list, with no
+    // refresh and no second authenticated fetch.
+    {
+        try home.store("revoked-token", "team-a", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "never" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 2), catalog.calls);
+        try std.testing.expectEqualStrings("revoked-token", catalog.sentToken(0));
+        try std.testing.expectEqualStrings("", catalog.sentToken(1));
+        try std.testing.expect(runtime.outcome.loaded.?.anonymous_fallback_used);
+    }
+    // Another team's stored login is never sent.
+    {
+        try home.store("team-b-token", "team-b", stored_login_testing.far_future_ms);
+        var runtime = Runtime.init(alloc, "/v1/models");
+        defer runtime.deinit();
+        var catalog = SharedLoginCatalog{ .home = &home, .accepted = "launch-token" };
+        runtime.startWarmupWithSharedSignIn(catalog.provider(), access, .activity, sign_in);
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+        try std.testing.expectEqualStrings("launch-token", catalog.sentToken(0));
+    }
 }
 
 test "model cache projects anonymous fallback provenance for 401 and 403" {
@@ -1870,7 +2218,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
         },
     };
     runtime.state = .ready;
-    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries);
+    try hydrateMenuSnapshot(alloc, &runtime.menu, &entries, false);
     runtime.menu.active = true;
 
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
@@ -1910,6 +2258,128 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expectEqualStrings("standalone", selected);
 }
 
+test "model menu leads with the models the catalog marks as Token Pass, for a team with Token Pass" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language") },
+        .{ .id = @constCast("acme/new-pass-model"), .model_type = @constCast("language"), .token_pass = true },
+        .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language") },
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .token_pass = true },
+    };
+    var menu: ModelMenu = .{};
+    defer menu.deinit(alloc);
+
+    // The marks, not a list in fx, pick the models, in catalog order.
+    try hydrateMenuSnapshot(alloc, &menu, &entries, true);
+    const led = [_][]const u8{ "acme/new-pass-model", "zai/glm-5.3", "openai/gpt-6", "deepseek/deepseek-v4.1-flash" };
+    for (led, menu.items.items) |id, item| {
+        try std.testing.expectEqualStrings(id, item.id);
+        try std.testing.expectEqual(std.mem.eql(u8, id, "acme/new-pass-model") or std.mem.eql(u8, id, "zai/glm-5.3"), item.token_pass);
+    }
+
+    // Without Token Pass the catalog order stands.
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    for (entries, menu.items.items) |entry, item| try std.testing.expectEqualStrings(entry.id, item.id);
+}
+
+test "model menu ranks fuzzy matches below verbatim ones and keeps the selection" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-4.5-preview"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-5"), .model_type = @constCast("language") },
+        .{ .id = @constCast("anthropic/claude-opus-4.8"), .model_type = @constCast("language") },
+        .{ .id = @constCast("acme/gpt5-lite"), .model_type = @constCast("language") },
+    };
+    var menu: ModelMenu = .{};
+    defer menu.deinit(alloc);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    menu.active = true;
+
+    menu.setQuery("gpt5");
+    try std.testing.expectEqual(@as(usize, 3), menu.filteredItemCount());
+    try std.testing.expectEqualStrings("acme/gpt5-lite", menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", menu.itemAt(2).?.id);
+    try std.testing.expect(menu.itemAt(3) == null);
+
+    menu.provider_index = @backingInt(ModelProviderFilter.openai);
+    try std.testing.expectEqual(@as(usize, 2), menu.filteredItemCount());
+    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", menu.itemAt(1).?.id);
+    menu.provider_index = @backingInt(ModelProviderFilter.all);
+
+    try std.testing.expect(menu.moveVisibleItems(1, 3));
+    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
+
+    // A revalidated catalog that adds a better match keeps the cursor on the
+    // same model even though its row moves down.
+    const revalidated = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("acme/gpt5-pro"), .model_type = @constCast("language") },
+    } ++ entries;
+    try hydrateMenuSnapshot(alloc, &menu, &revalidated, false);
+    try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
+    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
+}
+
+test "a model's own name ranks it above longer ids that contain it" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-4o-mini"), .model_type = @constCast("language") },
+        .{ .id = @constCast("azure/gpt-4o-mini-tts"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-4o"), .model_type = @constCast("language") },
+        .{ .id = @constCast("standalone"), .model_type = @constCast("language") },
+    };
+    var menu: ModelMenu = .{};
+    defer menu.deinit(alloc);
+    try hydrateMenuSnapshot(alloc, &menu, &entries, false);
+    menu.active = true;
+
+    menu.setQuery("GPT-4o");
+    try std.testing.expectEqual(@as(usize, 3), menu.filteredItemCount());
+    try std.testing.expectEqualStrings("openai/gpt-4o", menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-4o-mini", menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("azure/gpt-4o-mini-tts", menu.itemAt(2).?.id);
+
+    menu.setQuery("stand");
+    try std.testing.expectEqualStrings("standalone", menu.itemAt(0).?.id);
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .prefix, .field = 0 }), modelIdMatch("stand", "standalone"));
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .exact, .field = 1 }), modelIdMatch("gpt-4o", "openai/gpt-4o"));
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .substring, .field = 0 }), modelIdMatch("ai/gpt", "openai/gpt-4o"));
+}
+
+test "model completions rank fuzzy matches below verbatim ones" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    for ([_][]const u8{
+        "openai/gpt-4.5-preview",
+        "openai/gpt-5",
+        "anthropic/claude-opus-4.8",
+        "acme/gpt5-lite",
+    }) |model| {
+        const id = try alloc.dupe(u8, model);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try runtime.catalog.append(alloc, .{ .id = id, .model_type = model_type });
+    }
+    runtime.state = .ready;
+
+    var completions: [4][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), runtime.modelCompletions("gpt5", &completions));
+    try std.testing.expectEqualStrings("acme/gpt5-lite", completions[0]);
+    try std.testing.expectEqualStrings("openai/gpt-5", completions[1]);
+    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", completions[2]);
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.modelCompletions("gpt5", completions[0..2]));
+    try std.testing.expectEqualStrings("openai/gpt-5", completions[1]);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.modelCompletions("anthropic opus", &completions));
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.8", completions[0]);
+    try std.testing.expectEqual(@as(usize, 4), runtime.modelCompletions("", &completions));
+    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", completions[0]);
+}
+
 test "model menu provider navigation skips absent and redundant filters" {
     const alloc = std.testing.allocator;
     const mixed_entries = [_]model_catalog.ModelCatalogEntry{
@@ -1918,7 +2388,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var mixed: ModelMenu = .{};
     defer mixed.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries);
+    try hydrateMenuSnapshot(alloc, &mixed, &mixed_entries, false);
     mixed.active = true;
 
     try std.testing.expect(mixed.moveProvider(1));
@@ -1934,7 +2404,7 @@ test "model menu provider navigation skips absent and redundant filters" {
     };
     var codex: ModelMenu = .{};
     defer codex.deinit(alloc);
-    try hydrateMenuSnapshot(alloc, &codex, &codex_entries);
+    try hydrateMenuSnapshot(alloc, &codex, &codex_entries, false);
     codex.active = true;
 
     try std.testing.expect(!codex.moveProvider(1));
@@ -1950,14 +2420,14 @@ test "model menu snapshot construction cleans every allocation failure" {
 
     var probe = std.testing.FailingAllocator.init(backing, .{});
     var menu: ModelMenu = .{};
-    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries);
+    try hydrateMenuSnapshot(probe.allocator(), &menu, &entries, false);
     menu.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
         var failed_menu: ModelMenu = .{};
-        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries)) {
+        if (hydrateMenuSnapshot(failing.allocator(), &failed_menu, &entries, false)) {
             failed_menu.deinit(failing.allocator());
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(failing.has_induced_failure);

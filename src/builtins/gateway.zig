@@ -14,6 +14,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const gateway_client = @import("../gateway/client.zig");
+const chat_completions_protocol = @import("../gateway/chat_completions_protocol.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -34,7 +35,7 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
-const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8) anyerror!gateway_client.GetResult;
+const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8, *std.atomic.Value(bool)) anyerror!gateway_client.GetResult;
 
 const Request = web_search_contract.ProviderRequest;
 const Response = web_search_contract.ProviderResponse;
@@ -49,8 +50,8 @@ pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
 pub const default_model_catalog_base_url = "https://ai-gateway.vercel.sh";
 const base_url_env = "FX_GATEWAY_BASE_URL";
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
-const oauth_request_timeout_ms: i64 = 15_000;
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
+const oauth_request_timeout_ms = oauth_transport.default_request_timeout_ms;
 const oauth_response_max_bytes: usize = 64 * 1024;
 
 const web_search_system_prompt = "Research the user's query with the web_search tool and preserve sources for citation.";
@@ -195,6 +196,9 @@ pub fn buildAgentRequest(
     defer alloc.free(prompt);
     @memcpy(prompt[0..request.instructions.len], request.instructions);
     @memcpy(prompt[request.instructions.len..], projected orelse request.messages);
+    var provider_options = request.provider_options;
+    provider_options.cache_markers = vercel_model_policy.cacheMarkers(request.model);
+    provider_options.single_system_message = vercel_model_policy.singleSystemMessage(request.model);
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -204,7 +208,7 @@ pub fn buildAgentRequest(
             tools_json,
             prompt,
             images,
-            request.provider_options,
+            provider_options,
             request.tool_choice,
             .{
                 .name = response_format.name,
@@ -223,7 +227,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
                 active,
@@ -233,7 +237,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
             );
@@ -246,7 +250,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
                 active,
             )
@@ -255,7 +259,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
             );
         return finalizeAgentRequestBody(alloc, request.model, try body);
@@ -419,6 +423,109 @@ test "agent request builder keeps default reasoning silent and emits output limi
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("providerOptions") == null);
+}
+
+test "agent request builder sends stable cache markers in each family's syntax" {
+    const alloc = std.testing.allocator;
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "stable base", .cache_breakpoint = true },
+        .{ .role = .system, .content = "turn context" },
+    };
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    for ([_]struct { model: []const u8, anthropic: usize, openai: usize, bedrock: usize = 0 }{
+        .{ .model = "anthropic/claude-sonnet-5.5", .anthropic = 1, .openai = 0 },
+        .{ .model = "openai/gpt-6.1-sol", .anthropic = 0, .openai = 1 },
+        .{ .model = "openai/gpt-5.6-luna", .anthropic = 0, .openai = 1 },
+        .{ .model = "amazon/nova-pro", .anthropic = 0, .openai = 0, .bedrock = 1 },
+        .{ .model = "amazon/nova-2-lite", .anthropic = 0, .openai = 0, .bedrock = 1 },
+        .{ .model = "openai/gpt-5", .anthropic = 0, .openai = 0 },
+        .{ .model = "google/gemini-3-flash", .anthropic = 0, .openai = 0 },
+    }) |case| {
+        var options = resolveGatewayProviderOptions(case.model, .auto, false);
+        options.prompt_caching = true;
+        const body = try buildAgentRequest(alloc, .{
+            .model = case.model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = options,
+        });
+        defer alloc.free(body);
+        try std.testing.expectEqual(case.anthropic, std.mem.count(u8, body, "\"cacheControl\""));
+        try std.testing.expectEqual(case.openai, std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+        try std.testing.expectEqual(case.bedrock, std.mem.count(u8, body, "\"cachePoint\""));
+        // The caller's instructions are not modified.
+        try std.testing.expect(instructions[0].cache_breakpoint);
+    }
+}
+
+test "agent requests carry delivered rules in the tool result for every family, without cache markers (D93)" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const instructions = [_]shared_types.ChatMessage{.{ .role = .system, .content = "stable base", .cache_breakpoint = true }};
+    const calls = [_]shared_types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"sub/notes.md\"}" }};
+    const messages = [_]shared_types.ChatMessage{
+        .{ .role = .user, .content = "question" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "notes", .tool_call_id = "call_1", .tool_name = "read_file" },
+        .{ .role = .system, .content = "<scoped-rules from=\"sub/AGENTS.md\" scope=\"sub\">tabs</scoped-rules>", .context_note = true },
+    };
+    const sent = try agent_stream_provider_contract.carryContextNotes(arena, &messages);
+    const carried = "\"value\":\"notes\\n\\n<scoped-rules from=\\\"sub/AGENTS.md\\\" scope=\\\"sub\\\">tabs</scoped-rules>\"";
+    for ([_][]const u8{
+        "anthropic/claude-sonnet-5.5",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-5",
+        "spacexai/grok-4.7",
+        "moonshotai/kimi-k3",
+        "alibaba/qwen3.8-max",
+        "meta/llama-4-maverick",
+        "amazon/nova-pro",
+    }) |model| {
+        var options = resolveGatewayProviderOptions(model, .auto, false);
+        options.prompt_caching = true;
+        const body = try buildAgentRequest(arena, .{
+            .model = model,
+            .instructions = &instructions,
+            .messages = sent,
+            .tool_choice = .auto,
+            .provider_options = options,
+        });
+        // The rules end the tool result's text, and the instructions are the
+        // request's only system message.
+        try std.testing.expect(std.mem.find(u8, body, carried) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"role\":\"system\""));
+        // Only the stable instructions carry a marker, for the families fx marks.
+        const markers: usize = @intFromBool(vercel_model_policy.cacheMarkers(model) != .none);
+        try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\"") + std.mem.count(u8, body, "\"cachePoint\""));
+    }
+}
+
+test "agent requests to Qwen send the instructions as one system message" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "stable base" },
+        .{ .role = .system, .content = "turn context" },
+    };
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    for ([_]struct { model: []const u8, systems: usize }{
+        .{ .model = "alibaba/qwen3.8-max", .systems = 1 },
+        .{ .model = "zai/glm-5.3", .systems = 2 },
+    }) |case| {
+        const body = try buildAgentRequest(arena, .{
+            .model = case.model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = resolveGatewayProviderOptions(case.model, .auto, false),
+        });
+        try std.testing.expectEqual(case.systems, std.mem.count(u8, body, "{\"role\":\"system\""));
+    }
 }
 
 test "agent request builder scopes the product user agent to GLM 5.2" {
@@ -594,8 +701,9 @@ fn streamAgentCompletion(
         .content_capture_limit = request.content_capture_limit,
         .delivery = request.delivery,
         .admission = request.admission,
-        .on_reasoning_chunk = EventBridge.reasoning,
-        .on_tool_input_chunk = EventBridge.toolInput,
+        .on_reasoning_chunk = agent_stream_provider_contract.EventSink.onReasoningChunk,
+        .on_tool_input_chunk = agent_stream_provider_contract.EventSink.onToolInputChunk,
+        .on_tool_input_progress = agent_stream_provider_contract.EventSink.onToolInputProgress,
         .provider_attempt_owner = switch (request.provider_attempt_owner) {
             .transport => .transport,
             .agent => .agent,
@@ -607,8 +715,8 @@ fn streamAgentCompletion(
             alloc,
             stream_request,
             &events,
-            EventBridge.content,
-            EventBridge.toolStart,
+            agent_stream_provider_contract.EventSink.onContentChunk,
+            agent_stream_provider_contract.EventSink.onToolStart,
             deadline,
             request.cancel_flag,
         )
@@ -617,8 +725,8 @@ fn streamAgentCompletion(
             alloc,
             stream_request,
             &events,
-            EventBridge.content,
-            EventBridge.toolStart,
+            agent_stream_provider_contract.EventSink.onContentChunk,
+            agent_stream_provider_contract.EventSink.onToolStart,
             request.cancel_flag,
         )) catch |err| {
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
@@ -631,48 +739,32 @@ fn streamAgentCompletion(
         vercel_failure_diagnostics.FailureDiagnostics{}
     else
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
-    if (result.status != .ok) return .{ .failed = .{
-        .kind = gatewayFailureKind(alloc, result.status, result.err_body),
-        .detail = result.err_body,
-        .diagnostics = .{
-            .schema = diagnostics.schema,
-            .request_shape = diagnostics.request_shape,
+    if (result.status != .ok) return .{
+        .failed = .{
+            .kind = gatewayFailureKind(alloc, result.status, result.err_body),
+            .http_status = result.status,
+            // The body can echo the credential it refused, and it reaches the
+            // screen and the trace.
+            .detail = if (result.err_body) |body| try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret() orelse "") else null,
+            .diagnostics = .{
+                .schema = diagnostics.schema,
+                .request_shape = diagnostics.request_shape,
+            },
+            .retry_after_seconds = result.retry_after_seconds,
+            .ownership = .owned,
         },
-        .retry_after_seconds = result.retry_after_seconds,
-        .ownership = .owned,
-    } };
+    };
     return .{ .completed = .{
         .completion = result.completion,
         .ownership = .owned,
     } };
 }
 
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *agent_stream_provider_contract.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
 /// Gateway reports the last provider it tried, so a provider's size rejection
-/// can arrive as a 400 from a later fallback. Classify it as too large.
+/// can arrive as a 400 from a later fallback. Classify it as too large. A 429
+/// whose body names a used-up quota is not a rate limit a wait outlives.
 fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
-    const kind = failureKind(status);
+    const kind = gateway_client.httpFailureKind(alloc, agent_stream_provider_contract.FailureKind.fromHttpStatus(status), err_body);
     if (kind != .invalid_request) return kind;
     const body = err_body orelse return kind;
     return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
@@ -688,19 +780,14 @@ test "Gateway 400 with a provider 413 attempt is a size failure" {
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
 }
 
-fn failureKind(status: std.http.Status) agent_stream_provider_contract.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
+test "Gateway 429 naming a used-up quota is not a rate limit" {
+    const alloc = std.testing.allocator;
+    const quota_body = "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}";
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.quota_exhausted, gatewayFailureKind(alloc, .too_many_requests, quota_body));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, "{\"error\":{\"code\":\"rate_limit_exceeded\"}}"));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, null));
+    // Only a 429 changes kind.
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.forbidden, gatewayFailureKind(alloc, .forbidden, quota_body));
 }
 
 fn fetchCredits(
@@ -714,11 +801,13 @@ fn fetchCredits(
     if (input.credential_source == .grok_subscription) {
         return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Grok subscription.");
     }
+    var local_cancel = std.atomic.Value(bool).init(false);
     return fetchCreditsWithFetch(
         alloc,
         input.credential,
         input.tenant,
-        gateway_client.fetchGatewayGetResult,
+        input.cancel_flag orelse &local_cancel,
+        gateway_client.fetchGatewayGetResultCancellable,
     );
 }
 
@@ -731,6 +820,7 @@ fn fetchCreditsWithFetch(
     alloc: Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
+    cancel_flag: *std.atomic.Value(bool),
     fetch_fn: FetchGatewayGetResultFn,
 ) output_contracts.CreditsSnapshot {
     var team_path: ?[]u8 = null;
@@ -745,7 +835,7 @@ fn fetchCreditsWithFetch(
         }
     }
 
-    var result = fetch_fn(alloc, api_key, team_path orelse credits_path) catch {
+    var result = fetch_fn(alloc, api_key, team_path orelse credits_path, cancel_flag) catch {
         return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
     };
     defer result.deinit(alloc);
@@ -782,14 +872,140 @@ fn creditsSnapshotFromJsonValue(
     if (obj.get("balance")) |field| {
         if (field == .string) snapshot.balance = try alloc.dupe(u8, field.string);
     }
-    if (obj.get("used")) |field| {
-        if (field == .string) snapshot.used = try alloc.dupe(u8, field.string);
+    // The Gateway reports spend as `total_used`; older responses named it `used`.
+    for ([_][]const u8{ "total_used", "used" }) |key| {
+        const field = obj.get(key) orelse continue;
+        if (field != .string) continue;
+        snapshot.used = try alloc.dupe(u8, field.string);
+        break;
     }
     if (obj.get("plan")) |field| {
         if (field == .string) snapshot.plan = try alloc.dupe(u8, field.string);
     }
+    // The team's Token Pass credit, or null when it has no active Token Pass.
+    if (obj.get("token_pass")) |field| switch (field) {
+        .null => snapshot.no_token_pass = true,
+        .object => |credit| snapshot.token_pass = try tokenPassCreditFromJson(alloc, credit),
+        else => {},
+    };
 
     return snapshot;
+}
+
+/// The Token Pass credit in a credits reply, owned by the caller. AI Gateway
+/// sends the object to every team with an active Token Pass, with a
+/// `remaining` of "0" once the credit is used up and null when it cannot
+/// read the balance. The values reach the terminal, so only a plain amount
+/// and an ISO 8601 time are kept; anything else reads as unknown.
+fn tokenPassCreditFromJson(alloc: Allocator, credit: std.json.ObjectMap) !output_contracts.CreditsSnapshot.TokenPassCredit {
+    const remaining = if (jsonString(credit.get("remaining"))) |value| (if (isCreditAmount(value)) value else null) else null;
+    const resets_at = if (jsonString(credit.get("resets_at"))) |value| (if (isIsoTime(value)) value else null) else null;
+
+    const owned_remaining = if (remaining) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (owned_remaining) |value| alloc.free(value);
+    return .{
+        .remaining = owned_remaining,
+        .resets_at = if (resets_at) |value| try alloc.dupe(u8, value) else null,
+    };
+}
+
+fn jsonString(value: ?std.json.Value) ?[]const u8 {
+    const field = value orelse return null;
+    return if (field == .string) field.string else null;
+}
+
+/// A decimal amount such as `79.92906` or `-1`.
+fn isCreditAmount(text: []const u8) bool {
+    if (text.len == 0 or text.len > 32) return false;
+    const digits = if (text[0] == '-') text[1..] else text;
+    var seen_digit = false;
+    var seen_point = false;
+    for (digits) |byte| switch (byte) {
+        '0'...'9' => seen_digit = true,
+        '.' => {
+            if (seen_point) return false;
+            seen_point = true;
+        },
+        else => return false,
+    };
+    return seen_digit;
+}
+
+/// A time such as `2026-12-05T08:00:00.000Z`.
+fn isIsoTime(text: []const u8) bool {
+    if (text.len == 0 or text.len > 40) return false;
+    for (text) |byte| switch (byte) {
+        '0'...'9', 'T', 'Z', ':', '.', '-', '+' => {},
+        else => return false,
+    };
+    return true;
+}
+
+test "built-in credits provider reads the Token Pass credit" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"balance\":\"12.50\",\"token_pass\":{\"remaining\":\"79.92906\",\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+    var snapshot = try creditsSnapshotFromJsonValue(std.testing.allocator, parsed.value);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("79.92906", snapshot.token_pass.?.remaining.?);
+    try std.testing.expectEqualStrings("2026-12-05T08:00:00.000Z", snapshot.token_pass.?.resets_at.?);
+    try std.testing.expect(!snapshot.no_token_pass);
+
+    // An explicit null: the team has no active Token Pass. A reply from
+    // before the field existed says nothing either way.
+    for ([_]struct { body: []const u8, no_token_pass: bool }{
+        .{ .body = "{\"balance\":\"1\",\"token_pass\":null}", .no_token_pass = true },
+        .{ .body = "{\"balance\":\"1\"}", .no_token_pass = false },
+    }) |case| {
+        var none = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.body, .{});
+        defer none.deinit();
+        var without = try creditsSnapshotFromJsonValue(std.testing.allocator, none.value);
+        defer without.deinit(std.testing.allocator);
+        try std.testing.expect(without.token_pass == null);
+        try std.testing.expectEqual(case.no_token_pass, without.no_token_pass);
+    }
+
+    // An object means an active Token Pass whatever its amount says: used
+    // up is "0", and a balance the Gateway could not read, or a value that
+    // could forge lines or drive the terminal, reads as unknown.
+    for ([_]struct { body: []const u8, remaining: ?[]const u8 }{
+        .{ .body = "{\"token_pass\":{\"remaining\":\"0\",\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}", .remaining = "0" },
+        .{ .body = "{\"token_pass\":{\"remaining\":null,\"resets_at\":\"2026-12-05T08:00:00.000Z\"}}", .remaining = null },
+        .{ .body = "{\"balance\":\"1\",\"token_pass\":{\"remaining\":79}}", .remaining = null },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"79\\n[credits] balance=999999\"}}", .remaining = null },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"\\u001b]52;c;aGk=\\u0007\"}}", .remaining = null },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"1.2.3\"}}", .remaining = null },
+        .{ .body = "{\"token_pass\":{\"remaining\":\"123456789012345678901234567890123\"}}", .remaining = null },
+    }) |case| {
+        var active = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.body, .{});
+        defer active.deinit();
+        var with = try creditsSnapshotFromJsonValue(std.testing.allocator, active.value);
+        defer with.deinit(std.testing.allocator);
+        const credit = with.token_pass orelse return error.TestExpectedTokenPass;
+        if (case.remaining) |expected| {
+            try std.testing.expectEqualStrings(expected, credit.remaining.?);
+        } else {
+            try std.testing.expect(credit.remaining == null);
+        }
+        try std.testing.expect(!with.no_token_pass);
+    }
+
+    // A malformed reset time drops only the time.
+    var bad_time = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"token_pass\":{\"remaining\":\"5\",\"resets_at\":\"soon\\u001b[2K\"}}",
+        .{},
+    );
+    defer bad_time.deinit();
+    var without_time = try creditsSnapshotFromJsonValue(std.testing.allocator, bad_time.value);
+    defer without_time.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("5", without_time.token_pass.?.remaining.?);
+    try std.testing.expect(without_time.token_pass.?.resets_at == null);
 }
 
 fn creditsErrorSnapshot(
@@ -831,17 +1047,12 @@ const OAuthHttpOperation = struct {
     request: oauth_transport.Request,
 
     pub fn run(self: *@This()) !oauth_transport.Response {
-        var client: std.http.Client = .{
-            .allocator = self.alloc,
-            .io = io_mod.getIo(),
-        };
-        defer client.deinit();
-
-        const response_buffer = try self.alloc.alloc(u8, oauth_response_max_bytes + 1);
+        const max_bytes = self.request.max_response_bytes orelse oauth_response_max_bytes;
+        const response_buffer = try self.alloc.alloc(u8, max_bytes + 1);
         defer secret.zeroAndFree(self.alloc, response_buffer);
         var response_writer = std.Io.Writer.fixed(response_buffer);
 
-        const result = client.fetch(.{
+        const result = gateway_client.fetchOnOpenJob(.{
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,
@@ -868,7 +1079,7 @@ const OAuthHttpOperation = struct {
             else => return err,
         };
         const body = response_writer.buffered();
-        if (body.len > oauth_response_max_bytes) return error.OAuthResponseTooLarge;
+        if (body.len > max_bytes) return error.OAuthResponseTooLarge;
 
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
@@ -1953,10 +2164,13 @@ test "built-in gateway defaults preserve active provider policy" {
     try std.testing.expectEqualStrings("FX_GATEWAY_CHAT_URL", chat_url_env);
 }
 
+var test_credits_never_cancelled = std.atomic.Value(bool).init(false);
+
 fn stubFetchCreditsError(
     _: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return error.StubFetchFailed;
 }
@@ -1965,6 +2179,7 @@ fn stubFetchInvalidCreditsJson(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .ok,
@@ -1976,6 +2191,7 @@ fn stubFetchCreditsObject(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .ok,
@@ -1990,6 +2206,7 @@ fn stubCaptureCreditsPath(
     alloc: Allocator,
     _: ?[]const u8,
     path: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     captured_credits_path_len = @min(path.len, captured_credits_path.len);
     @memcpy(
@@ -2006,6 +2223,7 @@ fn stubFetchForbiddenCredits(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .forbidden,
@@ -2040,6 +2258,7 @@ test "built-in credits provider names the team query only when valid" {
             std.testing.allocator,
             null,
             case.team,
+            &test_credits_never_cancelled,
             stubCaptureCreditsPath,
         );
         defer snapshot.deinit(std.testing.allocator);
@@ -2055,6 +2274,7 @@ test "built-in credits provider maps fetch failure" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchCreditsError,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2073,6 +2293,7 @@ test "built-in credits provider maps Gateway HTTP denial" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchForbiddenCredits,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2091,6 +2312,7 @@ test "built-in credits provider rejects malformed JSON" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchInvalidCreditsJson,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2121,6 +2343,7 @@ test "built-in credits provider returns owned string fields" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchCreditsObject,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2135,6 +2358,22 @@ test "built-in credits provider returns owned string fields" {
         "[credits] balance=10\n[credits] used=2\n[credits] plan=pro\n",
         text,
     );
+}
+
+test "built-in credits provider reads the Gateway's total_used as used" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"balance\":\"12.50\",\"total_used\":\"1.25\",\"used\":\"9\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var snapshot = try creditsSnapshotFromJsonValue(std.testing.allocator, parsed.value);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("12.50", snapshot.balance.?);
+    try std.testing.expectEqualStrings("1.25", snapshot.used.?);
 }
 
 test "built-in credits provider ignores non-string fields" {
@@ -2281,6 +2520,7 @@ pub const model_catalog_provider = model_catalog.Provider{
     // An active session refetches a stale catalog so newly released models
     // appear without a restart. Only user activity starts the refetch.
     .refresh_interval_ms = 5 * std.time.ms_per_min,
+    .reports_connection = true,
 };
 
 pub const ModelCatalogEntry = model_catalog.ModelCatalogEntry;
@@ -2302,6 +2542,7 @@ fn fetchCatalogForProvider(
         input.access,
         input.endpoint,
         input.cancel_flag,
+        input.connected,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = catalogRequestFailure(err) };
@@ -2341,7 +2582,7 @@ fn fetchModelCatalogForView(
     cancel_flag: ?*std.atomic.Value(bool),
     view: ModelCatalogView,
 ) !std.ArrayList(ModelCatalogEntry) {
-    const response = try fetchModelCatalogResponse(alloc, access, path, cancel_flag);
+    const response = try fetchModelCatalogResponse(alloc, access, path, cancel_flag, null);
     const json_text = switch (response) {
         .success => |body| body,
         .http_status => |status| return model_catalog.failureForHttpStatus(status).asError(),
@@ -2356,6 +2597,7 @@ fn fetchModelCatalogResponse(
     access: credentials.CatalogAccess,
     path: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
+    connected: ?*std.atomic.Value(bool),
 ) !gateway_client.GatewayJsonResult {
     if (cancel_flag) |flag| {
         if (flag.load(.seq_cst)) return error.Cancelled;
@@ -2386,6 +2628,7 @@ fn fetchModelCatalogResponse(
         gateway_team,
         model_catalog_url,
         cancel_flag orelse &never_cancelled,
+        connected,
     );
 }
 
@@ -2811,6 +3054,9 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .context_window = context_window,
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
+        // AI Gateway marks the models a team's Token Pass pays for, only for
+        // a team with an active pass.
+        .token_pass = if (entry.object.get("token_pass")) |value| value == .bool and value.bool else false,
     };
 }
 
@@ -3240,4 +3486,41 @@ test "gateway catalog controls are explicit ordered and bounded" {
     try std.testing.expectEqualStrings("provider/malformed", catalog.items[2].id);
     try std.testing.expectEqual(@as(usize, 0), catalog.items[2].reasoning_efforts.items.len);
     try std.testing.expect(!catalog.items[2].supports_fast_mode);
+}
+
+test "an OAuth request stops at once when cancelled during a lookup that hangs" {
+    const stuck_lookup_testing = @import("../gateway/stuck_lookup_testing.zig");
+    var stuck = stuck_lookup_testing.StuckLookups.install();
+    defer gateway_client.waitForOwnClientOpenJobs() catch {};
+    defer stuck.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    const canceller = try stuck.cancelOnceStuck(&cancel);
+    defer canceller.join();
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(error.Cancelled, executeOAuthRequest(null, std.testing.allocator, .{
+        .method = .post_form,
+        .url = "https://oauth.stuck-lookup.test/token",
+        .payload = "grant_type=refresh_token&refresh_token=example",
+        .cancel_flag = &cancel,
+    }));
+    try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
+}
+
+test "gateway catalog reads the Token Pass marks and nothing else as one" {
+    const json =
+        \\{"object":"list","data":[
+        \\  {"id":"zai/glm-5.3","type":"language","tags":["tool-use"],"token_pass":true},
+        \\  {"id":"acme/new-pass-model","type":"language","tags":["tool-use"],"token_pass":true},
+        \\  {"id":"acme/typed","type":"language","tags":["tool-use"],"token_pass":"true"},
+        \\  {"id":"acme/off","type":"language","tags":["tool-use"],"token_pass":false},
+        \\  {"id":"acme/plain","type":"language","tags":["tool-use"]}
+        \\ ]}
+    ;
+    var catalog = try parseModelCatalogForView(std.testing.allocator, json, .picker);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 5), catalog.items.len);
+    for (catalog.items) |entry| {
+        const marked = std.mem.eql(u8, entry.id, "zai/glm-5.3") or std.mem.eql(u8, entry.id, "acme/new-pass-model");
+        try std.testing.expectEqual(marked, entry.token_pass);
+    }
 }

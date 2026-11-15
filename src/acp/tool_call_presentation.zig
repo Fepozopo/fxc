@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../core/tooling/toolbox.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
@@ -11,6 +12,7 @@ const builtin_tools = @import("../builtins/tools.zig");
 const host_target = @import("../core/hosts/target.zig");
 const types = @import("../core/shared/types.zig");
 const catalog_state = @import("../core/mcp/catalog_state.zig");
+const json_decode = @import("../core/shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -32,7 +34,6 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (std.mem.eql(u8, tool_name, "shell")) return .execute;
     if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
     if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
-    if (std.mem.eql(u8, tool_name, "skill")) return .other;
     if (std.mem.eql(u8, tool_name, "install_skill")) return .other;
     return .other;
 }
@@ -56,6 +57,17 @@ pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, cal
         return arena.print("{s}", .{presentation.action_label});
     }
     return arena.print("{s}", .{call.name});
+}
+
+/// The call an editor is shown for `call`: for a toolbox run, the tool it
+/// runs with that tool's arguments, under the toolbox call's id; any other
+/// call as it is. Opening and searching show as toolbox, an internal tool.
+pub fn shownCall(arena: Allocator, call: ToolCall) Allocator.Error!ToolCall {
+    const run = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return call;
+    var shown = call;
+    shown.name = run.name;
+    shown.arguments_json = run.arguments_json;
+    return shown;
 }
 
 pub const ToolCallPresentation = struct {
@@ -121,7 +133,7 @@ pub fn shellUpdateContentText(
     output: []const u8,
 ) Allocator.Error!?[]u8 {
     if (!std.mem.eql(u8, tool_name, "shell")) return null;
-    const parsed = std.json.parseFromSlice(
+    const parsed = json_decode.parseFromSlice(
         ShellResultView,
         alloc,
         output,
@@ -174,10 +186,10 @@ test "describeToolCall flags internal discovery and names MCP identity" {
     const arena = arena_state.allocator();
     const registry = builtin_tools.registry;
 
-    const search = describeToolCall(registry, arena, .{ .id = "a", .name = "capability_search", .arguments_json = "{}" }, null);
+    const search = describeToolCall(registry, arena, .{ .id = "a", .name = "toolbox", .arguments_json = "{\"search\":\"echo\"}" }, null);
     try std.testing.expect(search.meta.internal);
-    const select = describeToolCall(registry, arena, .{ .id = "b", .name = "mcp_select_tool", .arguments_json = "{}" }, null);
-    try std.testing.expect(select.meta.internal);
+    const open = describeToolCall(registry, arena, .{ .id = "b", .name = "toolbox", .arguments_json = "{\"open\":\"mcp_mini_echo\"}" }, null);
+    try std.testing.expect(open.meta.internal);
     const read = describeToolCall(registry, arena, .{ .id = "c", .name = "read_file", .arguments_json = "{}" }, null);
     try std.testing.expect(!read.meta.internal);
     try std.testing.expect(read.meta.mcp == null);
